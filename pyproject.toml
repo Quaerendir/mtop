@@ -7,10 +7,13 @@ name = "ollama-mtop"
 version = "0.1.0"
 description = "htop for Ollama — curses-based TUI monitor for models, GPU, and Docker containers"
 readme = "README.md"
-license = "MIT"
+license = {text = "MIT"}
 requires-python = ">=3.10"
 authors = [
-    { name = "Marek Kostur", email = "itservices@kostur.uk" },
+    { name = "Quaerendir", email = "42608192+Quaerendir@users.noreply.github.com" },
+]
+maintainers = [
+    { name = "Quaerendir", email = "42608192+Quaerendir@users.noreply.github.com" },
 ]
 keywords = [
     "ollama", "monitor", "tui", "curses", "docker",
