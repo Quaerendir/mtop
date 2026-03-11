@@ -1,0 +1,44 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ollama-mtop"
+version = "0.1.0"
+description = "htop for Ollama — curses-based TUI monitor for models, GPU, and Docker containers"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [
+    { name = "Marek Kostur", email = "itservices@kostur.uk" },
+]
+keywords = [
+    "ollama", "monitor", "tui", "curses", "docker",
+    "gpu", "nvidia", "jetson", "llm", "inference",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console :: Curses",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Monitoring",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.urls]
+Homepage = "https://github.com/Quaerendir/mtop"
+Repository = "https://github.com/Quaerendir/mtop"
+Issues = "https://github.com/Quaerendir/mtop/issues"
+
+[project.scripts]
+mtop = "mtop:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mtop"]
