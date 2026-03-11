@@ -312,14 +312,21 @@ def draw_bar(win, y: int, x: int, label: str, value: float, width: int = 20,
 # ── Main sections ─────────────────────────────────────────────────────────────
 
 def render_header(win, y: int, container: str, status: str, uptime: str) -> int:
-    """Draw the top banner."""
+    """Draw the top banner with full-width frame."""
+    max_y, max_x = win.getmaxyx()
+    w = max_x - 2  # usable width (1px margin each side)
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     hostname = os.uname().nodename
 
+    # Top border: ╔═══ mtop v0.1.0 — Ollama Model Monitor ═══╗
     title = f" mtop v{__version__} — Ollama Model Monitor "
-    y = safe_addstr(win, y, 1, f"─── {title}───", curses.color_pair(C_HEADER) | curses.A_BOLD)
+    pad_total = w - len(title) - 2  # -2 for corner chars
+    pad_left = pad_total // 2
+    pad_right = pad_total - pad_left
+    top_line = "╔" + "═" * pad_left + title + "═" * pad_right + "╗"
+    y = safe_addstr(win, y, 1, top_line, curses.color_pair(C_HEADER) | curses.A_BOLD)
 
-    # Status line
+    # Status line: ║ host: ... container: ... up: ... time ║
     if status == "running":
         status_icon = "● "
         status_attr = curses.color_pair(C_OK) | curses.A_BOLD
@@ -330,19 +337,26 @@ def render_header(win, y: int, container: str, status: str, uptime: str) -> int:
         status_icon = "○ "
         status_attr = curses.color_pair(C_WARN)
 
-    safe_addstr(win, y, 1, "host: ", curses.color_pair(C_DIM))
-    safe_addstr(win, y, 7, hostname, curses.color_pair(C_ACCENT))
-    col2 = 30
+    # Draw left and right border chars
+    safe_addstr(win, y, 1, "║", curses.color_pair(C_HEADER))
+    safe_addstr(win, y, min(w + 2, max_x - 1), "║", curses.color_pair(C_HEADER))
+
+    safe_addstr(win, y, 3, "host: ", curses.color_pair(C_DIM))
+    safe_addstr(win, y, 9, hostname, curses.color_pair(C_ACCENT))
+    col2 = 32
     safe_addstr(win, y, col2, "container: ", curses.color_pair(C_DIM))
     safe_addstr(win, y, col2 + 11, status_icon + container, status_attr)
-    col3 = 62
+    col3 = 64
     if uptime:
         safe_addstr(win, y, col3, f"up: {uptime}", curses.color_pair(C_DIM))
-    col4_x = max(col3 + 20, 82)
-    safe_addstr(win, y, col4_x, now, curses.color_pair(C_DIM))
+    # Right-align timestamp before the border
+    time_x = max(w - len(now), col3 + 20)
+    safe_addstr(win, y, time_x, now, curses.color_pair(C_DIM))
     y += 1
 
-    y = draw_hline(win, y, 1, "─", 100, curses.color_pair(C_DIM))
+    # Bottom border: ╚═══════════════════════════════════════════╝
+    bottom_line = "╚" + "═" * (w) + "╝"
+    y = safe_addstr(win, y, 1, bottom_line, curses.color_pair(C_HEADER))
     return y
 
 
@@ -352,7 +366,12 @@ def render_docker_stats(win, y: int, container: str) -> int:
     if not stats:
         return y
 
-    y = safe_addstr(win, y, 1, "CONTAINER RESOURCES", curses.color_pair(C_TABLE_HDR) | curses.A_BOLD)
+    max_y, max_x = win.getmaxyx()
+    w = max_x - 4  # usable width for section headers
+    label = " CONTAINER RESOURCES "
+    pad = w - len(label)
+    sep = "─" * (pad // 2) + label + "─" * (pad - pad // 2)
+    y = safe_addstr(win, y, 2, sep, curses.color_pair(C_TABLE_HDR) | curses.A_BOLD)
 
     # Parse CPU percentage (Docker reports per-core, e.g. 500% = 5 cores)
     try:
@@ -379,7 +398,12 @@ def render_docker_stats(win, y: int, container: str) -> int:
 
 def render_gpu_stats(win, y: int, gpus: Optional[list[dict]]) -> int:
     """Render GPU info section."""
-    y = safe_addstr(win, y, 1, "GPU", curses.color_pair(C_TABLE_HDR) | curses.A_BOLD)
+    max_y, max_x = win.getmaxyx()
+    w = max_x - 4
+    label = " GPU "
+    pad = w - len(label)
+    sep = "─" * (pad // 2) + label + "─" * (pad - pad // 2)
+    y = safe_addstr(win, y, 2, sep, curses.color_pair(C_TABLE_HDR) | curses.A_BOLD)
 
     if gpus is None:
         y = safe_addstr(win, y, 3, "GPU monitoring unavailable", curses.color_pair(C_DIM) | curses.A_DIM)
@@ -417,7 +441,12 @@ def render_gpu_stats(win, y: int, gpus: Optional[list[dict]]) -> int:
 
 def render_models(win, y: int, api_url: str) -> int:
     """Fetch and display loaded models from /api/ps."""
-    y = safe_addstr(win, y, 1, "LOADED MODELS", curses.color_pair(C_TABLE_HDR) | curses.A_BOLD)
+    max_y, max_x = win.getmaxyx()
+    w = max_x - 4
+    label = " LOADED MODELS "
+    pad = w - len(label)
+    sep = "─" * (pad // 2) + label + "─" * (pad - pad // 2)
+    y = safe_addstr(win, y, 2, sep, curses.color_pair(C_TABLE_HDR) | curses.A_BOLD)
 
     ok, data = http_get_json(f"{api_url}/api/ps")
     if not ok:
@@ -464,7 +493,12 @@ def render_models(win, y: int, api_url: str) -> int:
 
 def render_ollama_ps(win, y: int, container: str) -> int:
     """Show raw ollama ps output from container (supplementary)."""
-    y = safe_addstr(win, y, 1, "OLLAMA PS (raw)", curses.color_pair(C_TABLE_HDR) | curses.A_BOLD)
+    max_y, max_x = win.getmaxyx()
+    w = max_x - 4
+    label = " OLLAMA PS "
+    pad = w - len(label)
+    sep = "─" * (pad // 2) + label + "─" * (pad - pad // 2)
+    y = safe_addstr(win, y, 2, sep, curses.color_pair(C_TABLE_HDR) | curses.A_BOLD)
 
     ok, out = run_cmd(["docker", "exec", container, "ollama", "ps"])
     if not ok:
