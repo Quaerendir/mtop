@@ -124,6 +124,14 @@ def relative_time(iso_str: str) -> str:
         return iso_str[:19]
 
 
+def get_cpu_count() -> int:
+    """Get number of CPU cores available."""
+    try:
+        return os.cpu_count() or 1
+    except Exception:
+        return 1
+
+
 def parse_docker_stats(container: str) -> Optional[dict]:
     """Get CPU%, MEM usage/limit from docker stats."""
     fmt = "{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}"
@@ -346,12 +354,16 @@ def render_docker_stats(win, y: int, container: str) -> int:
 
     y = safe_addstr(win, y, 1, "CONTAINER RESOURCES", curses.color_pair(C_TABLE_HDR) | curses.A_BOLD)
 
-    # Parse CPU percentage
+    # Parse CPU percentage (Docker reports per-core, e.g. 500% = 5 cores)
     try:
-        cpu_val = float(stats["cpu"].rstrip("%"))
+        cpu_raw = float(stats["cpu"].rstrip("%"))
     except (ValueError, TypeError):
-        cpu_val = 0.0
-    y = draw_bar(win, y, 3, "CPU  ", cpu_val, 30, C_ACCENT)
+        cpu_raw = 0.0
+    ncpu = get_cpu_count()
+    cpu_normalized = min(cpu_raw / ncpu, 100.0)
+    cpu_detail = f"{cpu_raw:.0f}% / {ncpu} cores"
+    y = draw_bar(win, y, 3, "CPU  ", cpu_normalized, 30, C_ACCENT)
+    safe_addstr(win, y - 1, 62, cpu_detail, curses.color_pair(C_DIM))
 
     # Parse MEM percentage
     try:
