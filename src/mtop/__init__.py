@@ -11,7 +11,6 @@ import argparse
 import curses
 import json
 import os
-import signal
 import subprocess
 import sys
 import time
@@ -145,27 +144,26 @@ def parse_docker_stats(container: str) -> Optional[dict]:
 
 
 def get_container_status(container: str) -> tuple[str, str]:
-    """Return (status, uptime) for a Docker container."""
-    ok, status = run_cmd(
-        ["docker", "inspect", "--format", "{{.State.Status}}", container]
+    """Return (status, uptime) for a Docker container in a single inspect call."""
+    ok, out = run_cmd(
+        ["docker", "inspect", "--format",
+         "{{.State.Status}}\t{{.State.StartedAt}}", container]
     )
     if not ok:
         return "not found", ""
+    parts = out.split("\t")
+    status = parts[0].strip()
     uptime = ""
-    if status == "running":
-        ok2, started = run_cmd(
-            ["docker", "inspect", "--format", "{{.State.StartedAt}}", container]
-        )
-        if ok2 and started:
-            uptime = relative_time(started).replace(" ago", "")
+    if status == "running" and len(parts) > 1 and parts[1].strip():
+        uptime = relative_time(parts[1].strip()).replace(" ago", "")
     return status, uptime
 
 
-def get_gpu_stats() -> Optional[list[dict]]:
+def get_gpu_stats(container: str = "ollama") -> Optional[list[dict]]:
     """Query nvidia-smi for GPU stats. Returns list of GPU dicts or None."""
     query = "name,utilization.gpu,memory.used,memory.total,temperature.gpu"
-    # Try host first, then common container paths
-    for cmd_prefix in [[], ["docker", "exec", "ollama"]]:
+    # Try host first, then inside the (configurable) container
+    for cmd_prefix in [[], ["docker", "exec", container]]:
         cmd = cmd_prefix + [
             "nvidia-smi",
             f"--query-gpu={query}",
@@ -221,15 +219,26 @@ def get_gpu_stats() -> Optional[list[dict]]:
 # ── Curses drawing helpers ────────────────────────────────────────────────────
 
 def safe_addstr(win, y: int, x: int, text: str, attr=0) -> int:
-    """Write string to window, clipping to window bounds. Returns next y."""
+    """Write string to window, clipping to window bounds. Returns next y.
+
+    Guards both axes: rows past the usable area stop vertical flow (return y),
+    while an x beyond the right edge skips the draw but still advances the row
+    so the surrounding layout stays intact. Clipping uses a real available-width
+    computation rather than a slice that can go negative when x >= max_x.
+    """
     max_y, max_x = win.getmaxyx()
     if y >= max_y - 1:
         return y
-    text = text[: max_x - x - 1] if x + len(text) >= max_x else text
-    try:
-        win.addstr(y, x, text, attr)
-    except curses.error:
-        pass
+    if x < 0 or x >= max_x - 1:
+        return y + 1
+    avail = max_x - x - 1
+    if len(text) > avail:
+        text = text[:avail]
+    if text:
+        try:
+            win.addstr(y, x, text, attr)
+        except curses.error:
+            pass
     return y + 1
 
 
@@ -273,6 +282,8 @@ def draw_table(win, y: int, x: int, headers: list[str], rows: list[list[str]],
         line = ""
         for i, cell in enumerate(row):
             w = col_widths[i] if i < len(col_widths) else len(cell)
+            if len(cell) > w:
+                cell = cell[: w - 1] + "…"
             line += cell.ljust(w) if i < len(row) - 1 else cell
             if i < len(row) - 1:
                 line += "  "
@@ -312,21 +323,31 @@ def draw_bar(win, y: int, x: int, label: str, value: float, width: int = 20,
 # ── Main sections ─────────────────────────────────────────────────────────────
 
 def render_header(win, y: int, container: str, status: str, uptime: str) -> int:
-    """Draw the top banner with full-width frame."""
+    """Draw the top banner with a full-width frame.
+
+    All geometry is anchored to ``inner_right = max_x - 2`` — the rightmost
+    column ``addstr`` can write without raising (the very last cell, max_x-1,
+    is unwritable via addstr). Top/bottom borders and the right ``║`` all land
+    on that column so the box stays square at any width, and the timestamp is
+    right-aligned *to the frame* instead of a hardcoded floor.
+    """
     max_y, max_x = win.getmaxyx()
-    w = max_x - 2  # usable width (1px margin each side)
+    if max_x < 16:                       # too narrow to frame anything sane
+        return y
+    inner_right = max_x - 2              # column of ╗ ╝ and the right ║
+    fill = inner_right - 2              # ═ count between the corners
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     hostname = os.uname().nodename
 
     # Top border: ╔═══ mtop v0.1.0 — Ollama Model Monitor ═══╗
     title = f" mtop v{__version__} — Ollama Model Monitor "
-    pad_total = w - len(title) - 2  # -2 for corner chars
+    pad_total = max(0, fill - len(title))
     pad_left = pad_total // 2
     pad_right = pad_total - pad_left
     top_line = "╔" + "═" * pad_left + title + "═" * pad_right + "╗"
     y = safe_addstr(win, y, 1, top_line, curses.color_pair(C_HEADER) | curses.A_BOLD)
 
-    # Status line: ║ host: ... container: ... up: ... time ║
+    # Status line: ║ host: ... container: ... up: ...            time ║
     if status == "running":
         status_icon = "● "
         status_attr = curses.color_pair(C_OK) | curses.A_BOLD
@@ -337,32 +358,44 @@ def render_header(win, y: int, container: str, status: str, uptime: str) -> int:
         status_icon = "○ "
         status_attr = curses.color_pair(C_WARN)
 
-    # Draw left and right border chars
+    # Both vertical borders on the same column the corners use.
     safe_addstr(win, y, 1, "║", curses.color_pair(C_HEADER))
-    safe_addstr(win, y, min(w + 2, max_x - 1), "║", curses.color_pair(C_HEADER))
+    safe_addstr(win, y, inner_right, "║", curses.color_pair(C_HEADER))
 
-    safe_addstr(win, y, 3, "host: ", curses.color_pair(C_DIM))
-    safe_addstr(win, y, 9, hostname, curses.color_pair(C_ACCENT))
     col2 = 32
+    col3 = 64
+    safe_addstr(win, y, 3, "host: ", curses.color_pair(C_DIM))
+    # Clamp hostname so it can never bleed into the container field.
+    host_room = max(1, col2 - 9 - 1)
+    host_show = hostname if len(hostname) <= host_room else hostname[: host_room - 1] + "…"
+    safe_addstr(win, y, 9, host_show, curses.color_pair(C_ACCENT))
     safe_addstr(win, y, col2, "container: ", curses.color_pair(C_DIM))
     safe_addstr(win, y, col2 + 11, status_icon + container, status_attr)
-    col3 = 64
     if uptime:
         safe_addstr(win, y, col3, f"up: {uptime}", curses.color_pair(C_DIM))
-    # Right-align timestamp before the border
-    time_x = max(w - len(now), col3 + 20)
-    safe_addstr(win, y, time_x, now, curses.color_pair(C_DIM))
+
+    # Right-align timestamp to the inner frame, with a 1-col gap before ║.
+    # Only draw it if it clears the uptime field; otherwise drop it silently.
+    time_x = inner_right - len(now) - 1
+    uptime_end = col3 + (len(f"up: {uptime}") if uptime else 0)
+    if time_x > uptime_end + 1:
+        safe_addstr(win, y, time_x, now, curses.color_pair(C_DIM))
     y += 1
 
-    # Bottom border: ╚═══════════════════════════════════════════╝
-    bottom_line = "╚" + "═" * (w) + "╝"
+    # Bottom border: same length as the top so corners align on inner_right.
+    bottom_line = "╚" + "═" * fill + "╝"
     y = safe_addstr(win, y, 1, bottom_line, curses.color_pair(C_HEADER))
     return y
 
 
-def render_docker_stats(win, y: int, container: str) -> int:
-    """Show container CPU/MEM with progress bars."""
-    stats = parse_docker_stats(container)
+def render_docker_stats(win, y: int, container: str, stats: Optional[dict] = None) -> int:
+    """Show container CPU/MEM with progress bars.
+
+    ``stats`` may be passed in pre-fetched (cached) to avoid the ~1-2s
+    ``docker stats --no-stream`` call on every frame.
+    """
+    if stats is None:
+        stats = parse_docker_stats(container)
     if not stats:
         return y
 
@@ -521,8 +554,9 @@ def render_footer(win, y: int, interval: float) -> int:
     max_y, max_x = win.getmaxyx()
     footer_y = max_y - 1
     footer = f" q: quit │ +/-: interval ({interval:.1f}s) │ mtop v{__version__} "
+    footer = footer[: max_x - 1].ljust(max_x - 1)
     try:
-        win.addstr(footer_y, 0, footer.ljust(max_x - 1), curses.color_pair(C_DIM) | curses.A_REVERSE)
+        win.addstr(footer_y, 0, footer, curses.color_pair(C_DIM) | curses.A_REVERSE)
     except curses.error:
         pass
     return y
@@ -545,6 +579,11 @@ def curses_main(stdscr, args):
     gpu_last_fetch: float = 0
     GPU_REFRESH = max(2.0, args.interval)
 
+    # Cache docker stats too — `docker stats --no-stream` blocks ~1-2s.
+    stats_cache: Optional[dict] = None
+    stats_last_fetch: float = 0
+    STATS_REFRESH = max(2.0, args.interval)
+
     while True:
         # Handle input
         try:
@@ -557,6 +596,8 @@ def curses_main(stdscr, args):
             elif key == ord("-"):
                 args.interval = min(30.0, args.interval + 0.5)
                 stdscr.timeout(int(args.interval * 1000))
+            elif key == curses.KEY_RESIZE:
+                stdscr.erase()
         except curses.error:
             pass
 
@@ -578,14 +619,18 @@ def curses_main(stdscr, args):
             stdscr.refresh()
             continue
 
-        # Docker stats
-        y = render_docker_stats(stdscr, y, container)
+        # Docker stats (cached — docker stats --no-stream is slow)
+        now = time.monotonic()
+        if now - stats_last_fetch >= STATS_REFRESH:
+            stats_cache = parse_docker_stats(container)
+            stats_last_fetch = now
+        y = render_docker_stats(stdscr, y, container, stats_cache)
 
         # GPU stats (cached, refreshed less frequently)
         if show_gpu:
             now = time.monotonic()
             if now - gpu_last_fetch >= GPU_REFRESH:
-                gpu_cache = get_gpu_stats()
+                gpu_cache = get_gpu_stats(container)
                 gpu_last_fetch = now
             y = render_gpu_stats(stdscr, y, gpu_cache)
 
