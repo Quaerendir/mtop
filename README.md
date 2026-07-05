@@ -22,7 +22,11 @@ There are web dashboards, Prometheus exporters, and chat TUIs for Ollama. But th
 - **Container health** — status indicator (●/✗/○), uptime, CPU & memory with progress bars
 - **GPU monitoring** — NVIDIA desktop GPUs via `nvidia-smi`, with utilization and VRAM bars
 - **Jetson / Tegra / NVIDIA Spark** — automatic fallback to unified memory via `/proc/meminfo`
-- **Interactive** — `q` to quit, `+`/`-` to adjust refresh interval on the fly
+- **Non-blocking UI** — all I/O (docker, nvidia-smi, HTTP) runs in a background collector thread; the interface stays responsive at 100 ms even when the API hangs, and stale data is flagged
+- **Interactive** — `q` to quit, `+`/`-` to adjust refresh interval, `o` to toggle raw `ollama ps`
+- **Scriptable** — `--json` one-shot mode for cron, Prometheus textfile collectors, or Ansible facts (exit code 1 on unhealthy)
+- **API-only mode** — `--no-docker` for monitoring remote Ollama instances without local docker calls
+- **cgroup-aware CPU bar** — normalizes against the container's `--cpus`/quota limit, not the host core count
 - **Docker-aware** — talks to both the Ollama API and `docker exec ollama ps`
 - **Respects `$OLLAMA_HOST`** — works with remote Ollama instances out of the box
 - **Zero external dependencies** — only Python stdlib (`curses`, `urllib`, `json`, `subprocess`)
@@ -32,15 +36,17 @@ There are web dashboards, Prometheus exporters, and chat TUIs for Ollama. But th
 ### One-liner (no install)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Quaerendir/mtop/main/src/mtop/__init__.py -o mtop.py
+curl -fsSL https://raw.githubusercontent.com/Quaerendir/mtop/master/src/mtop/__init__.py -o mtop.py
 chmod +x mtop.py
 ./mtop.py
 ```
 
 ### pip install
 
+> Not yet published to PyPI — coming with the first tagged release. Until then, use the one-liner or install from source.
+
 ```bash
-pip install ollama-mtop
+pip install ollama-mtop   # (pending)
 mtop
 ```
 
@@ -53,22 +59,27 @@ pip install -e .
 mtop
 ```
 
-### Run directly (no install needed)
+### Run directly from a clone (no install)
 
 ```bash
-python -m mtop
+git clone https://github.com/Quaerendir/mtop.git
+cd mtop
+PYTHONPATH=src python -m mtop
 ```
 
 ## Usage
 
 ```
-mtop [-c CONTAINER] [-i INTERVAL] [-u URL] [--no-gpu] [-V] [-h]
+mtop [-c CONTAINER] [-i INTERVAL] [-u URL] [--no-gpu] [--no-docker] [--json] [-V] [-h]
 
 Options:
   -c, --container NAME   Docker container name (default: ollama)
   -i, --interval SECS    Refresh interval in seconds (default: 1.0)
   -u, --api-url URL      Ollama API base URL (default: $OLLAMA_HOST or http://localhost:11434)
+                         Scheme-less values (gpu-rig:11434) are accepted, like Ollama itself
       --no-gpu           Disable GPU monitoring section
+      --no-docker        API-only mode: skip all docker calls (remote instances)
+      --json             Print one snapshot as JSON and exit (exit 1 on unhealthy)
   -V, --version          Show version
   -h, --help             Show help
 ```
@@ -82,8 +93,11 @@ mtop -c my-ollama
 # Slower refresh for remote/metered connections
 mtop -i 5
 
-# Monitor a remote Ollama instance, skip GPU
-mtop -u http://192.168.1.100:11434 --no-gpu
+# Monitor a remote Ollama instance — API only, no local docker/GPU noise
+mtop -u 192.168.1.100:11434 --no-docker
+
+# One-shot health/state snapshot for scripting
+mtop --json | jq '.models[].name'
 
 # Using OLLAMA_HOST environment variable
 export OLLAMA_HOST=http://gpu-rig:11434
@@ -97,11 +111,12 @@ mtop
 | `q` / `ESC` | Quit |
 | `+` | Decrease refresh interval (faster) |
 | `-` | Increase refresh interval (slower) |
+| `o` | Toggle raw `ollama ps` section |
 
 ## Display Layout
 
 ```
-─── mtop v0.1.0 — Ollama Model Monitor ───
+─── mtop v0.2.0 — Ollama Model Monitor ───
 host: gpu-rig     container: ● ollama     up: 3d 14h     2026-03-11 15:42:01
 ────────────────────────────────────────────────────────────────────────────────
 CONTAINER RESOURCES
@@ -145,7 +160,10 @@ OLLAMA PS (raw)
 - [ ] Apple Silicon GPU stats (via `powermetrics`)
 - [ ] Model pull progress tracking
 - [ ] Multiple container / multi-host support
-- [ ] Configurable layout (hide/show sections)
+- [x] Configurable layout (raw `ollama ps` toggle; more sections to follow)
+- [ ] Model actions — unload on keypress (`keep_alive: 0`), extend TTL
+- [ ] Sparkline history for CPU/GPU utilization (braille chars, stdlib deque)
+- [ ] systemd/bare-metal Ollama support (cgroup v2 stats, no Docker required)
 - [ ] Log panel (tail Ollama container logs)
 - [ ] Request rate / tokens-per-second from Ollama API
 

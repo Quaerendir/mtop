@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ollama-mtop"
-version = "0.1.0"
+version = "0.2.0"
 description = "htop for Ollama — curses-based TUI monitor for models, GPU, and Docker containers"
 readme = "README.md"
 license = {text = "MIT"}
@@ -45,3 +45,11 @@ mtop = "mtop:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/mtop"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "SIM", "UP", "C4"]
+ignore = ["E741", "SIM105"]  # SIM105: contextlib.suppress has per-call overhead in the render hot path
