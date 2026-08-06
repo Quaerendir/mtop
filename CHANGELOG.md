@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.3.0 — 2026-08-06
+
+### Added
+- **Bare-metal / local Ollama monitoring.** `--mode local` monitors an Ollama
+  server running outside Docker — the official systemd `ollama.service`, or a
+  manual `ollama serve`. Process CPU/MEM come from `/proc/<pid>` on Linux
+  (world-readable, no root, works regardless of launch method) and from
+  `ps`/`sysctl` on macOS. systemd is used only for discovery/status (active/
+  activating/failed + MainPID); the numbers always come from `/proc` to avoid
+  the "MemoryAccounting is off" and locale-timestamp pitfalls.
+- **`--mode {auto,docker,local,api}`** (default `auto`). Auto probes Docker
+  first, then a bare-metal process, else falls back to API-only — and keeps
+  trying to upgrade from the api fallback each cycle, so starting mtop before
+  Ollama is up self-heals. Docker is probed before /proc because a
+  containerized `ollama serve` is also visible in host /proc.
+- CPU-usage sampling for the local process (Δ of utime+stime ticks across
+  cycles, keyed by pid so a restart resets the baseline instead of spiking).
+- Header shows `ollama: ● serve · pid <N>` and a `PROCESS RESOURCES` section
+  in local mode; the `o` raw-`ollama ps` toggle works here too (runs
+  `ollama ps` directly instead of via `docker exec`).
+
+### Changed
+- Default source is now `auto` instead of docker-only. Docker hosts still
+  resolve to docker; hosts without a container now find the local process
+  instead of showing "container not found".
+- `--no-docker` is now an alias for `--mode api` (unchanged behavior), but an
+  explicit `--mode` wins over it.
+- Internal: `docker_stats` snapshot key → `res_stats`; `render_docker_stats`
+  → `render_resources` (mode-agnostic).
+
+### Notes
+- Ollama mmaps its GGUF model files, so the local process VmRSS includes
+  resident mmapped model pages that also live in the page cache — the MEM bar
+  can read ≈ model size. This is the honest footprint, just be aware it
+  overlaps buffers/cache. On unified-memory boxes (GB10 Spark, Apple Silicon)
+  the process RSS and the GPU "VRAM" measure the same physical bytes.
+
 ## 0.2.0 — 2026-07-05
 
 ### Architecture

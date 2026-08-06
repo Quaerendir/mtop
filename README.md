@@ -1,6 +1,6 @@
 # mtop
 
-**htop for Ollama** — a curses-based TUI that monitors your models, GPU, and Docker container in real time. Zero flicker. Zero dependencies beyond Python 3.10+.
+**htop for Ollama** — a curses-based TUI that monitors your models, GPU, and the Ollama server (in Docker *or* bare-metal) in real time. Zero flicker. Zero dependencies beyond Python 3.10+.
 
 ![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)
 ![License: MIT](https://img.shields.io/badge/license-MIT-green)
@@ -13,7 +13,7 @@
 
 There are web dashboards, Prometheus exporters, and chat TUIs for Ollama. But there's no **terminal monitor** — something you SSH into a box and just run, like `htop` or `nvtop`, to see what models are loaded, how much VRAM they're eating, and whether the container is healthy.
 
-`mtop` fills that gap. One file, one command, pure stdlib Python.
+`mtop` fills that gap. One file, one command, pure stdlib Python. It auto-detects whether Ollama runs in a Docker container or as a bare-metal process (systemd or a manual `ollama serve`) and monitors it either way.
 
 ## Features
 
@@ -27,6 +27,7 @@ There are web dashboards, Prometheus exporters, and chat TUIs for Ollama. But th
 - **Scriptable** — `--json` one-shot mode for cron, Prometheus textfile collectors, or Ansible facts (exit code 1 on unhealthy)
 - **API-only mode** — `--no-docker` for monitoring remote Ollama instances without local docker calls
 - **cgroup-aware CPU bar** — normalizes against the container's `--cpus`/quota limit, not the host core count
+- **Docker *and* bare-metal** — auto-detects the source: a Docker container, a systemd `ollama.service`, or a manual `ollama serve`; monitors process CPU/MEM via `/proc` (Linux, no root) or `ps`/`sysctl` (macOS)
 - **Docker-aware** — talks to both the Ollama API and `docker exec ollama ps`
 - **Respects `$OLLAMA_HOST`** — works with remote Ollama instances out of the box
 - **Zero external dependencies** — only Python stdlib (`curses`, `urllib`, `json`, `subprocess`)
@@ -70,10 +71,13 @@ PYTHONPATH=src python -m mtop
 ## Usage
 
 ```
-mtop [-c CONTAINER] [-i INTERVAL] [-u URL] [--no-gpu] [--no-docker] [--json] [-V] [-h]
+mtop [-c CONTAINER] [-i INTERVAL] [-u URL] [-m MODE] [--no-gpu] [--no-docker] [--json] [-V] [-h]
 
 Options:
   -c, --container NAME   Docker container name (default: ollama)
+  -m, --mode MODE        Data source: auto|docker|local|api (default: auto)
+                         local = bare-metal `ollama serve` (systemd/proc/ps)
+                         api   = models only, no host resource stats
   -i, --interval SECS    Refresh interval in seconds (default: 1.0)
   -u, --api-url URL      Ollama API base URL (default: $OLLAMA_HOST or http://localhost:11434)
                          Scheme-less values (gpu-rig:11434) are accepted, like Ollama itself
@@ -93,8 +97,14 @@ mtop -c my-ollama
 # Slower refresh for remote/metered connections
 mtop -i 5
 
+# Bare-metal Ollama (systemd service or `ollama serve` in a terminal)
+mtop --mode local
+
+# Let mtop figure it out (docker? systemd? manual? — it probes in that order)
+mtop
+
 # Monitor a remote Ollama instance — API only, no local docker/GPU noise
-mtop -u 192.168.1.100:11434 --no-docker
+mtop -u 192.168.1.100:11434 --mode api
 
 # One-shot health/state snapshot for scripting
 mtop --json | jq '.models[].name'
@@ -143,7 +153,9 @@ OLLAMA PS (raw)
 | NVIDIA Jetson / Orin | ✅ Unified memory | Falls back to `/proc/meminfo` |
 | NVIDIA GB10 Spark | ✅ Unified memory | Tegra-based, same fallback |
 | Linux without GPU | ✅ (no GPU section) | Use `--no-gpu` to hide the section |
-| macOS | ⚠️ Partial | curses works, no `nvidia-smi`; Docker Desktop only |
+| Bare-metal Ollama (systemd) | ✅ process stats | `--mode local`; CPU/MEM from `/proc`, no root needed |
+| Manual `ollama serve` | ✅ process stats | auto-detected via `/proc` cmdline scan |
+| macOS | ⚠️ Partial | `--mode local` monitors the process via `ps`/`sysctl`; GPU (Metal) not yet supported |
 | WSL2 | ⚠️ Partial | Works if Docker + nvidia-container-toolkit configured |
 
 ## Requirements
@@ -163,7 +175,7 @@ OLLAMA PS (raw)
 - [x] Configurable layout (raw `ollama ps` toggle; more sections to follow)
 - [ ] Model actions — unload on keypress (`keep_alive: 0`), extend TTL
 - [ ] Sparkline history for CPU/GPU utilization (braille chars, stdlib deque)
-- [ ] systemd/bare-metal Ollama support (cgroup v2 stats, no Docker required)
+- [x] systemd/bare-metal Ollama support (process stats via `/proc`, no Docker required)
 - [ ] Log panel (tail Ollama container logs)
 - [ ] Request rate / tokens-per-second from Ollama API
 

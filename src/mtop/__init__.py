@@ -27,7 +27,7 @@ import urllib.request
 from datetime import datetime, timezone
 from typing import Any
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
 
@@ -179,6 +179,175 @@ def read_unified_memory() -> tuple[str, int, int] | None:
         return None
 
 
+# ── Bare-metal / local Ollama helpers ─────────────────────────────────────────
+#
+# When Ollama runs outside Docker (the official install.sh systemd service, a
+# manual `ollama serve` in tmux, or the macOS app) there is no container to
+# inspect. We monitor the server process directly. Numbers come from /proc on
+# Linux (world-readable — no root needed, works regardless of launch method)
+# and from `ps`/`sysctl` on macOS. systemd is used only for discovery/status,
+# not for the numbers, to sidestep the "MemoryAccounting is off" and locale-
+# dependent timestamp headaches.
+
+IS_LINUX = sys.platform.startswith("linux")
+IS_DARWIN = sys.platform == "darwin"
+CLK_TCK = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
+
+
+def total_ram_bytes() -> int:
+    """System RAM in bytes (for the process MEM% denominator)."""
+    if IS_DARWIN:
+        ok, out = run_cmd(["sysctl", "-n", "hw.memsize"], timeout=2)
+        if ok:
+            v = to_float(out)
+            if v:
+                return int(v)
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    return int(line.split()[1]) * 1024
+    except (FileNotFoundError, PermissionError, ValueError, IndexError):
+        pass
+    return 0
+
+
+def find_ollama_pid() -> int | None:
+    """Find the Ollama *server* PID (the one running `serve`).
+
+    Linux: scan /proc for a process whose argv[0] basename is 'ollama' and
+    which has 'serve' among its args — this excludes `ollama run`/`ollama ps`
+    clients. macOS: pgrep. Returns None if not found.
+
+    Note: on a Docker host the containerized `ollama serve` is *also* visible
+    in host /proc, so callers must probe Docker before falling back here (auto
+    mode does exactly that).
+    """
+    if IS_DARWIN:
+        ok, out = run_cmd(["pgrep", "-f", "ollama serve"], timeout=2)
+        if ok and out.strip():
+            first = out.split()[0]
+            return int(first) if first.isdigit() else None
+        ok, out = run_cmd(["pgrep", "-x", "ollama"], timeout=2)
+        if ok and out.strip():
+            first = out.split()[0]
+            return int(first) if first.isdigit() else None
+        return None
+
+    if not os.path.isdir("/proc"):
+        return None
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/cmdline", "rb") as f:
+                raw = f.read()
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            continue
+        args = [a for a in raw.decode("utf-8", "replace").split("\x00") if a]
+        if not args:
+            continue
+        if os.path.basename(args[0]) == "ollama" and any(a == "serve" for a in args[1:]):
+            return int(entry)
+    return None
+
+
+def systemd_ollama() -> tuple[str, int] | None:
+    """Query the ollama systemd unit. Returns (status, main_pid) or None.
+
+    status is normalized: running / starting / failed / not found.
+    Only used for discovery + status; the numbers come from /proc.
+    """
+    ok, out = run_cmd(
+        ["systemctl", "show", "ollama.service",
+         "--property=ActiveState,SubState,MainPID"],
+        timeout=3,
+    )
+    if not ok:
+        return None
+    props: dict[str, str] = {}
+    for line in out.splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            props[k] = v
+    active = props.get("ActiveState", "")
+    if not active or active == "inactive":
+        return None
+    try:
+        pid = int(props.get("MainPID", "0"))
+    except ValueError:
+        pid = 0
+    if active == "active" and pid > 0:
+        return "running", pid
+    if active == "activating":
+        return "starting", pid
+    if active == "failed":
+        return "failed", pid
+    return None
+
+
+def read_proc_cpu_ticks(pid: int) -> int | None:
+    """Cumulative CPU time (utime+stime) of a PID in clock ticks, via /proc/<pid>/stat.
+
+    Splits on the last ')' so a comm containing spaces/parens can't shift the
+    field offsets (the classic /proc/<pid>/stat parsing trap).
+    """
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            data = f.read()
+    except (FileNotFoundError, PermissionError, ProcessLookupError):
+        return None
+    try:
+        fields = data.rsplit(")", 1)[1].split()
+        # after the split, index 0 = state (field 3); utime=field14→idx11,
+        # stime=field15→idx12
+        return int(fields[11]) + int(fields[12])
+    except (IndexError, ValueError):
+        return None
+
+
+def read_proc_rss_bytes(pid: int) -> int | None:
+    """Resident set size of a PID in bytes, via /proc/<pid>/status VmRSS.
+
+    Caveat: Ollama mmaps its GGUF model files, so VmRSS includes resident
+    mmapped model pages that also live in the kernel page cache — the process
+    footprint can look ≈ model size and appears to "double count" against
+    buffers/cache. This is the honest footprint, just worth knowing.
+    """
+    try:
+        with open(f"/proc/{pid}/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) * 1024
+    except (FileNotFoundError, PermissionError, ProcessLookupError, ValueError, IndexError):
+        return None
+    return None
+
+
+def proc_uptime_sec(pid: int) -> float | None:
+    """Seconds since a PID started: system uptime minus the process starttime."""
+    try:
+        with open("/proc/uptime") as f:
+            sys_up = float(f.read().split()[0])
+        with open(f"/proc/{pid}/stat") as f:
+            data = f.read()
+        fields = data.rsplit(")", 1)[1].split()
+        starttime_ticks = int(fields[19])  # field 22 → idx 19
+        return max(0.0, sys_up - starttime_ticks / CLK_TCK)
+    except (FileNotFoundError, PermissionError, ProcessLookupError,
+            ValueError, IndexError):
+        return None
+
+
+def fmt_duration(sec: float) -> str:
+    sec = int(sec)
+    if sec < 3600:
+        return f"{sec // 60}m {sec % 60}s"
+    if sec < 86400:
+        return f"{sec // 3600}h {(sec % 3600) // 60}m"
+    return f"{sec // 86400}d {(sec % 86400) // 3600}h"
+
+
 # ── Collector (background thread) ─────────────────────────────────────────────
 
 class Collector(threading.Thread):
@@ -191,34 +360,53 @@ class Collector(threading.Thread):
     ``interval`` and ``show_raw_ps`` are mutated from the UI thread; both
     are single-reference reads/writes so the GIL makes them safe without
     additional locking.
+
+    ``mode`` selects the data source:
+      docker — inspect/stats/exec a container (the v0.2.0 behavior)
+      local  — monitor a bare-metal `ollama serve` process (systemd/proc/ps)
+      api    — API only, no host resource stats (former --no-docker)
+      auto   — probe docker first, then a local process, else api; the
+               resolved mode is cached once a concrete source is found
     """
 
     def __init__(self, container: str, api_url: str, interval: float,
-                 show_gpu: bool, use_docker: bool, show_raw_ps: bool = False):
+                 show_gpu: bool, mode: str = "auto", show_raw_ps: bool = False):
         super().__init__(daemon=True, name="mtop-collector")
         self.container = container
         self.api_url = api_url
         self.interval = interval
         self.show_gpu = show_gpu
-        self.use_docker = use_docker
+        self.mode = mode                    # requested: auto|docker|local|api
+        self._resolved: str | None = None   # concrete mode once known
         self.show_raw_ps = show_raw_ps
 
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._snapshot: dict = {"ts": 0.0, "status": "starting", "uptime": ""}
 
-        # Slow-path caches (docker stats / nvidia-smi), refreshed at
-        # max(SLOW_FLOOR, self.interval) — recomputed each cycle so
-        # runtime +/- interval changes take effect (fixes v0.1.0 bug
-        # where the cap was frozen at startup).
+        # Slow-path caches (container/process stats + nvidia-smi), refreshed at
+        # max(SLOW_FLOOR, self.interval) — recomputed each cycle so runtime
+        # +/- interval changes take effect (fixes v0.1.0 frozen-cap bug).
         self._slow_ts: float = 0.0
-        self._docker_stats: dict | None = None
+        self._res_stats: dict | None = None
         self._gpu_cache: list[dict] | None = None
 
         # Memoized GPU probe strategy: "host" | "container" | "unified" | None.
         # Avoids re-forking failed nvidia-smi probes every cycle on boxes
         # without a GPU; reset on failure so hotplug/driver restarts recover.
         self._gpu_mode: str | None = None
+
+        # Previous CPU sample for the local process, keyed by pid so a restart
+        # (new pid) resets the baseline instead of reporting a bogus spike.
+        self._cpu_prev: tuple[int, int, float] | None = None  # (pid, ticks, mono)
+
+    @property
+    def use_docker(self) -> bool:
+        """True once auto/explicit resolution has settled on the docker source.
+
+        Gates the container-exec GPU probe path in _gpu_read().
+        """
+        return self._resolved == "docker"
 
     # -- lifecycle -------------------------------------------------------------
 
@@ -240,32 +428,79 @@ class Collector(threading.Thread):
 
     # -- collection ------------------------------------------------------------
 
+    def _resolve_mode(self) -> str:
+        """Pick a concrete data source. Docker wins over a bare-metal process
+        because a containerized `ollama serve` is also visible in host /proc;
+        probing Docker first avoids mistaking the container for a local install.
+        """
+        if self.mode != "auto":
+            return self.mode
+        if self._detect_docker():
+            return "docker"
+        if self._detect_local():
+            return "local"
+        return "api"
+
+    def _detect_docker(self) -> bool:
+        ok, out = run_cmd(
+            ["docker", "inspect", "--format", "{{.State.Status}}", self.container]
+        )
+        return ok and out.strip() == "running"
+
+    def _detect_local(self) -> bool:
+        if IS_LINUX and systemd_ollama() is not None:
+            return True
+        return find_ollama_pid() is not None
+
     def collect(self, now: float) -> dict:
         """One full collection pass. Also used synchronously by --json."""
+        # Resolve the source. Once locked to docker/local we stop probing;
+        # while still on the soft 'api' fallback we keep trying to upgrade,
+        # so starting mtop before Ollama is up still self-heals.
+        if self.mode == "auto":
+            if self._resolved in (None, "api"):
+                self._resolved = self._resolve_mode()
+        elif self._resolved is None:
+            self._resolved = self.mode
+        mode = self._resolved
+
         snap: dict = {
             "ts": time.monotonic(),
             "wallclock": datetime.now().astimezone().isoformat(timespec="seconds"),
             "container": self.container,
             "api_url": self.api_url,
+            "mode": mode,
         }
 
-        if self.use_docker:
+        if mode == "docker":
             status, uptime, cpu_limit = self._inspect_container()
-            snap.update(status=status, uptime=uptime, cpu_limit=cpu_limit)
+            snap.update(status=status, uptime=uptime, cpu_limit=cpu_limit, pid=None)
             if status != "running":
                 return snap
-        else:
-            snap.update(status="api-only", uptime="", cpu_limit=None)
+        elif mode == "local":
+            status, pid, uptime = self._local_status()
+            snap.update(status=status, uptime=uptime, cpu_limit=float(os.cpu_count() or 1),
+                        pid=pid)
+            if status != "running":
+                # process gone but API might still answer (remote -u, race) —
+                # fall through so models still render
+                snap["cpu_limit"] = None
+        else:  # api
+            snap.update(status="api-only", uptime="", cpu_limit=None, pid=None)
 
         slow_due = now - self._slow_ts >= max(SLOW_FLOOR, self.interval)
         if slow_due:
-            if self.use_docker:
-                self._docker_stats = self._docker_stats_read()
+            if mode == "docker":
+                self._res_stats = self._docker_stats_read()
+            elif mode == "local" and snap.get("pid"):
+                self._res_stats = self._local_stats(snap["pid"])
+            elif mode == "api":
+                self._res_stats = None
             if self.show_gpu:
                 self._gpu_cache = self._gpu_read()
             self._slow_ts = now
 
-        snap["docker_stats"] = self._docker_stats if self.use_docker else None
+        snap["res_stats"] = self._res_stats if mode != "api" else None
         snap["gpus"] = self._gpu_cache if self.show_gpu else None
 
         ok, data = http_get_json(f"{self.api_url}/api/ps")
@@ -273,12 +508,90 @@ class Collector(threading.Thread):
         snap["models"] = data.get("models", []) if ok else []
         snap["models_err"] = "" if ok else str(data)
 
-        if self.use_docker and self.show_raw_ps:
-            ok2, out2 = run_cmd(["docker", "exec", self.container, "ollama", "ps"])
+        if self.show_raw_ps and mode in ("docker", "local"):
+            if mode == "docker":
+                cmd = ["docker", "exec", self.container, "ollama", "ps"]
+            else:
+                cmd = ["ollama", "ps"]
+            ok2, out2 = run_cmd(cmd)
             snap["raw_ps_ok"] = ok2
             snap["raw_ps"] = out2
 
         return snap
+
+    # -- local (bare-metal) process source -------------------------------------
+
+    def _local_status(self) -> tuple[str, int | None, str]:
+        """(status, pid, uptime_str) for a bare-metal ollama server.
+
+        Prefers systemd (gives a real activating/failed distinction and the
+        MainPID) and falls back to a /proc or pgrep scan for manual
+        `ollama serve` launches.
+        """
+        pid: int | None = None
+        status = "not found"
+        if IS_LINUX:
+            sd = systemd_ollama()
+            if sd is not None:
+                status, pid = sd
+        if pid is None:
+            pid = find_ollama_pid()
+            if pid is not None:
+                status = "running"
+        uptime = ""
+        if pid and IS_LINUX:
+            up = proc_uptime_sec(pid)
+            if up is not None:
+                uptime = fmt_duration(up)
+        return status, pid, uptime
+
+    def _local_stats(self, pid: int) -> dict | None:
+        """CPU/MEM for the local server process, in the same shape docker uses.
+
+        CPU is reported summed-across-cores (docker's {{.CPUPerc}} convention),
+        so the shared renderer's divide-by-cpu_limit produces a correct %.
+        """
+        total = total_ram_bytes()
+        if IS_DARWIN:
+            return self._local_stats_macos(pid, total)
+        return self._local_stats_linux(pid, total)
+
+    def _local_stats_linux(self, pid: int, total: int) -> dict | None:
+        ticks = read_proc_cpu_ticks(pid)
+        rss = read_proc_rss_bytes(pid)
+        if ticks is None or rss is None:
+            return None
+        now = time.monotonic()
+        cpu_pct = 0.0
+        prev = self._cpu_prev
+        if prev is not None and prev[0] == pid:
+            dt = now - prev[2]
+            if dt > 0:
+                cpu_pct = (ticks - prev[1]) / CLK_TCK / dt * 100.0
+        self._cpu_prev = (pid, ticks, now)
+        mem_pct = (rss / total * 100.0) if total else 0.0
+        return {
+            "cpu": f"{max(0.0, cpu_pct):.2f}%",
+            "mem_usage": f"{rss / 1024**3:.1f}GiB / {total / 1024**3:.1f}GiB",
+            "mem_pct": f"{mem_pct:.1f}%",
+        }
+
+    def _local_stats_macos(self, pid: int, total: int) -> dict | None:
+        # macOS ps %cpu is already summed-across-cores; rss is in KiB.
+        ok, out = run_cmd(["ps", "-o", "%cpu=,rss=", "-p", str(pid)], timeout=2)
+        if not ok or not out.strip():
+            return None
+        parts = out.split()
+        if len(parts) < 2:
+            return None
+        cpu_pct = to_float(parts[0]) or 0.0
+        rss = (to_float(parts[1]) or 0.0) * 1024
+        mem_pct = (rss / total * 100.0) if total else 0.0
+        return {
+            "cpu": f"{cpu_pct:.2f}%",
+            "mem_usage": f"{rss / 1024**3:.1f}GiB / {total / 1024**3:.1f}GiB",
+            "mem_pct": f"{mem_pct:.1f}%",
+        }
 
     def _inspect_container(self) -> tuple[str, str, float | None]:
         """(status, uptime, effective_cpu_limit) in a single inspect call.
@@ -554,6 +867,8 @@ def render_header(win, y: int, snap: dict, stale: bool) -> int:
     status = snap.get("status", "?")
     uptime = snap.get("uptime", "")
     container = snap.get("container", "?")
+    mode = snap.get("mode", "docker")
+    pid = snap.get("pid")
 
     # Top border: ╔═══ mtop v0.2.0 — Ollama Model Monitor ═══╗
     title = f" mtop v{__version__} — Ollama Model Monitor "
@@ -588,9 +903,16 @@ def render_header(win, y: int, snap: dict, stale: bool) -> int:
     host_room = max(1, col2 - 9 - 1)
     host_show = hostname if len(hostname) <= host_room else hostname[: host_room - 1] + "…"
     safe_addstr(win, y, 9, host_show, curses.color_pair(C_ACCENT))
-    if status == "api-only":
+    if mode == "api" or status == "api-only":
         safe_addstr(win, y, col2, "api: ", curses.color_pair(C_DIM))
         safe_addstr(win, y, col2 + 5, status_icon + snap.get("api_url", ""), status_attr)
+    elif mode == "local":
+        label = "ollama: "
+        val = status_icon + (f"serve · pid {pid}" if pid else "serve")
+        safe_addstr(win, y, col2, label, curses.color_pair(C_DIM))
+        safe_addstr(win, y, col2 + len(label), val, status_attr)
+        if uptime:
+            safe_addstr(win, y, col3, f"up: {uptime}", curses.color_pair(C_DIM))
     else:
         safe_addstr(win, y, col2, "container: ", curses.color_pair(C_DIM))
         safe_addstr(win, y, col2 + 11, status_icon + container, status_attr)
@@ -613,16 +935,18 @@ def render_header(win, y: int, snap: dict, stale: bool) -> int:
     return y
 
 
-def render_docker_stats(win, y: int, snap: dict) -> int:
-    """Show container CPU/MEM with progress bars from the snapshot."""
-    stats = snap.get("docker_stats")
+def render_resources(win, y: int, snap: dict) -> int:
+    """Show CPU/MEM with progress bars — container or bare-metal process."""
+    stats = snap.get("res_stats")
     if not stats:
         return y
 
-    y = section_header(win, y, " CONTAINER RESOURCES ")
+    label = " PROCESS RESOURCES " if snap.get("mode") == "local" \
+        else " CONTAINER RESOURCES "
+    y = section_header(win, y, label)
 
-    # Docker reports CPUPerc per-core (500% = 5 cores); normalize against
-    # the container's effective limit (--cpus / quota) or host core count.
+    # CPU% arrives summed-across-cores (docker {{.CPUPerc}} or /proc ticks
+    # delta); normalize against the effective core budget.
     cpu_raw = to_float(str(stats["cpu"]).rstrip("%")) or 0.0
     ncpu = snap.get("cpu_limit") or float(os.cpu_count() or 1)
     cpu_normalized = min(cpu_raw / ncpu, 100.0)
@@ -750,11 +1074,11 @@ def render_ollama_ps(win, y: int, snap: dict) -> int:
     return y
 
 
-def render_footer(win, interval: float, raw_ps: bool, use_docker: bool):
+def render_footer(win, interval: float, raw_ps: bool, can_raw_ps: bool):
     max_y, max_x = win.getmaxyx()
     footer_y = max_y - 1
     parts = ["q: quit", f"+/-: interval ({interval:.1f}s)"]
-    if use_docker:
+    if can_raw_ps:
         parts.append(f"o: raw ps [{'on' if raw_ps else 'off'}]")
     parts.append(f"mtop v{__version__}")
     footer = " " + " │ ".join(parts) + " "
@@ -777,7 +1101,7 @@ def curses_main(stdscr, args):
         api_url=args.api_url,
         interval=args.interval,
         show_gpu=not args.no_gpu,
-        use_docker=not args.no_docker,
+        mode=args.mode,
     )
     collector.start()
 
@@ -791,7 +1115,7 @@ def curses_main(stdscr, args):
                     collector.interval = max(0.5, collector.interval - 0.5)
                 elif key == ord("-"):
                     collector.interval = min(30.0, collector.interval + 0.5)
-                elif key == ord("o") and not args.no_docker:
+                elif key == ord("o"):
                     collector.show_raw_ps = not collector.show_raw_ps
                 elif key == curses.KEY_RESIZE:
                     stdscr.erase()
@@ -801,23 +1125,31 @@ def curses_main(stdscr, args):
             snap = collector.snapshot()
             age = time.monotonic() - snap.get("ts", 0.0)
             stale = snap.get("ts", 0.0) > 0 and age > collector.interval * STALE_FACTOR
+            mode = snap.get("mode", "")
 
             stdscr.erase()
             y = render_header(stdscr, 0, snap, stale)
 
             status = snap.get("status", "starting")
+            models_ok = snap.get("models_ok", False)
+            source_up = status in ("running", "api-only")
             if status == "starting":
                 y = safe_addstr(stdscr, y + 1, 3, "Collecting first snapshot…",
                                 curses.color_pair(C_DIM))
-            elif status not in ("running", "api-only"):
+            elif not source_up and not models_ok:
+                # source (container/process) is down AND the API isn't answering
+                subj = (f"Container '{args.container}'" if mode == "docker"
+                        else "Ollama process" if mode == "local"
+                        else "Ollama")
                 y = safe_addstr(stdscr, y + 1, 3,
-                                f"Container '{args.container}' is {status}. Waiting...",
+                                f"{subj} is {status}. Waiting...",
                                 curses.color_pair(C_ERR) | curses.A_BOLD)
                 y = safe_addstr(stdscr, y + 1, 3,
                                 "Will retry automatically.",
                                 curses.color_pair(C_DIM))
             else:
-                y = render_docker_stats(stdscr, y, snap)
+                # source up, or source down but API still answering (render models)
+                y = render_resources(stdscr, y, snap)
                 if not args.no_gpu:
                     y = render_gpu_stats(stdscr, y, snap)
                 y = render_models(stdscr, y, snap)
@@ -825,7 +1157,7 @@ def curses_main(stdscr, args):
                     y = render_ollama_ps(stdscr, y, snap)
 
             render_footer(stdscr, collector.interval, collector.show_raw_ps,
-                          not args.no_docker)
+                          mode in ("docker", "local"))
             stdscr.refresh()
     finally:
         collector.stop()
@@ -836,16 +1168,16 @@ def curses_main(stdscr, args):
 def json_main(args) -> int:
     """--json: run one collection pass, dump JSON to stdout.
 
-    Exit code 0 when the container is running (or --no-docker) and the API
-    answered; 1 otherwise. Suitable for cron, Prometheus textfile collectors
-    (post-processed), or Ansible facts.
+    Exit code 0 when the source (container/process) is up (or api mode) and
+    the API answered; 1 otherwise. Suitable for cron, Prometheus textfile
+    collectors (post-processed), or Ansible facts.
     """
     collector = Collector(
         container=args.container,
         api_url=args.api_url,
         interval=args.interval,
         show_gpu=not args.no_gpu,
-        use_docker=not args.no_docker,
+        mode=args.mode,
     )
     snap = collector.collect(time.monotonic())
     snap.pop("ts", None)  # monotonic value is meaningless outside the process
@@ -868,11 +1200,16 @@ def main():
     parser.add_argument("-u", "--api-url", default=DEFAULT_API_BASE,
                         help="Ollama API base URL (default: $OLLAMA_HOST or "
                              f"{DEFAULT_API_BASE})")
+    parser.add_argument("-m", "--mode", choices=["auto", "docker", "local", "api"],
+                        default="auto",
+                        help="Data source (default: auto — probe docker, then a "
+                             "bare-metal ollama process, else api). "
+                             "local: monitor a systemd/manual `ollama serve`. "
+                             "api: models only, no host resource stats.")
     parser.add_argument("--no-gpu", action="store_true",
                         help="Disable GPU stats section")
     parser.add_argument("--no-docker", action="store_true",
-                        help="API-only mode: skip all docker calls "
-                             "(for remote Ollama instances)")
+                        help="Alias for --mode api (kept for compatibility)")
     parser.add_argument("--json", action="store_true",
                         help="One-shot: print a single snapshot as JSON and exit "
                              "(exit code 1 on unhealthy)")
@@ -880,6 +1217,11 @@ def main():
                         version=f"mtop {__version__}")
     args = parser.parse_args()
     args.api_url = normalize_api_url(args.api_url)
+    # --no-docker is the v0.2.0 spelling of "api only"; let it win only when the
+    # user didn't pass an explicit --mode, so `--mode local --no-docker` errors
+    # toward the explicit choice rather than silently overriding it.
+    if args.no_docker and args.mode == "auto":
+        args.mode = "api"
 
     if args.json:
         sys.exit(json_main(args))
