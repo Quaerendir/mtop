@@ -3,7 +3,7 @@
 mtop — Ollama model monitor for Docker containers.
 curses-based TUI with zero flicker, color-coded status, GPU/container stats.
 
-Architecture (v0.2.0): a background collector thread gathers all data
+Architecture (v0.4.0): a background collector thread gathers all data
 (docker inspect/stats, nvidia-smi, Ollama API) and publishes immutable
 snapshots; the curses loop only draws the latest snapshot and handles
 keys at a fixed 100 ms poll. Slow or hung data sources can no longer
@@ -27,7 +27,10 @@ import urllib.request
 from datetime import datetime, timezone
 from typing import Any
 
-__version__ = "0.3.0"
+from .gpu import (AmdSysfsProvider, GpuMonitor, GpuProvider, NvidiaSmiProvider,
+                  RocmSmiProvider, TegraUnifiedProvider)
+
+__version__ = "0.4.0"
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
 
@@ -49,6 +52,7 @@ C_DIM = 5
 C_ACCENT = 6
 C_TABLE_HDR = 7
 C_GPU = 8
+C_AMD = 9
 
 
 def init_colors():
@@ -62,6 +66,7 @@ def init_colors():
     curses.init_pair(C_ACCENT, curses.COLOR_MAGENTA, -1)
     curses.init_pair(C_TABLE_HDR, curses.COLOR_WHITE, -1)
     curses.init_pair(C_GPU, curses.COLOR_GREEN, -1)
+    curses.init_pair(C_AMD, curses.COLOR_RED, -1)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -324,6 +329,210 @@ def read_proc_rss_bytes(pid: int) -> int | None:
     return None
 
 
+def read_proc_pss_bytes(pid: int) -> int | None:
+    """Proportional set size via /proc/<pid>/smaps_rollup, or None.
+
+    Preferred over VmRSS when rolling up a process tree: every runner maps the
+    same GGUF and the same CUDA/ROCm libraries, so summing VmRSS across the
+    tree double-counts the shared pages. PSS divides each shared page by the
+    number of mappers, which is exactly the accounting we want.
+
+    smaps_rollup needs PTRACE_MODE_READ on the target, so it works for our own
+    processes but not for another user's (the systemd unit runs as `ollama`).
+    Callers must fall back to VmRSS.
+    """
+    try:
+        with open(f"/proc/{pid}/smaps_rollup") as f:
+            for line in f:
+                if line.startswith("Pss:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def read_proc_ppid(pid: int) -> int | None:
+    """Parent PID from /proc/<pid>/stat field 4 (idx 1 after the comm split)."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            data = f.read()
+        return int(data.rsplit(")", 1)[1].split()[1])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def proc_children_map() -> dict[int, list[int]]:
+    """One /proc scan -> {ppid: [pid, ...]}."""
+    children: dict[int, list[int]] = {}
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return children
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        ppid = read_proc_ppid(pid)
+        if ppid is not None:
+            children.setdefault(ppid, []).append(pid)
+    return children
+
+
+def process_tree(root: int, children: dict[int, list[int]] | None = None) -> list[int]:
+    """[root] + all descendants.
+
+    Ollama runs the model in a child process, so the weights live below the
+    process we discovered via `serve` in argv. Reporting only the root makes a
+    multi-GB model look like a ~64 MiB server.
+
+    Matching is on ppid and never on process name: that child has been called
+    `ollama_llama_server`, then `ollama runner`, and is `llama-server` in
+    current builds. Name matching would break on the next rename — and `pgrep
+    -C ollama` never sees it at all.
+    """
+    if children is None:
+        children = proc_children_map()
+    out = [root]
+    stack = list(children.get(root, []))
+    seen = {root}
+    while stack:
+        pid = stack.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        out.append(pid)
+        stack.extend(children.get(pid, []))
+    return out
+
+
+def read_proc_cmdline(pid: int) -> list[str] | None:
+    """argv of a PID as a list, or None."""
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            raw = f.read()
+    except (OSError, ValueError):
+        return None
+    args = [a for a in raw.decode("utf-8", "replace").split("\x00") if a]
+    return args or None
+
+
+# Every name this process has shipped under. Kept as a hint for the *display*
+# only — tree membership is decided by ppid, never by these (see process_tree).
+RUNNER_BASENAMES = {"llama-server", "ollama_llama_server", "ollama-runner"}
+
+# argv flag -> (key, takes_value). Long and short spellings both appear
+# depending on the llama.cpp vintage Ollama vendored.
+_RUNNER_FLAGS: dict[str, tuple[str, bool]] = {
+    "--model": ("model", True), "-m": ("model", True),
+    "--ctx-size": ("ctx", True), "-c": ("ctx", True),
+    "--batch-size": ("batch", True), "-b": ("batch", True),
+    "--ubatch-size": ("ubatch", True), "-ub": ("ubatch", True),
+    "--parallel": ("parallel", True), "-np": ("parallel", True),
+    "--n-gpu-layers": ("ngl", True), "--gpu-layers": ("ngl", True),
+    "-ngl": ("ngl", True),
+    "--cache-type-k": ("kv_k", True), "-ctk": ("kv_k", True),
+    "--cache-type-v": ("kv_v", True), "-ctv": ("kv_v", True),
+    "--mmproj": ("mmproj", True),
+    "--port": ("port", True),
+    "--tensor-split": ("tensor_split", True), "-ts": ("tensor_split", True),
+    "--main-gpu": ("main_gpu", True), "-mg": ("main_gpu", True),
+    "--direct-io": ("direct_io", False),
+    "--no-mmap": ("no_mmap", False),
+    "--context-shift": ("context_shift", False),
+}
+
+
+def parse_runner_argv(args: list[str]) -> dict | None:
+    """Extract the effective inference config from a runner's argv.
+
+    This is the only place the *negotiated* settings are visible. `/api/ps`
+    reports the context length and nothing else; everything Ollama worked out
+    between the Modelfile, the environment and its own heuristics — flash
+    attention, KV cache dtype, batch sizes, layer split — exists only here.
+    Notably `OLLAMA_FLASH_ATTENTION=1` shows up as `--flash-attn on` while an
+    unset environment yields `--flash-attn auto`, which is how you tell whether
+    the variable actually reached the server.
+    """
+    if not args:
+        return None
+    base = os.path.basename(args[0])
+    if base not in RUNNER_BASENAMES and not (
+            base == "ollama" and "runner" in args[1:]):
+        return None
+
+    out: dict[str, Any] = {}
+    i = 1
+    while i < len(args):
+        spec = _RUNNER_FLAGS.get(args[i])
+        if spec is None:
+            # --flash-attn takes an optional value: 'on'/'off'/'auto' in recent
+            # builds, bare (implying on) in older ones.
+            if args[i] in ("--flash-attn", "-fa"):
+                nxt = args[i + 1] if i + 1 < len(args) else None
+                if nxt and not nxt.startswith("-"):
+                    out["flash_attn"] = nxt
+                    i += 2
+                    continue
+                out["flash_attn"] = "on"
+            i += 1
+            continue
+        key, takes_value = spec
+        if not takes_value:
+            out[key] = True
+            i += 1
+            continue
+        if i + 1 < len(args):
+            out[key] = args[i + 1]
+        i += 2
+
+    model = out.get("model", "")
+    digest = ""
+    if model:
+        stem = os.path.basename(str(model))
+        if stem.startswith("sha256-"):
+            digest = stem[len("sha256-"):]
+    out["digest"] = digest
+    return out
+
+
+def _claim(runner: dict, model: dict) -> None:
+    """Copy the API's view of a matched model onto its runner.
+
+    `size_vram` matters most: on accelerator-backed hosts the weights are device
+    allocations that never appear in the runner's VmRSS. On a GB10 Spark an 82 GB
+    model shows a 7.5 GiB RSS — the bytes come out of the same unified pool
+    (/proc/meminfo sees them) but are not charged to the process.
+    """
+    runner["model_name"] = model.get("name", "")
+    runner["vram"] = model.get("size_vram")
+    runner["model_size"] = model.get("size")
+
+
+def match_runners_to_models(runners: list[dict], models: list[dict]) -> None:
+    """Best-effort blob -> tag mapping, mutating `runners` in place.
+
+    The `--model` path is a blob digest; `/api/tags` and `/api/ps` expose the
+    *manifest* digest, so there is no direct join. Two honest heuristics, in
+    order, and a shortened digest when neither is conclusive — a wrong tag on a
+    monitoring screen is worse than no tag:
+
+    1. context length, when it uniquely identifies one loaded model;
+    2. one unmatched runner left facing one unmatched model.
+    """
+    unclaimed = list(models)
+    for r in runners:
+        ctx = to_float(r.get("ctx"))
+        if ctx is None:
+            continue
+        hits = [m for m in unclaimed if to_float(m.get("context_length")) == ctx]
+        if len(hits) == 1:
+            _claim(r, hits[0])
+            unclaimed.remove(hits[0])
+    rest = [r for r in runners if not r.get("model_name")]
+    if len(rest) == 1 and len(unclaimed) == 1:
+        _claim(rest[0], unclaimed[0])
+
+
 def proc_uptime_sec(pid: int) -> float | None:
     """Seconds since a PID started: system uptime minus the process starttime."""
     try:
@@ -370,7 +579,8 @@ class Collector(threading.Thread):
     """
 
     def __init__(self, container: str, api_url: str, interval: float,
-                 show_gpu: bool, mode: str = "auto", show_raw_ps: bool = False):
+                 show_gpu: bool, mode: str = "auto", show_raw_ps: bool = False,
+                 show_runners: bool = True):
         super().__init__(daemon=True, name="mtop-collector")
         self.container = container
         self.api_url = api_url
@@ -379,6 +589,7 @@ class Collector(threading.Thread):
         self.mode = mode                    # requested: auto|docker|local|api
         self._resolved: str | None = None   # concrete mode once known
         self.show_raw_ps = show_raw_ps
+        self.show_runners = show_runners
 
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -389,16 +600,18 @@ class Collector(threading.Thread):
         # +/- interval changes take effect (fixes v0.1.0 frozen-cap bug).
         self._slow_ts: float = 0.0
         self._res_stats: dict | None = None
+        self._runners: list[dict] | None = None
         self._gpu_cache: list[dict] | None = None
 
-        # Memoized GPU probe strategy: "host" | "container" | "unified" | None.
-        # Avoids re-forking failed nvidia-smi probes every cycle on boxes
-        # without a GPU; reset on failure so hotplug/driver restarts recover.
-        self._gpu_mode: str | None = None
+        # Multi-vendor GPU registry, built lazily so `use_docker` is already
+        # resolved when the nvidia provider asks for its argv prefixes.
+        self._gpu_monitor: GpuMonitor | None = None
 
-        # Previous CPU sample for the local process, keyed by pid so a restart
-        # (new pid) resets the baseline instead of reporting a bogus spike.
-        self._cpu_prev: tuple[int, int, float] | None = None  # (pid, ticks, mono)
+        # Previous CPU sample for the local process tree: (root_pid,
+        # {pid: ticks}, monotonic). Keyed by root pid so a server restart
+        # resets the baseline, and per-pid inside so a runner spawning or
+        # exiting does not register as a CPU spike.
+        self._cpu_prev: tuple[int, dict[int, int], float] | None = None
 
     @property
     def use_docker(self) -> bool:
@@ -473,8 +686,9 @@ class Collector(threading.Thread):
         }
 
         if mode == "docker":
-            status, uptime, cpu_limit = self._inspect_container()
-            snap.update(status=status, uptime=uptime, cpu_limit=cpu_limit, pid=None)
+            status, uptime, cpu_limit, init_pid = self._inspect_container()
+            snap.update(status=status, uptime=uptime, cpu_limit=cpu_limit,
+                        pid=init_pid)
             if status != "running":
                 return snap
         elif mode == "local":
@@ -500,13 +714,20 @@ class Collector(threading.Thread):
                 self._gpu_cache = self._gpu_read()
             self._slow_ts = now
 
+        if slow_due and mode == "docker":
+            self._runners = self._docker_runners(snap.get("pid"))
+
         snap["res_stats"] = self._res_stats if mode != "api" else None
+        snap["runners"] = (self._runners if mode == "docker"
+                           else (self._res_stats or {}).get("runners"))
         snap["gpus"] = self._gpu_cache if self.show_gpu else None
 
         ok, data = http_get_json(f"{self.api_url}/api/ps")
         snap["models_ok"] = ok
         snap["models"] = data.get("models", []) if ok else []
         snap["models_err"] = "" if ok else str(data)
+        if snap.get("runners") and snap["models"]:
+            match_runners_to_models(snap["runners"], snap["models"])
 
         if self.show_raw_ps and mode in ("docker", "local"):
             if mode == "docker":
@@ -557,44 +778,114 @@ class Collector(threading.Thread):
         return self._local_stats_linux(pid, total)
 
     def _local_stats_linux(self, pid: int, total: int) -> dict | None:
-        ticks = read_proc_cpu_ticks(pid)
-        rss = read_proc_rss_bytes(pid)
-        if ticks is None or rss is None:
+        """CPU/MEM rolled up over the server process and its model runners.
+
+        CPU deltas are computed per-pid and summed only over pids present in
+        *both* samples. Summing the tree totals instead would report a huge
+        spike the cycle a runner spawns (its accumulated ticks appear at once)
+        and a clamped-to-zero dip the cycle one exits.
+        """
+        tree = process_tree(pid)
+        ticks_by_pid: dict[int, int] = {}
+        rss = 0
+        pss = 0
+        pss_complete = True
+        runners: list[dict] = []
+        for p in tree:
+            t = read_proc_cpu_ticks(p)
+            if t is not None:
+                ticks_by_pid[p] = t
+            r = read_proc_rss_bytes(p)
+            if r is not None:
+                rss += r
+            q = read_proc_pss_bytes(p)
+            if q is None:
+                pss_complete = False
+            else:
+                pss += q
+            if p != pid:
+                # cmdline is one extra read on a /proc entry we already opened,
+                # and it is the only source for the effective inference config.
+                info = parse_runner_argv(read_proc_cmdline(p) or [])
+                if info:
+                    info["pid"] = p
+                    info["rss"] = r
+                    runners.append(info)
+        if not ticks_by_pid:
             return None
+
         now = time.monotonic()
         cpu_pct = 0.0
         prev = self._cpu_prev
         if prev is not None and prev[0] == pid:
             dt = now - prev[2]
             if dt > 0:
-                cpu_pct = (ticks - prev[1]) / CLK_TCK / dt * 100.0
-        self._cpu_prev = (pid, ticks, now)
-        mem_pct = (rss / total * 100.0) if total else 0.0
+                delta = sum(ticks_by_pid[p] - prev[1][p]
+                            for p in ticks_by_pid if p in prev[1])
+                cpu_pct = delta / CLK_TCK / dt * 100.0
+        self._cpu_prev = (pid, ticks_by_pid, now)
+
+        # PSS when every process in the tree was readable, else RSS. Mixed
+        # accounting would be worse than either: silently omitting a runner's
+        # share is a bigger error than double-counting shared library pages.
+        mem = pss if (pss_complete and pss) else rss
+        mem_pct = (mem / total * 100.0) if total else 0.0
         return {
             "cpu": f"{max(0.0, cpu_pct):.2f}%",
-            "mem_usage": f"{rss / 1024**3:.1f}GiB / {total / 1024**3:.1f}GiB",
+            "mem_usage": f"{mem / 1024**3:.1f}GiB / {total / 1024**3:.1f}GiB",
             "mem_pct": f"{mem_pct:.1f}%",
+            "mem_kind": "pss" if (pss_complete and pss) else "rss",
+            "procs": len(tree),
+            "runners": runners,
         }
 
     def _local_stats_macos(self, pid: int, total: int) -> dict | None:
-        # macOS ps %cpu is already summed-across-cores; rss is in KiB.
-        ok, out = run_cmd(["ps", "-o", "%cpu=,rss=", "-p", str(pid)], timeout=2)
+        """Same tree rollup as Linux, but from one `ps -ax` snapshot.
+
+        No /proc, and no PSS equivalent that does not need root, so this is
+        RSS-based and will over-count pages shared between the runners.
+        """
+        ok, out = run_cmd(["ps", "-axo", "pid=,ppid=,%cpu=,rss=,args="], timeout=3)
         if not ok or not out.strip():
             return None
-        parts = out.split()
-        if len(parts) < 2:
+        procs: dict[int, tuple[int, float, float]] = {}
+        argv: dict[int, list[str]] = {}
+        children: dict[int, list[int]] = {}
+        for line in out.splitlines():
+            f = line.split()
+            if len(f) < 4 or not f[0].isdigit() or not f[1].isdigit():
+                continue
+            p, pp = int(f[0]), int(f[1])
+            procs[p] = (pp, to_float(f[2]) or 0.0, (to_float(f[3]) or 0.0) * 1024)
+            argv[p] = f[4:]
+            children.setdefault(pp, []).append(p)
+        if pid not in procs:
             return None
-        cpu_pct = to_float(parts[0]) or 0.0
-        rss = (to_float(parts[1]) or 0.0) * 1024
+
+        tree = process_tree(pid, children)
+        cpu_pct = sum(procs[p][1] for p in tree if p in procs)
+        rss = sum(procs[p][2] for p in tree if p in procs)
+        runners = []
+        for p in tree:
+            if p == pid:
+                continue
+            info = parse_runner_argv(argv.get(p, []))
+            if info:
+                info["pid"] = p
+                info["rss"] = procs[p][2] if p in procs else None
+                runners.append(info)
         mem_pct = (rss / total * 100.0) if total else 0.0
         return {
             "cpu": f"{cpu_pct:.2f}%",
             "mem_usage": f"{rss / 1024**3:.1f}GiB / {total / 1024**3:.1f}GiB",
             "mem_pct": f"{mem_pct:.1f}%",
+            "mem_kind": "rss",
+            "procs": len(tree),
+            "runners": runners,
         }
 
-    def _inspect_container(self) -> tuple[str, str, float | None]:
-        """(status, uptime, effective_cpu_limit) in a single inspect call.
+    def _inspect_container(self) -> tuple[str, str, float | None, int | None]:
+        """(status, uptime, effective_cpu_limit, init_pid) in a single inspect call.
 
         CPU limit comes from HostConfig (NanoCpus for --cpus, quota/period
         for --cpu-quota); falls back to host core count. This makes the CPU
@@ -604,10 +895,10 @@ class Collector(threading.Thread):
         """
         fmt = ("{{.State.Status}}\t{{.State.StartedAt}}\t"
                "{{.HostConfig.NanoCpus}}\t{{.HostConfig.CpuQuota}}\t"
-               "{{.HostConfig.CpuPeriod}}")
+               "{{.HostConfig.CpuPeriod}}\t{{.State.Pid}}")
         ok, out = run_cmd(["docker", "inspect", "--format", fmt, self.container])
         if not ok:
-            return "not found", "", None
+            return "not found", "", None, None
         parts = out.split("\t")
         status = parts[0].strip()
         uptime = ""
@@ -627,7 +918,13 @@ class Collector(threading.Thread):
             pass
         if not cpu_limit or cpu_limit <= 0:
             cpu_limit = float(os.cpu_count() or 1)
-        return status, uptime, cpu_limit
+        init_pid = None
+        try:
+            if len(parts) > 5 and parts[5].strip():
+                init_pid = int(parts[5]) or None
+        except ValueError:
+            pass
+        return status, uptime, cpu_limit, init_pid
 
     def _docker_stats_read(self) -> dict | None:
         fmt = "{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}"
@@ -645,87 +942,83 @@ class Collector(threading.Thread):
             "mem_pct": parts[2].strip(),
         }
 
+    def _docker_runners(self, init_pid: int | None) -> list[dict] | None:
+        """Runner argv for a containerized Ollama.
+
+        Preferred path: walk the container init PID's tree on the *host* /proc.
+        Same kernel, so the runners are visible there, and it costs no exec.
+        Falls back to one `docker exec` reading every cmdline in the container's
+        PID namespace — needed when mtop itself runs containerized without the
+        host PID namespace, at the price of no per-runner RSS.
+        """
+        runners: list[dict] = []
+        if init_pid and IS_LINUX:
+            for p in process_tree(init_pid):
+                info = parse_runner_argv(read_proc_cmdline(p) or [])
+                if info:
+                    info["pid"] = p
+                    info["rss"] = read_proc_rss_bytes(p)
+                    runners.append(info)
+            if runners:
+                return runners
+
+        # `head -c` on a glob emits '==> /proc/N/cmdline <==' separators, which
+        # is the cheapest way to get every argv out in a single exec.
+        ok, out = run_cmd(
+            ["docker", "exec", self.container, "sh", "-c",
+             "head -c 4096 /proc/[0-9]*/cmdline 2>/dev/null"], timeout=5)
+        if not ok or not out:
+            return runners or None
+        pid_now: int | None = None
+        for chunk in out.split("==> "):
+            if not chunk.strip():
+                continue
+            head, _, body = chunk.partition(" <==")
+            try:
+                pid_now = int(head.split("/")[2])
+            except (IndexError, ValueError):
+                continue
+            args = [a for a in body.replace("\x00", "\0").split("\0") if a.strip()]
+            if len(args) < 2:
+                args = [a for a in body.split() if a]
+            info = parse_runner_argv(args)
+            if info:
+                info["pid"] = pid_now
+                info["rss"] = None
+                runners.append(info)
+        return runners or None
+
     # -- GPU -------------------------------------------------------------------
 
-    def _nvidia_smi(self, prefix: list[str]) -> list[dict] | None:
-        query = "name,utilization.gpu,memory.used,memory.total,temperature.gpu"
-        cmd = prefix + [
-            "nvidia-smi",
-            f"--query-gpu={query}",
-            "--format=csv,noheader,nounits",
+    def _build_gpu_providers(self) -> list[GpuProvider]:
+        """Every provider that could plausibly answer on this host.
+
+        The registry runs all of them and concatenates the results, so a box
+        with an NVIDIA card *and* a Radeon shows both. v0.3.0 memoized a single
+        winning strategy and structurally could not.
+        """
+        def nvidia_prefixes() -> list[list[str]]:
+            prefixes: list[list[str]] = [[]]          # host first
+            if self.use_docker:
+                prefixes.append(["docker", "exec", self.container])
+            return prefixes
+
+        providers: list[GpuProvider] = [
+            NvidiaSmiProvider(run_cmd, nvidia_prefixes),
         ]
-        ok, out = run_cmd(cmd, timeout=3)
-        if not ok or not out:
-            return None
-        gpus = []
-        for line in out.strip().split("\n"):
-            fields = [f.strip() for f in line.split(",")]
-            if len(fields) >= 5:
-                gpus.append({
-                    "name": fields[0],
-                    "util": fields[1],
-                    "mem_used": fields[2],
-                    "mem_total": fields[3],
-                    "temp": fields[4],
-                })
-        return gpus or None
+        if IS_LINUX:
+            providers += [
+                AmdSysfsProvider(),
+                RocmSmiProvider(run_cmd),
+                TegraUnifiedProvider(read_unified_memory),
+            ]
+        return providers
 
     def _gpu_read(self) -> list[dict] | None:
-        """Probe GPU stats, memoizing which strategy worked.
-
-        On unified-memory platforms (GB10 Spark, Jetson, Orin under recent
-        DGX OS / JetPack) nvidia-smi is present but reports memory fields
-        as '[N/A]'. v0.1.0 accepted that output verbatim and the VRAM bar
-        silently vanished; now incomplete memory data gets patched from
-        /proc/meminfo while util/temp (when numeric) are kept.
-        """
-        host_prefix: list[str] = []
-        cont_prefix = ["docker", "exec", self.container] if self.use_docker else None
-
-        if self._gpu_mode == "host":
-            candidates = [("host", host_prefix)]
-        elif self._gpu_mode == "container" and cont_prefix:
-            candidates = [("container", cont_prefix)]
-        elif self._gpu_mode == "unified":
-            candidates = []
-        else:
-            candidates = [("host", host_prefix)]
-            if cont_prefix:
-                candidates.append(("container", cont_prefix))
-
-        for mode, prefix in candidates:
-            gpus = self._nvidia_smi(prefix)
-            if gpus:
-                self._gpu_mode = mode
-                return self._patch_unified(gpus)
-
-        uni = read_unified_memory()
-        if uni:
-            self._gpu_mode = "unified"
-            model, used_mib, total_mib = uni
-            return [{
-                "name": model,
-                "util": "N/A",
-                "mem_used": str(used_mib),
-                "mem_total": str(total_mib),
-                "temp": "N/A",
-            }]
-
-        # Nothing worked — forget the memo so a driver restart / container
-        # start is picked up on the next slow cycle.
-        self._gpu_mode = None
-        return None
-
-    def _patch_unified(self, gpus: list[dict]) -> list[dict]:
-        """Fill '[N/A]' memory fields from /proc/meminfo on unified platforms."""
-        if len(gpus) == 1 and to_float(gpus[0]["mem_total"]) is None:
-            uni = read_unified_memory()
-            if uni:
-                _, used_mib, total_mib = uni
-                gpus[0]["mem_used"] = str(used_mib)
-                gpus[0]["mem_total"] = str(total_mib)
-                gpus[0]["unified"] = True
-        return gpus
+        if self._gpu_monitor is None:
+            self._gpu_monitor = GpuMonitor(self._build_gpu_providers(),
+                                           time.monotonic)
+        return self._gpu_monitor.collect()
 
 
 # ── Curses drawing helpers ────────────────────────────────────────────────────
@@ -908,7 +1201,10 @@ def render_header(win, y: int, snap: dict, stale: bool) -> int:
         safe_addstr(win, y, col2 + 5, status_icon + snap.get("api_url", ""), status_attr)
     elif mode == "local":
         label = "ollama: "
-        val = status_icon + (f"serve · pid {pid}" if pid else "serve")
+        # "+2r" = two model runner subprocesses rolled into the stats below.
+        procs = (snap.get("res_stats") or {}).get("procs") or 1
+        runners = f" +{procs - 1}r" if procs > 1 else ""
+        val = status_icon + (f"serve · pid {pid}{runners}" if pid else "serve")
         safe_addstr(win, y, col2, label, curses.color_pair(C_DIM))
         safe_addstr(win, y, col2 + len(label), val, status_attr)
         if uptime:
@@ -960,7 +1256,13 @@ def render_resources(win, y: int, snap: dict) -> int:
 
     mem_val = to_float(str(stats["mem_pct"]).rstrip("%")) or 0.0
     y = draw_bar(win, y, 3, "MEM  ", mem_val, 30, C_OK)
-    draw_detail_right(win, y - 1, bar_end_x(3, "MEM  ", 30), stats["mem_usage"],
+    mem_detail = stats["mem_usage"]
+    kind = stats.get("mem_kind")
+    if kind:
+        # PSS and RSS differ by a lot once several runners share a GGUF; say
+        # which one the bar is showing rather than making the user guess.
+        mem_detail += f" ({kind})"
+    draw_detail_right(win, y - 1, bar_end_x(3, "MEM  ", 30), mem_detail,
                       curses.color_pair(C_DIM))
 
     y += 1
@@ -979,26 +1281,43 @@ def render_gpu_stats(win, y: int, snap: dict) -> int:
         return y
 
     for i, gpu in enumerate(gpus):
-        prefix = f"[{i}] {gpu['name']}"
+        vendor = gpu.get("vendor", "nvidia")
+        color = C_AMD if vendor == "amd" else C_GPU
+        # Index is the provider's own (nvidia-smi index / PCI order), which is
+        # not the position in this list once two vendors are present.
+        prefix = f"[{vendor}:{gpu.get('index', i)}] {gpu['name']}"
         temp_val = to_float(gpu["temp"])
         temp_str = f"  {gpu['temp']}°C" if temp_val is not None else ""
+        if gpu.get("power") and to_float(gpu["power"]) is not None:
+            temp_str += f"  {to_float(gpu['power']):.0f}W"
         if gpu.get("unified"):
             temp_str += "  (unified memory)"
-        y = safe_addstr(win, y, 3, prefix + temp_str, curses.color_pair(C_GPU))
+        y = safe_addstr(win, y, 3, prefix + temp_str, curses.color_pair(color))
 
         # GPU utilization bar
         util_val = to_float(gpu["util"])
         if util_val is not None:
-            y = draw_bar(win, y, 5, "UTIL ", util_val, 25, C_GPU)
+            y = draw_bar(win, y, 5, "UTIL ", util_val, 25, color)
 
         # VRAM bar
         mem_used = to_float(gpu["mem_used"])
         mem_total = to_float(gpu["mem_total"])
         if mem_used is not None and mem_total and mem_total > 0:
             mem_pct = mem_used / mem_total * 100
-            y = draw_bar(win, y, 5, "VRAM ", mem_pct, 25, C_GPU)
+            label = "MEM  " if gpu.get("unified") else "VRAM "
+            y = draw_bar(win, y, 5, label, mem_pct, 25, color)
             vram_str = f"{mem_used:.0f} / {mem_total:.0f} MiB"
-            draw_detail_right(win, y - 1, bar_end_x(5, "VRAM ", 25), vram_str,
+            draw_detail_right(win, y - 1, bar_end_x(5, label, 25), vram_str,
+                              curses.color_pair(C_DIM))
+
+        # GTT is a second pool on dGPUs (host memory the card can pull from);
+        # only worth a line when something actually lives there.
+        gtt_used = to_float(gpu.get("gtt_used", ""))
+        gtt_total = to_float(gpu.get("gtt_total", ""))
+        if gtt_used and gtt_total and gtt_used / gtt_total > 0.01:
+            y = draw_bar(win, y, 5, "GTT  ", gtt_used / gtt_total * 100, 25, C_DIM)
+            draw_detail_right(win, y - 1, bar_end_x(5, "GTT  ", 25),
+                              f"{gtt_used:.0f} / {gtt_total:.0f} MiB",
                               curses.color_pair(C_DIM))
 
     y += 1
@@ -1074,12 +1393,69 @@ def render_ollama_ps(win, y: int, snap: dict) -> int:
     return y
 
 
-def render_footer(win, interval: float, raw_ps: bool, can_raw_ps: bool):
+def render_runners(win, y: int, snap: dict) -> int:
+    """Effective inference config, one row per model runner process.
+
+    Everything here comes from the runner's argv, which is the only place the
+    negotiated settings are observable: `/api/ps` reports the context length and
+    stops. `FA` reading `on` vs `auto` is the difference between
+    OLLAMA_FLASH_ATTENTION having reached the server and the backend deciding
+    for itself.
+
+    VRAM and HOST are deliberately separate columns measuring different things.
+    VRAM is Ollama's own `size_vram` for the matched model; HOST is the runner
+    process's resident set. On CPU inference they converge. On an accelerator
+    they do not and should not: weights allocated through CUDA/ROCm/Metal are
+    not charged to the process, so a GB10 Spark holding an 82 GB model reports
+    ~7.5 GiB of host RSS. The gap between the two columns *is* the device-memory
+    footprint.
+    """
+    runners = snap.get("runners")
+    if not runners:
+        return y
+    y = section_header(win, y, " RUNNERS ")
+
+    rows = []
+    for r in runners:
+        kv_k, kv_v = r.get("kv_k", ""), r.get("kv_v", "")
+        kv = kv_k if kv_k == kv_v else "/".join(x for x in (kv_k, kv_v) if x)
+        rss = r.get("rss")
+        vram = r.get("vram")
+        name = r.get("model_name") or (r.get("digest", "")[:12] or "—")
+        extras = []
+        if r.get("ngl"):
+            extras.append(f"ngl:{r['ngl']}")
+        if r.get("mmproj"):
+            extras.append("mmproj")
+        if r.get("direct_io"):
+            extras.append("O_DIRECT")
+        rows.append([
+            str(r.get("pid", "—")),
+            name,
+            str(r.get("ctx", "—")),
+            str(r.get("batch", "—")),
+            str(r.get("flash_attn", "—")),
+            kv or "—",
+            f"{vram / 1024**3:.1f} G" if vram else "—",
+            f"{rss / 1024**3:.1f} G" if rss else "—",
+            ",".join(extras) or "",
+        ])
+    y = draw_table(win, y, 3,
+                   ["PID", "MODEL", "CTX", "BATCH", "FA", "KV", "VRAM", "HOST", ""],
+                   rows, [8, 32, 7, 6, 5, 9, 8, 8, 20],
+                   hdr_attr=curses.color_pair(C_TABLE_HDR) | curses.A_BOLD)
+    y += 1
+    return y
+
+
+def render_footer(win, interval: float, raw_ps: bool, can_raw_ps: bool,
+                  runners: bool = True):
     max_y, max_x = win.getmaxyx()
     footer_y = max_y - 1
     parts = ["q: quit", f"+/-: interval ({interval:.1f}s)"]
     if can_raw_ps:
         parts.append(f"o: raw ps [{'on' if raw_ps else 'off'}]")
+        parts.append(f"r: runners [{'on' if runners else 'off'}]")
     parts.append(f"mtop v{__version__}")
     footer = " " + " │ ".join(parts) + " "
     footer = footer[: max_x - 1].ljust(max_x - 1)
@@ -1102,6 +1478,7 @@ def curses_main(stdscr, args):
         interval=args.interval,
         show_gpu=not args.no_gpu,
         mode=args.mode,
+        show_runners=not args.no_runners,
     )
     collector.start()
 
@@ -1117,6 +1494,8 @@ def curses_main(stdscr, args):
                     collector.interval = min(30.0, collector.interval + 0.5)
                 elif key == ord("o"):
                     collector.show_raw_ps = not collector.show_raw_ps
+                elif key == ord("r"):
+                    collector.show_runners = not collector.show_runners
                 elif key == curses.KEY_RESIZE:
                     stdscr.erase()
             except curses.error:
@@ -1153,11 +1532,13 @@ def curses_main(stdscr, args):
                 if not args.no_gpu:
                     y = render_gpu_stats(stdscr, y, snap)
                 y = render_models(stdscr, y, snap)
+                if collector.show_runners:
+                    y = render_runners(stdscr, y, snap)
                 if collector.show_raw_ps and "raw_ps" in snap:
                     y = render_ollama_ps(stdscr, y, snap)
 
             render_footer(stdscr, collector.interval, collector.show_raw_ps,
-                          mode in ("docker", "local"))
+                          mode in ("docker", "local"), collector.show_runners)
             stdscr.refresh()
     finally:
         collector.stop()
@@ -1178,6 +1559,7 @@ def json_main(args) -> int:
         interval=args.interval,
         show_gpu=not args.no_gpu,
         mode=args.mode,
+        show_runners=not args.no_runners,
     )
     snap = collector.collect(time.monotonic())
     snap.pop("ts", None)  # monotonic value is meaningless outside the process
@@ -1190,7 +1572,8 @@ def main():
     parser = argparse.ArgumentParser(
         description="mtop — Ollama model monitor for Docker containers",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="Keys: q=quit, +=faster, -=slower, o=toggle raw ollama ps\n\n"
+        epilog="Keys: q=quit, +=faster, -=slower, o=toggle raw ollama ps, "
+               "r=toggle runners\n\n"
                "https://github.com/Quaerendir/mtop",
     )
     parser.add_argument("-c", "--container", default=DEFAULT_CONTAINER,
@@ -1208,6 +1591,9 @@ def main():
                              "api: models only, no host resource stats.")
     parser.add_argument("--no-gpu", action="store_true",
                         help="Disable GPU stats section")
+    parser.add_argument("--no-runners", action="store_true",
+                        help="Hide the RUNNERS section (effective inference "
+                             "config parsed from each runner process argv)")
     parser.add_argument("--no-docker", action="store_true",
                         help="Alias for --mode api (kept for compatibility)")
     parser.add_argument("--json", action="store_true",

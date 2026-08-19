@@ -18,9 +18,12 @@ There are web dashboards, Prometheus exporters, and chat TUIs for Ollama. But th
 ## Features
 
 - **Zero-flicker display** — curses double-buffered rendering, no `clear` + print loops
+- **Effective inference config** — `RUNNERS` section parses each runner's argv: context, batch, flash attention, KV cache dtype, layer offload. The only place these are observable
+- **Whole-tree process stats** — the server *and* its per-model `ollama runner` subprocesses, with PSS accounting where available
 - **Loaded models** — name, VRAM/RAM split, context length, processor type, TTL countdown
 - **Container health** — status indicator (●/✗/○), uptime, CPU & memory with progress bars
-- **GPU monitoring** — NVIDIA desktop GPUs via `nvidia-smi`, with utilization and VRAM bars
+- **Multi-vendor GPU monitoring** — NVIDIA via `nvidia-smi` *and* AMD via sysfs, side by side on the same host; utilization, VRAM/GTT, temperature, power draw
+- **AMD without ROCm** — telemetry comes from `/sys/class/drm/card*/device`, so a bare `amdgpu` driver is enough; `rocm-smi` is only a fallback
 - **Jetson / Tegra / NVIDIA Spark** — automatic fallback to unified memory via `/proc/meminfo`
 - **Non-blocking UI** — all I/O (docker, nvidia-smi, HTTP) runs in a background collector thread; the interface stays responsive at 100 ms even when the API hangs, and stale data is flagged
 - **Interactive** — `q` to quit, `+`/`-` to adjust refresh interval, `o` to toggle raw `ollama ps`
@@ -37,7 +40,7 @@ There are web dashboards, Prometheus exporters, and chat TUIs for Ollama. But th
 ### One-liner (no install)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Quaerendir/mtop/master/src/mtop/__init__.py -o mtop.py
+curl -fsSL https://github.com/Quaerendir/mtop/releases/latest/download/mtop.py -o mtop.py
 chmod +x mtop.py
 ./mtop.py
 ```
@@ -82,6 +85,7 @@ Options:
   -u, --api-url URL      Ollama API base URL (default: $OLLAMA_HOST or http://localhost:11434)
                          Scheme-less values (gpu-rig:11434) are accepted, like Ollama itself
       --no-gpu           Disable GPU monitoring section
+      --no-runners       Hide the RUNNERS section (effective inference config)
       --no-docker        API-only mode: skip all docker calls (remote instances)
       --json             Print one snapshot as JSON and exit (exit 1 on unhealthy)
   -V, --version          Show version
@@ -122,6 +126,7 @@ mtop
 | `+` | Decrease refresh interval (faster) |
 | `-` | Increase refresh interval (slower) |
 | `o` | Toggle raw `ollama ps` section |
+| `r` | Toggle the `RUNNERS` section |
 
 ## Display Layout
 
@@ -152,6 +157,8 @@ OLLAMA PS (raw)
 | Linux x86_64 + NVIDIA | ✅ Full | `nvidia-smi` on host or in container |
 | NVIDIA Jetson / Orin | ✅ Unified memory | Falls back to `/proc/meminfo` |
 | NVIDIA GB10 Spark | ✅ Unified memory | Tegra-based, same fallback |
+| Linux + AMD (amdgpu) | ✅ Full | sysfs — no ROCm install required |
+| AMD APU (780M, Strix) | ✅ Unified memory | GTT pool, not the tiny VRAM carve-out |
 | Linux without GPU | ✅ (no GPU section) | Use `--no-gpu` to hide the section |
 | Bare-metal Ollama (systemd) | ✅ process stats | `--mode local`; CPU/MEM from `/proc`, no root needed |
 | Manual `ollama serve` | ✅ process stats | auto-detected via `/proc` cmdline scan |
@@ -168,7 +175,7 @@ OLLAMA PS (raw)
 ## Roadmap
 
 - [ ] Record terminal sessions with `asciinema` for README gif
-- [ ] AMD ROCm GPU support (`rocm-smi`)
+- [x] AMD GPU support (sysfs first, `rocm-smi` fallback)
 - [ ] Apple Silicon GPU stats (via `powermetrics`)
 - [ ] Model pull progress tracking
 - [ ] Multiple container / multi-host support
@@ -177,6 +184,7 @@ OLLAMA PS (raw)
 - [ ] Sparkline history for CPU/GPU utilization (braille chars, stdlib deque)
 - [x] systemd/bare-metal Ollama support (process stats via `/proc`, no Docker required)
 - [ ] Log panel (tail Ollama container logs)
+- [x] Effective inference config per runner (context, flash attention, KV dtype)
 - [ ] Request rate / tokens-per-second from Ollama API
 
 ## Contributing
@@ -187,9 +195,14 @@ PRs welcome. Keep it stdlib-only — the zero-dependency constraint is a feature
 git clone https://github.com/Quaerendir/mtop.git
 cd mtop
 pip install -e .
-# hack on src/mtop/__init__.py
+# hack on src/mtop/*.py
 mtop
+
+# regenerate the single-file artifact shipped with releases
+python tools/bundle.py       # -> dist/mtop.py
 ```
+
+`dist/mtop.py` is generated — never edit it by hand.
 
 ## License
 

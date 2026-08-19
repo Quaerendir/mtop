@@ -1,0 +1,449 @@
+"""
+mtop.gpu — multi-vendor GPU telemetry providers.
+
+Replaces the single memoized `nvidia-smi`-or-unified probe from v0.3.0 with a
+small provider registry, so a box with an RTX 4070 Ti Super *and* a Radeon AI
+PRO R9700 shows both cards instead of whichever probe answered first.
+
+Design notes / gotchas encoded here:
+
+* AMD telemetry comes from **sysfs first**, not `rocm-smi`. sysfs needs no ROCm
+  install, no fork per cycle, survives ROCm major-version JSON schema churn
+  (5.x `card0` → 6.x `card:0` → amd-smi), and works inside containers because
+  /sys is bind-mounted read-only by default. `rocm-smi` is kept only as a
+  fallback for exotic setups.
+* `/sys/class/drm` contains connector entries (`card0-DP-1`); only bare
+  `cardN` directories with a `device/vendor` of 0x1002 are amdgpu cards.
+* APUs (780M, Strix) report `mem_info_vram_total` as a tiny carve-out; the real
+  pool is GTT. Detected and reported as unified memory rather than a 512 MiB
+  card that is somehow 900% full.
+* Ordering is by PCI slot (`PCI_SLOT_NAME` from uevent), which is stable across
+  boots — unlike `cardN` numbering, and unlike HIP device order, which is
+  another sort entirely (see `HIP_VISIBLE_DEVICES`).
+
+Everything is stdlib. Set `MTOP_SYSFS_DRM` to point the AMD provider at a fake
+tree for testing.
+"""
+
+from __future__ import annotations
+
+import glob
+import json
+import os
+import re
+import sys
+from typing import Any
+from collections.abc import Callable
+
+SYSFS_DRM = os.environ.get("MTOP_SYSFS_DRM", "/sys/class/drm")
+_CARD_RE = re.compile(r"^card\d+$")
+
+IS_LINUX = sys.platform.startswith("linux")
+IS_WINDOWS = sys.platform == "win32"
+IS_DARWIN = sys.platform == "darwin"
+
+
+# ── small local helpers (kept independent of __init__ to avoid a cycle) ───────
+
+def _read(path: str) -> str | None:
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except (OSError, ValueError):
+        return None
+
+
+def _read_int(path: str) -> int | None:
+    v = _read(path)
+    if v is None:
+        return None
+    try:
+        return int(v.strip())
+    except ValueError:
+        return None
+
+
+def _mib(v: float | None) -> float:
+    """rocm-smi reports VRAM in bytes on some builds, MiB on others."""
+    if not v:
+        return 0.0
+    return v / (1 << 20) if v > (1 << 30) else v
+
+
+def _to_float(s: Any) -> float | None:
+    try:
+        return float(str(s).strip())
+    except (ValueError, TypeError):
+        return None
+
+
+# ── PCI marketing-name lookup (lazy, cached) ──────────────────────────────────
+#
+# amdgpu exposes `product_name` only on some ASICs/kernels, and it is often
+# empty. hwdata's pci.ids is present on essentially every distro; parsing the
+# ~2 MB file once for a single vendor:device pair is cheaper than shelling out
+# to lspci every refresh.
+
+_PCI_IDS_PATHS = (
+    "/usr/share/hwdata/pci.ids",
+    "/usr/share/misc/pci.ids",
+    "/usr/share/pci.ids",
+)
+_pci_name_cache: dict[str, str] = {}
+_pci_ids_missing = False
+
+
+def pci_device_name(vendor: str, device: str) -> str | None:
+    """Marketing name for a vendor:device pair (both 4 hex chars, lowercase)."""
+    global _pci_ids_missing
+    key = f"{vendor}:{device}"
+    if key in _pci_name_cache:
+        return _pci_name_cache[key]
+    if _pci_ids_missing:
+        return None
+    path = next((p for p in _PCI_IDS_PATHS if os.path.exists(p)), None)
+    if not path:
+        _pci_ids_missing = True
+        return None
+    try:
+        in_vendor = False
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if not line or line.startswith("#"):
+                    continue
+                if not line.startswith("\t"):
+                    in_vendor = line[:4].lower() == vendor
+                    continue
+                if (in_vendor and not line.startswith("\t\t")
+                        and line[1:5].lower() == device):
+                    name = line[5:].strip()
+                    _pci_name_cache[key] = name
+                    return name
+    except OSError:
+        _pci_ids_missing = True
+    return None
+
+
+# ── provider protocol ─────────────────────────────────────────────────────────
+#
+# A provider returns a list of dicts in the shape the renderer already expects:
+#   name, util, mem_used, mem_total (MiB, stringly-typed), temp
+# plus new optional keys: vendor, index, power, unified, gtt_used, gtt_total.
+# Stringly-typed numerics are kept deliberately — '[N/A]' is a legitimate value
+# from nvidia-smi on Tegra and the renderer already copes via to_float().
+
+
+class GpuProvider:
+    name = "base"
+
+    def collect(self) -> list[dict] | None:
+        raise NotImplementedError
+
+
+class AmdSysfsProvider(GpuProvider):
+    """amdgpu telemetry straight out of /sys/class/drm/cardN/device."""
+
+    name = "amd-sysfs"
+
+    def __init__(self):
+        self._cards: list[str] | None = None   # resolved device dirs, cached
+
+    def _discover(self) -> list[str]:
+        cards: list[tuple[str, str]] = []
+        for entry in sorted(os.listdir(SYSFS_DRM)) if os.path.isdir(SYSFS_DRM) else []:
+            if not _CARD_RE.match(entry):
+                continue
+            dev = os.path.join(SYSFS_DRM, entry, "device")
+            vendor = (_read(os.path.join(dev, "vendor")) or "").lower()
+            if vendor != "0x1002":                      # 0x1002 = AMD/ATI
+                continue
+            slot = ""
+            uevent = _read(os.path.join(dev, "uevent")) or ""
+            for line in uevent.splitlines():
+                if line.startswith("PCI_SLOT_NAME="):
+                    slot = line.split("=", 1)[1]
+            cards.append((slot or entry, dev))
+        cards.sort(key=lambda t: t[0])                  # stable across boots
+        return [dev for _, dev in cards]
+
+    def _name_for(self, dev: str) -> str:
+        prod = _read(os.path.join(dev, "product_name"))
+        if prod and prod not in ("", "0"):
+            return prod
+        uevent = _read(os.path.join(dev, "uevent")) or ""
+        pci_id = ""
+        for line in uevent.splitlines():
+            if line.startswith("PCI_ID="):
+                pci_id = line.split("=", 1)[1].strip()
+        if pci_id and ":" in pci_id:
+            ven, devid = (x.lower() for x in pci_id.split(":", 1))
+            marketing = pci_device_name(ven, devid)
+            if marketing:
+                return marketing
+            return f"AMD {pci_id}"
+        return "AMD GPU"
+
+    def _hwmon_temp_power(self, dev: str) -> tuple[str, str | None]:
+        """(edge temp °C, power W) — junction/mem sensors are skipped."""
+        temp, power = "N/A", None
+        for hw in sorted(glob.glob(os.path.join(dev, "hwmon", "hwmon*"))):
+            # Prefer the sensor labelled 'edge'; fall back to temp1.
+            chosen = None
+            for lbl_path in sorted(glob.glob(os.path.join(hw, "temp*_label"))):
+                if (_read(lbl_path) or "").lower() == "edge":
+                    chosen = lbl_path.replace("_label", "_input")
+                    break
+            chosen = chosen or os.path.join(hw, "temp1_input")
+            mdeg = _read_int(chosen)
+            if mdeg is not None:
+                temp = f"{mdeg / 1000:.0f}"
+            uw = _read_int(os.path.join(hw, "power1_average"))
+            if uw is None:
+                uw = _read_int(os.path.join(hw, "power1_input"))
+            if uw is not None:
+                power = f"{uw / 1_000_000:.0f}"
+            if temp != "N/A":
+                break
+        return temp, power
+
+    def collect(self) -> list[dict] | None:
+        if self._cards is None:
+            self._cards = self._discover()
+        if not self._cards:
+            self._cards = None      # re-probe next cycle (hotplug / late modprobe)
+            return None
+
+        out: list[dict] = []
+        for idx, dev in enumerate(self._cards):
+            vram_total = _read_int(os.path.join(dev, "mem_info_vram_total"))
+            vram_used = _read_int(os.path.join(dev, "mem_info_vram_used"))
+            gtt_total = _read_int(os.path.join(dev, "mem_info_gtt_total"))
+            gtt_used = _read_int(os.path.join(dev, "mem_info_gtt_used"))
+            busy = _read_int(os.path.join(dev, "gpu_busy_percent"))
+            temp, power = self._hwmon_temp_power(dev)
+
+            unified = False
+            # APU: the "VRAM" is a BIOS carve-out (typically ≤ 1 GiB) and the
+            # real working pool is GTT backed by system RAM.
+            if vram_total is not None and vram_total <= 1 << 30 and gtt_total:
+                unified = True
+                mem_used, mem_total = (vram_used or 0) + (gtt_used or 0), gtt_total
+            else:
+                mem_used, mem_total = vram_used, vram_total
+
+            if mem_total is None:
+                continue
+
+            gpu = {
+                "vendor": "amd",
+                "index": idx,
+                "name": self._name_for(dev),
+                "util": str(busy) if busy is not None else "N/A",
+                "mem_used": f"{(mem_used or 0) / (1 << 20):.0f}",
+                "mem_total": f"{mem_total / (1 << 20):.0f}",
+                "temp": temp,
+                "sysfs": dev,
+            }
+            if power is not None:
+                gpu["power"] = power
+            if unified:
+                gpu["unified"] = True
+            if gtt_total and not unified:
+                gpu["gtt_used"] = f"{(gtt_used or 0) / (1 << 20):.0f}"
+                gpu["gtt_total"] = f"{gtt_total / (1 << 20):.0f}"
+            out.append(gpu)
+        return out or None
+
+
+class RocmSmiProvider(GpuProvider):
+    """Fallback for setups where sysfs is unavailable (locked-down /sys, some
+    container runtimes) but the ROCm userspace is installed.
+
+    Schema-tolerant on purpose: ROCm renamed keys between 5.x and 6.x
+    ('card0' → 'card:0', 'GPU use (%)' → 'gfx_activity'), and amd-smi changed
+    them again. We fish for substrings instead of trusting exact keys.
+    """
+
+    name = "rocm-smi"
+
+    def __init__(self, runner: Callable[[list[str], int], tuple[bool, str]]):
+        self._run = runner
+
+    @staticmethod
+    def _pick(d: dict, *needles: str) -> str | None:
+        for k, v in d.items():
+            kl = k.lower()
+            if all(n in kl for n in needles):
+                return str(v)
+        return None
+
+    def collect(self) -> list[dict] | None:
+        ok, out = self._run(
+            ["rocm-smi", "--showuse", "--showmemuse", "--showtemp",
+             "--showproductname", "--json"], 4)
+        if not ok or not out:
+            return None
+        try:
+            data = json.loads(out)
+        except json.JSONDecodeError:
+            return None
+        gpus = []
+        for idx, (key, card) in enumerate(sorted(data.items())):
+            if not isinstance(card, dict) or "card" not in key.lower():
+                continue
+            used = _to_float(self._pick(card, "vram", "used") or "")
+            total = _to_float(self._pick(card, "vram", "total") or "")
+            util = self._pick(card, "gpu", "use") or self._pick(card, "activity")
+            temp = self._pick(card, "temperature", "edge") or self._pick(card, "temp")
+            name = (self._pick(card, "card", "series")
+                    or self._pick(card, "product", "name") or f"AMD GPU {idx}")
+            gpus.append({
+                "vendor": "amd",
+                "index": idx,
+                "name": name,
+                "util": (util or "N/A").strip("% "),
+                # rocm-smi reports VRAM in bytes; some builds in MiB. Heuristic:
+                # anything over 1 GiB-as-a-number is bytes.
+                "mem_used": f"{_mib(used):.0f}",
+                "mem_total": f"{_mib(total):.0f}",
+                "temp": (temp or "N/A").strip("c° "),
+            })
+        return gpus or None
+
+
+class NvidiaSmiProvider(GpuProvider):
+    """nvidia-smi, on the host or via `docker exec`.
+
+    `prefix_fn` returns the argv prefix to run the binary with, so the docker
+    path stays out of this class. Works unchanged on Windows: nvidia-smi.exe
+    lives in System32 and is on PATH.
+    """
+
+    name = "nvidia-smi"
+
+    def __init__(self, runner: Callable[[list[str], int], tuple[bool, str]],
+                 prefix_fn: Callable[[], list[list[str]]]):
+        self._run = runner
+        self._prefix_fn = prefix_fn
+        self._good_prefix: list[str] | None = None
+
+    def _query(self, prefix: list[str]) -> list[dict] | None:
+        query = ("index,name,utilization.gpu,memory.used,memory.total,"
+                 "temperature.gpu,power.draw")
+        ok, out = self._run(
+            prefix + ["nvidia-smi", f"--query-gpu={query}",
+                      "--format=csv,noheader,nounits"], 3)
+        if not ok or not out:
+            return None
+        gpus = []
+        for line in out.strip().splitlines():
+            f = [x.strip() for x in line.split(",")]
+            if len(f) < 6:
+                continue
+            gpus.append({
+                "vendor": "nvidia",
+                "index": int(f[0]) if f[0].isdigit() else len(gpus),
+                "name": f[1],
+                "util": f[2],
+                "mem_used": f[3],
+                "mem_total": f[4],
+                "temp": f[5],
+                **({"power": f[6]} if len(f) > 6 and _to_float(f[6]) is not None else {}),
+            })
+        return gpus or None
+
+    def collect(self) -> list[dict] | None:
+        prefixes = [self._good_prefix] if self._good_prefix is not None \
+            else self._prefix_fn()
+        for prefix in prefixes:
+            gpus = self._query(prefix)
+            if gpus:
+                self._good_prefix = prefix
+                return gpus
+        self._good_prefix = None
+        return None
+
+
+class TegraUnifiedProvider(GpuProvider):
+    """Jetson / Orin / GB10 Spark: nvidia-smi exists but memory reads [N/A]."""
+
+    name = "tegra-unified"
+
+    def __init__(self, reader: Callable[[], tuple[str, int, int] | None]):
+        self._reader = reader
+
+    def collect(self) -> list[dict] | None:
+        uni = self._reader()
+        if not uni:
+            return None
+        model, used_mib, total_mib = uni
+        return [{
+            "vendor": "nvidia",
+            "index": 0,
+            "name": model,
+            "util": "N/A",
+            "mem_used": str(used_mib),
+            "mem_total": str(total_mib),
+            "temp": "N/A",
+            "unified": True,
+        }]
+
+
+# ── registry ──────────────────────────────────────────────────────────────────
+
+class GpuMonitor:
+    """Runs every provider that has ever answered, concatenating results.
+
+    Unlike v0.3.0's single memoized strategy, a mixed CUDA + ROCm box shows
+    both vendors. Providers that return None are retried at a slower cadence
+    so a GPU-less host does not fork `nvidia-smi` and `rocm-smi` every cycle.
+    """
+
+    RETRY_AFTER = 30.0  # seconds before re-probing a provider that came back None
+
+    def __init__(self, providers: list[GpuProvider], clock: Callable[[], float]):
+        self._providers = providers
+        self._clock = clock
+        self._dead: dict[str, float] = {}   # provider name -> next retry time
+
+    def collect(self) -> list[dict] | None:
+        now = self._clock()
+        out: list[dict] = []
+        for p in self._providers:
+            deadline = self._dead.get(p.name)
+            if deadline is not None and now < deadline:
+                continue
+            try:
+                gpus = p.collect()
+            except Exception:
+                gpus = None
+            if gpus:
+                self._dead.pop(p.name, None)
+                out.extend(gpus)
+            else:
+                self._dead[p.name] = now + self.RETRY_AFTER
+        if not out:
+            return None
+        # Patch nvidia-smi's '[N/A]' memory on unified platforms.
+        for g in out:
+            if g["vendor"] == "nvidia" and _to_float(g["mem_total"]) is None:
+                for t in self._providers:
+                    if isinstance(t, TegraUnifiedProvider):
+                        uni = t.collect()
+                        if uni:
+                            g["mem_used"] = uni[0]["mem_used"]
+                            g["mem_total"] = uni[0]["mem_total"]
+                            g["unified"] = True
+                        break
+        # De-dup: Tegra provider and nvidia-smi describe the same silicon.
+        if any(g.get("unified") and g["vendor"] == "nvidia" for g in out):
+            seen_unified = False
+            deduped = []
+            for g in out:
+                if g["vendor"] == "nvidia" and g.get("unified"):
+                    if seen_unified:
+                        continue
+                    seen_unified = True
+                deduped.append(g)
+            out = deduped
+        return out
