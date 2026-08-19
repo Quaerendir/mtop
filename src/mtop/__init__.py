@@ -30,7 +30,7 @@ from typing import Any
 from .gpu import (AmdSysfsProvider, GpuMonitor, GpuProvider, NvidiaSmiProvider,
                   RocmSmiProvider, TegraUnifiedProvider)
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
 
@@ -1062,37 +1062,36 @@ def draw_detail_right(win, y: int, min_x: int, text: str, attr=0):
 
 def draw_table(win, y: int, x: int, headers: list[str], rows: list[list[str]],
                col_widths: list[int], hdr_attr=0, row_attr=0) -> int:
-    """Draw a formatted table. Returns next y position."""
+    """Draw a formatted table. Returns next y position.
+
+    The rule under the header is sized to the widest *visible* line rather than
+    to the sum of col_widths. A trailing column with an empty header (the
+    runner flags) padded its heading with spaces — invisible — while the rule
+    got the full column width in dashes and overhung the content, leaving two
+    tables on screen with rules of different lengths.
+    """
     max_y, _ = win.getmaxyx()
 
-    # Header
-    line = ""
-    for i, h in enumerate(headers):
-        line += h.ljust(col_widths[i]) if i < len(col_widths) else h
-        if i < len(headers) - 1:
-            line += "  "
-    y = safe_addstr(win, y, x, line, hdr_attr)
-
-    # Separator
-    sep = ""
-    for i, w in enumerate(col_widths):
-        sep += "─" * w
-        if i < len(col_widths) - 1:
-            sep += "──"
-    y = safe_addstr(win, y, x, sep, curses.color_pair(C_DIM))
-
-    # Rows
-    for row in rows:
-        if y >= max_y - 1:
-            break
+    def render(cells: list[str]) -> str:
         line = ""
-        for i, cell in enumerate(row):
+        for i, cell in enumerate(cells):
             w = col_widths[i] if i < len(col_widths) else len(cell)
             if len(cell) > w:
                 cell = cell[: w - 1] + "…"
-            line += cell.ljust(w) if i < len(row) - 1 else cell
-            if i < len(row) - 1:
+            line += cell.ljust(w) if i < len(cells) - 1 else cell
+            if i < len(cells) - 1:
                 line += "  "
+        return line
+
+    header_line = render(headers)
+    body = [render(r) for r in rows]
+    rule = "─" * max(len(t.rstrip()) for t in [header_line, *body])
+
+    y = safe_addstr(win, y, x, header_line, hdr_attr)
+    y = safe_addstr(win, y, x, rule, curses.color_pair(C_DIM))
+    for line in body:
+        if y >= max_y - 1:
+            break
         y = safe_addstr(win, y, x, line, row_attr)
     return y
 

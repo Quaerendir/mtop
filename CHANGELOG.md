@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.4.1 — 2026-08-19
+
+### Fixed
+- **VRAM bar missing on GB10 / Jetson.** `nvidia-smi` reports memory as `[N/A]`
+  on unified-memory parts and the `/proc/meminfo` fallback was gated on
+  `/proc/device-tree/model` matching a keyword. Where that file is absent or
+  names the board differently, the gate failed and the bar silently vanished —
+  the exact symptom 0.2.0 set out to fix, reintroduced by a second condition.
+  The gate is gone: a card that cannot report its own memory *is* a
+  unified-memory part, so system RAM is the honest answer. The device-tree
+  probe is kept for discovery when `nvidia-smi` is absent entirely.
+- Table rules are sized to the widest visible line instead of the sum of column
+  widths. The runner flags column has an empty header, which padded with
+  invisible spaces while the rule got the full width in dashes — it overhung
+  the content and left the two on-screen tables with mismatched rules.
+
 ## 0.4.0 — 2026-08-18
 
 ### Fixed

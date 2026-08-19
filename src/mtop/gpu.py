@@ -70,6 +70,33 @@ def _mib(v: float | None) -> float:
     return v / (1 << 20) if v > (1 << 30) else v
 
 
+def meminfo_mib() -> tuple[int, int] | None:
+    """(used_mib, total_mib) from /proc/meminfo, with no platform gate.
+
+    Deliberately ungated, unlike the device-tree probe used for *discovery*.
+    When a card reports its memory as '[N/A]' that is itself the signal: the
+    only NVIDIA parts that do so are the unified-memory ones (Jetson, Orin,
+    GB10), where system RAM *is* the video memory. Requiring
+    /proc/device-tree/model to also match a keyword added a second condition
+    that fails in containers and on DGX OS images that name the model
+    differently — and when it failed, the VRAM bar silently vanished.
+    """
+    try:
+        info: dict[str, int] = {}
+        with open("/proc/meminfo") as f:
+            for line in f:
+                k, _, v = line.partition(":")
+                if k in ("MemTotal", "MemAvailable", "MemFree"):
+                    info[k] = int(v.strip().split()[0])
+        total = info.get("MemTotal", 0)
+        avail = info.get("MemAvailable", info.get("MemFree", 0))
+        if not total:
+            return None
+        return (total - avail) // 1024, total // 1024
+    except (OSError, ValueError, IndexError):
+        return None
+
+
 def _to_float(s: Any) -> float | None:
     try:
         return float(str(s).strip())
@@ -424,17 +451,15 @@ class GpuMonitor:
                 self._dead[p.name] = now + self.RETRY_AFTER
         if not out:
             return None
-        # Patch nvidia-smi's '[N/A]' memory on unified platforms.
+        # Patch nvidia-smi's '[N/A]' memory. No platform gate: a card that
+        # cannot report its own memory is a unified-memory part by definition,
+        # and system RAM is the honest answer for it.
         for g in out:
             if g["vendor"] == "nvidia" and _to_float(g["mem_total"]) is None:
-                for t in self._providers:
-                    if isinstance(t, TegraUnifiedProvider):
-                        uni = t.collect()
-                        if uni:
-                            g["mem_used"] = uni[0]["mem_used"]
-                            g["mem_total"] = uni[0]["mem_total"]
-                            g["unified"] = True
-                        break
+                mem = meminfo_mib()
+                if mem:
+                    g["mem_used"], g["mem_total"] = str(mem[0]), str(mem[1])
+                    g["unified"] = True
         # De-dup: Tegra provider and nvidia-smi describe the same silicon.
         if any(g.get("unified") and g["vendor"] == "nvidia" for g in out):
             seen_unified = False
