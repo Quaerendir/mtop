@@ -54,12 +54,12 @@ chmod +x mtop.py
 
 ### pip install
 
-> Not yet published to PyPI — coming with the first tagged release. Until then, use the one-liner or install from source.
-
 ```bash
-pip install ollama-mtop   # (pending)
+pip install ollama-mtop
 mtop
 ```
+
+Or without touching the system Python: `pipx install ollama-mtop` / `uv tool install ollama-mtop`.
 
 ### From source
 
@@ -255,8 +255,10 @@ pytest                       # stdlib-only fakes: no GPU, docker or Ollama neede
 python tools/bundle.py       # -> dist/mtop.py
 ```
 
-`dist/mtop.py` is generated — never edit it by hand. The version lives in `src/mtop/_version.py` only. CI builds it on every
-push and attaches it to the GitHub release when a `v*` tag is pushed.
+`dist/mtop.py` is generated — never edit it by hand. The version lives in `src/mtop/_version.py` only.
+A `v*` tag attaches the bundle to the GitHub release and, once the repository variable
+`PYPI_TRUSTED` is set, publishes the sdist and wheel to PyPI through Trusted Publishing
+(GitHub OIDC, no token in the repo). The tag must equal `v` + the package version.
 
 ## License
 

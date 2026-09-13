@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.11.2 — 2026-09-14
+
+### Added
+- **PyPI publishing from CI.** A `v*` tag builds the sdist and wheel and
+  uploads them to `ollama-mtop` on PyPI through Trusted Publishing (GitHub
+  OIDC, `pypi` environment, no token in the repo), next to the GitHub
+  release with `dist/mtop.py`. Gated on the repository variable
+  `PYPI_TRUSTED` until the publisher is registered on PyPI, and refuses a
+  tag that does not match `src/mtop/_version.py`. PyPI had been stuck at
+  0.4.1 since August; the README no longer says the package is unpublished.
+- `tools/screenshot.py` and a real screenshot in the README.
+
 ## 0.11.1 — 2026-09-14
 
 ### Fixed

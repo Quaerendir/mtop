@@ -61,3 +61,32 @@ jobs:
         with:
           files: dist/mtop.py
           generate_release_notes: true
+
+  pypi:
+    # Same tag -> sdist + wheel to PyPI via Trusted Publishing (OIDC, no token
+    # in the repo). PyPI side, once: project ollama-mtop -> Publishing -> add
+    # GitHub publisher: owner Quaerendir, repo mtop, workflow ci.yml,
+    # environment pypi. The `pypi` environment is created on first use.
+    # Gated on a repository variable so the tag run stays green until the
+    # PyPI side is configured: Settings -> Variables -> PYPI_TRUSTED = true.
+    if: startsWith(github.ref, 'refs/tags/v') && vars.PYPI_TRUSTED == 'true'
+    needs: test
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/ollama-mtop/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install build twine
+      - run: python -m build
+      - run: twine check dist/*
+      - name: tag must match the package version
+        run: |
+          v=$(python -c "import re;print(re.search(r'\"([^\"]+)\"', open('src/mtop/_version.py').read()).group(1))")
+          test "refs/tags/v$v" = "${{ github.ref }}" || { echo "tag ${{ github.ref }} != v$v"; exit 1; }
+      - uses: pypa/gh-action-pypi-publish@release/v1
