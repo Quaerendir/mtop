@@ -27,6 +27,7 @@ tree for testing.
 
 from __future__ import annotations
 
+import ctypes
 import glob
 import json
 import os
@@ -166,6 +167,10 @@ def pci_device_name(vendor: str, device: str) -> str | None:
 
 class GpuProvider:
     name = "base"
+    # Provider names this one makes redundant when it answers. NVML and
+    # nvidia-smi describe the same silicon; the registry concatenates every
+    # answer, so without this a CUDA box would list each card twice.
+    supersedes: frozenset[str] = frozenset()
 
     def collect(self) -> list[dict] | None:
         raise NotImplementedError
@@ -405,6 +410,173 @@ class NvidiaSmiProvider(GpuProvider):
         return None
 
 
+# ── NVML via ctypes ───────────────────────────────────────────────────────────
+#
+# libnvidia-ml.so.1 ships with every NVIDIA driver, so this needs nothing the
+# host does not already have — and it is what nvidia-smi itself calls. Benefits
+# over forking nvidia-smi every cycle: no process spawn (a few ms vs ~100 ms),
+# and nvmlDeviceGetComputeRunningProcesses, which nvidia-smi's --query-gpu
+# cannot express. That call returns (host pid, bytes) per process, which is
+# the only way to say *which card holds which runner* on a multi-GPU box.
+
+class _NvmlUtilization(ctypes.Structure):
+    _fields_ = [("gpu", ctypes.c_uint), ("memory", ctypes.c_uint)]
+
+
+class _NvmlMemory(ctypes.Structure):
+    _fields_ = [("total", ctypes.c_ulonglong), ("free", ctypes.c_ulonglong),
+                ("used", ctypes.c_ulonglong)]
+
+
+class _NvmlProcessV2(ctypes.Structure):
+    # nvmlProcessInfo_v2_t / nvmlProcessInfo_t (CUDA 11.1+): natural alignment
+    # puts usedGpuMemory at offset 8, total size 24.
+    _fields_ = [("pid", ctypes.c_uint), ("usedGpuMemory", ctypes.c_ulonglong),
+                ("gpuInstanceId", ctypes.c_uint), ("computeInstanceId", ctypes.c_uint)]
+
+
+class _NvmlProcessV1(ctypes.Structure):
+    _fields_ = [("pid", ctypes.c_uint), ("usedGpuMemory", ctypes.c_ulonglong)]
+
+
+NVML_SUCCESS = 0
+NVML_ERROR_INSUFFICIENT_SIZE = 7
+NVML_VALUE_NOT_AVAILABLE = (1 << 64) - 1   # usedGpuMemory on WDDM / unsupported
+NVML_LIB_NAMES = ("libnvidia-ml.so.1", "libnvidia-ml.so", "nvml.dll")
+
+
+def load_nvml() -> Any | None:
+    """The NVML shared library, or None when no NVIDIA driver is installed."""
+    for name in NVML_LIB_NAMES:
+        try:
+            return ctypes.CDLL(name)
+        except OSError:
+            continue
+    if IS_WINDOWS:
+        for path in (r"C:\Windows\System32\nvml.dll",
+                     r"C:\Program Files\NVIDIA Corporation\NVSMI\nvml.dll"):
+            try:
+                return ctypes.CDLL(path)
+            except OSError:
+                continue
+    return None
+
+
+class NvmlProvider(GpuProvider):
+    """NVIDIA telemetry straight from the driver library.
+
+    Emits the same dict shape as NvidiaSmiProvider plus ``procs``: a list of
+    ``{"pid": int, "mem_mib": float | None}`` for every compute process on the
+    card, host PID namespace. Values the driver reports as unsupported
+    (memory on unified parts like GB10, power on some laptops) come out as
+    ``"[N/A]"`` — the same spelling nvidia-smi uses, so the registry's
+    unified-memory patch keeps working unchanged.
+    """
+
+    name = "nvml"
+    supersedes = frozenset({"nvidia-smi"})
+
+    def __init__(self, loader: Callable[[], Any | None] = load_nvml):
+        self._loader = loader
+        self._lib: Any | None = None
+        self._inited = False
+        self._failed = False
+
+    def _init(self) -> bool:
+        if self._inited:
+            return True
+        if self._failed:
+            return False
+        lib = self._loader()
+        if lib is None or getattr(lib, "nvmlInit_v2", None) is None:
+            self._failed = True
+            return False
+        if lib.nvmlInit_v2() != NVML_SUCCESS:
+            self._failed = True
+            return False
+        self._lib = lib
+        self._inited = True
+        return True
+
+    def _processes(self, dev) -> list[dict]:
+        """(pid, bytes) per compute process; empty when the call is unsupported."""
+        lib = self._lib
+        for fname, struct in (("nvmlDeviceGetComputeRunningProcesses_v3", _NvmlProcessV2),
+                              ("nvmlDeviceGetComputeRunningProcesses_v2", _NvmlProcessV2),
+                              ("nvmlDeviceGetComputeRunningProcesses", _NvmlProcessV1)):
+            fn = getattr(lib, fname, None)
+            if fn is None:
+                continue
+            count = ctypes.c_uint(0)
+            rc = fn(dev, ctypes.byref(count), None)
+            if rc == NVML_SUCCESS and count.value == 0:
+                return []
+            if rc not in (NVML_SUCCESS, NVML_ERROR_INSUFFICIENT_SIZE):
+                return []
+            n = max(count.value, 1) + 8            # headroom for a spawn in between
+            infos = (struct * n)()
+            count = ctypes.c_uint(n)
+            rc = fn(dev, ctypes.byref(count), infos)
+            if rc != NVML_SUCCESS:
+                return []
+            out = []
+            for i in range(count.value):
+                used = infos[i].usedGpuMemory
+                out.append({
+                    "pid": int(infos[i].pid),
+                    "mem_mib": (None if used in (0, NVML_VALUE_NOT_AVAILABLE)
+                                else round(used / (1 << 20))),
+                })
+            return out
+        return []
+
+    def collect(self) -> list[dict] | None:
+        if not self._init():
+            return None
+        lib = self._lib
+        count = ctypes.c_uint(0)
+        if lib.nvmlDeviceGetCount_v2(ctypes.byref(count)) != NVML_SUCCESS:
+            return None
+        gpus: list[dict] = []
+        for idx in range(count.value):
+            dev = ctypes.c_void_p()
+            if lib.nvmlDeviceGetHandleByIndex_v2(idx, ctypes.byref(dev)) != NVML_SUCCESS:
+                continue
+            name_buf = ctypes.create_string_buffer(96)
+            name = "NVIDIA GPU"
+            if lib.nvmlDeviceGetName(dev, name_buf, 96) == NVML_SUCCESS:
+                name = name_buf.value.decode("utf-8", "replace") or name
+
+            util = _NvmlUtilization()
+            util_s = (str(util.gpu)
+                      if lib.nvmlDeviceGetUtilizationRates(dev, ctypes.byref(util)) == NVML_SUCCESS
+                      else "[N/A]")
+            mem = _NvmlMemory()
+            if lib.nvmlDeviceGetMemoryInfo(dev, ctypes.byref(mem)) == NVML_SUCCESS and mem.total:
+                mem_used, mem_total = f"{mem.used / (1 << 20):.0f}", f"{mem.total / (1 << 20):.0f}"
+            else:
+                mem_used = mem_total = "[N/A]"
+            temp = ctypes.c_uint(0)
+            temp_s = (str(temp.value)
+                      if lib.nvmlDeviceGetTemperature(dev, 0, ctypes.byref(temp)) == NVML_SUCCESS
+                      else "[N/A]")
+            mw = ctypes.c_uint(0)
+            gpu = {
+                "vendor": "nvidia",
+                "index": idx,
+                "name": name,
+                "util": util_s,
+                "mem_used": mem_used,
+                "mem_total": mem_total,
+                "temp": temp_s,
+                "procs": self._processes(dev),
+            }
+            if lib.nvmlDeviceGetPowerUsage(dev, ctypes.byref(mw)) == NVML_SUCCESS:
+                gpu["power"] = f"{mw.value / 1000:.2f}"
+            gpus.append(gpu)
+        return gpus or None
+
+
 class TegraUnifiedProvider(GpuProvider):
     """Jetson / Orin / GB10 Spark: nvidia-smi exists but memory reads [N/A]."""
 
@@ -450,7 +622,10 @@ class GpuMonitor:
     def collect(self) -> list[dict] | None:
         now = self._clock()
         out: list[dict] = []
+        superseded: set[str] = set()
         for p in self._providers:
+            if p.name in superseded:
+                continue
             deadline = self._dead.get(p.name)
             if deadline is not None and now < deadline:
                 continue
@@ -461,6 +636,7 @@ class GpuMonitor:
             if gpus:
                 self._dead.pop(p.name, None)
                 out.extend(gpus)
+                superseded |= p.supersedes
             else:
                 self._dead[p.name] = now + self.RETRY_AFTER
         if not out:

@@ -107,3 +107,45 @@ def test_parse_systemd_show():
 
 def test_host_cpu_count_positive():
     assert mtop.host_cpu_count() >= 1
+
+
+def test_inference_env_filters_sorts_and_masks():
+    env = mtop.inference_env([
+        "PATH=/usr/bin", "OLLAMA_KEEP_ALIVE=24h", "OLLAMA_FLASH_ATTENTION=1",
+        "CUDA_VISIBLE_DEVICES=0,1", "HSA_OVERRIDE_GFX_VERSION=11.0.0",
+        "OLLAMA_API_KEY=sk-abc", "OLLAMA_AUTH_TOKEN=", "HOME=/root", "GGML_CUDA_NO_PINNED=1",
+        "garbage-without-equals",
+    ])
+    assert list(env) == ["CUDA_VISIBLE_DEVICES", "GGML_CUDA_NO_PINNED", "HSA_OVERRIDE_GFX_VERSION",
+                         "OLLAMA_API_KEY", "OLLAMA_AUTH_TOKEN", "OLLAMA_FLASH_ATTENTION",
+                         "OLLAMA_KEEP_ALIVE"]
+    assert env["OLLAMA_API_KEY"] == "••••"
+    assert env["OLLAMA_AUTH_TOKEN"] == ""            # empty stays empty
+    assert env["OLLAMA_KEEP_ALIVE"] == "24h"
+
+
+def test_parse_systemd_environment_quotes():
+    assert mtop.parse_systemd_environment('Environment=A=1 "B=x y" OLLAMA_HOST=0.0.0.0') == \
+        ["A=1", "B=x y", "OLLAMA_HOST=0.0.0.0"]
+    assert mtop.parse_systemd_environment("Environment=") == []
+
+
+def test_link_runners_to_gpus_both_ways():
+    runners = [{"pid": 10, "model_name": "a:7b"}, {"pid": 11, "digest": "deadbeefcafe0000"},
+               {"pid": 12}]
+    gpus = [{"vendor": "nvidia", "index": 0, "procs": [{"pid": 10, "mem_mib": 4000},
+                                                        {"pid": 999, "mem_mib": 100}]},
+            {"vendor": "nvidia", "index": 1, "procs": [{"pid": 10, "mem_mib": 4000},
+                                                        {"pid": 11, "mem_mib": None}]}]
+    mtop.link_runners_to_gpus(runners, gpus)
+    assert runners[0]["gpu"] == ["nvidia:0", "nvidia:1"] and runners[0]["gpu_mem_mib"] == 8000
+    assert runners[1]["gpu"] == ["nvidia:1"] and "gpu_mem_mib" not in runners[1]
+    assert "gpu" not in runners[2]
+    assert gpus[0]["procs"][0]["model"] == "a:7b"
+    assert "model" not in gpus[0]["procs"][1]           # unknown pid
+    assert gpus[1]["procs"][1]["model"] == "deadbeefcafe"
+    # idempotent across cycles: re-linking does not accumulate
+    mtop.link_runners_to_gpus(runners, gpus)
+    assert runners[0]["gpu"] == ["nvidia:0", "nvidia:1"] and runners[0]["gpu_mem_mib"] == 8000
+    mtop.link_runners_to_gpus(None, gpus)
+    mtop.link_runners_to_gpus(runners, None)

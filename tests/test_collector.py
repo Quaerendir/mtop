@@ -91,7 +91,7 @@ def test_json_main_takes_second_cpu_sample_in_local_mode(local_host, monkeypatch
     monkeypatch.setattr(mtop.time, "sleep", lambda s: advance())
     args = argparse.Namespace(container="ollama", api_url="http://localhost:11434",
                               interval=1.0, no_gpu=True, mode="local", no_runners=False,
-                              runtime="auto")
+                              runtime="auto", no_env=False)
     rc = mtop.json_main(args)
     out = json.loads(capsys.readouterr().out)
     assert rc == 0
@@ -104,7 +104,7 @@ def test_json_main_exit_code_when_api_down(local_host, monkeypatch, capsys):
     monkeypatch.setattr(mtop, "http_get_json", lambda url, timeout=5: (False, "refused"))
     args = argparse.Namespace(container="ollama", api_url="http://localhost:11434",
                               interval=1.0, no_gpu=True, mode="local", no_runners=False,
-                              runtime="auto")
+                              runtime="auto", no_env=False)
     assert mtop.json_main(args) == 1
     out = json.loads(capsys.readouterr().out)
     assert out["models_ok"] is False and out["models_err"] == "refused"
@@ -314,8 +314,118 @@ def test_nvidia_attempts_include_container_exec(docker_host):
     c = _collector(mode="docker", container_runtime=docker_host, show_gpu=True)
     c.collect(100.0)
     providers = c._build_gpu_providers()
-    nv = providers[0]
+    nv = providers[1]                                   # [0] is NVML
     labels = [label for label, _ in nv._attempts_fn()]
     assert labels == ["host", "container"]
     ok, out = nv._attempts_fn()[1][1](["nvidia-smi", "-L"], 3)
     assert docker_host.execs[-1] == ["nvidia-smi", "-L"]
+
+
+# ── server config (env + version) and GPU linking ────────────────────────────
+
+VERSION_AND_PS = {"/api/version": (True, {"version": "0.33.2"}), "/api/ps": (True, API_PS)}
+
+
+def _http(table):
+    def get(url, timeout=5):
+        return table.get("/api" + url.rsplit("/api", 1)[-1], (False, "nope"))
+    return get
+
+
+def test_server_info_docker_from_inspect_env(docker_host, monkeypatch):
+    monkeypatch.setattr(mtop, "http_get_json", _http(VERSION_AND_PS))
+    rt = docker_host
+
+    def inspect(name):
+        info = FakeRuntime.inspect(rt, name)
+        info["env"] = ["PATH=/x", "OLLAMA_KEEP_ALIVE=24h", "OLLAMA_FLASH_ATTENTION=1"]
+        return info
+    rt.inspect = inspect
+    snap = _collector(mode="docker", container_runtime=rt).collect(100.0)
+    assert snap["server"] == {"version": "0.33.2", "env_source": "container",
+                              "env": {"OLLAMA_FLASH_ATTENTION": "1", "OLLAMA_KEEP_ALIVE": "24h"}}
+
+
+def test_server_info_local_prefers_process_then_systemd(local_host, monkeypatch):
+    monkeypatch.setattr(mtop, "http_get_json", _http(VERSION_AND_PS))
+    monkeypatch.setattr(mtop, "read_proc_environ", lambda pid: ["OLLAMA_NUM_PARALLEL=2"])
+    monkeypatch.setattr(mtop, "systemd_environment",
+                        lambda unit="ollama.service": ["OLLAMA_HOST=x"])
+    snap = _collector().collect(100.0)
+    assert snap["server"]["env"] == {"OLLAMA_NUM_PARALLEL": "2"}
+    assert snap["server"]["env_source"] == "process"
+
+    monkeypatch.setattr(mtop, "read_proc_environ", lambda pid: None)
+    snap = _collector().collect(100.0)
+    assert snap["server"] == {"version": "0.33.2", "env": {"OLLAMA_HOST": "x"},
+                              "env_source": "systemd"}
+
+    monkeypatch.setattr(mtop, "systemd_environment", lambda unit="ollama.service": None)
+    snap = _collector().collect(100.0)
+    assert snap["server"]["env_source"] is None and snap["server"]["version"] == "0.33.2"
+
+
+def test_server_info_version_failure_is_none(local_host, monkeypatch):
+    monkeypatch.setattr(mtop, "read_proc_environ", lambda pid: [])
+    snap = _collector().collect(100.0)      # local_host's http stub only knows /api/ps
+    assert snap["server"]["version"] is None and snap["server"]["env_source"] == "process"
+
+
+def test_runners_linked_to_gpus_in_snapshot(local_host, monkeypatch):
+    monkeypatch.setattr(mtop, "read_proc_environ", lambda pid: [])
+    gpus = [{"vendor": "nvidia", "index": 0, "name": "x", "util": "1", "mem_used": "1",
+             "mem_total": "2", "temp": "1", "procs": [{"pid": RUNNER_PID, "mem_mib": 14000}]}]
+    monkeypatch.setattr(mtop.Collector, "_gpu_read", lambda self: gpus)
+    snap = _collector(show_gpu=True).collect(100.0)
+    r = snap["runners"][0]
+    assert r["gpu"] == ["nvidia:0"] and r["gpu_mem_mib"] == 14000
+    assert snap["gpus"][0]["procs"][0]["model"] == "qwen2.5-coder:32b"
+
+
+def test_render_server_config_wraps_and_names_source():
+    w = FakeWin(rows=12, cols=60)
+    env = {f"OLLAMA_VAR_{i}": "value" for i in range(6)}
+    y = mtop.render_server_config(w, 0, {"mode": "docker",
+                                          "server": {"env": env, "env_source": "container"}})
+    text = w.text()
+    assert "SERVER CONFIG" in text and "source: container" in text
+    assert "OLLAMA_VAR_0=value" in text and "OLLAMA_VAR_5=value" in text
+    assert all(len(w.line(i)) <= 60 for i in range(y))
+    assert y >= 5                                       # header + >=2 wrapped lines + source
+
+
+def test_render_server_config_messages(win):
+    mtop.render_server_config(win, 0, {"mode": "local", "server": {"env": {}, "env_source": None}})
+    assert "not readable" in win.text()
+    w2 = FakeWin()
+    mtop.render_server_config(w2, 0, {"mode": "docker",
+                                       "server": {"env": {}, "env_source": "container"}})
+    assert "defaults (container)" in w2.text()
+    w3 = FakeWin()
+    assert mtop.render_server_config(w3, 0, {"mode": "api", "server": {}}) == 0
+
+
+def test_gpu_section_lists_processes(win):
+    snap = {"gpus": [{"vendor": "nvidia", "index": 0, "name": "RTX", "util": "5",
+                      "mem_used": "100", "mem_total": "200", "temp": "40",
+                      "procs": [{"pid": 7, "mem_mib": 13800, "model": "bielik:latest"},
+                                {"pid": 8, "mem_mib": None}]}]}
+    mtop.render_gpu_stats(win, 0, snap)
+    assert "procs: bielik:latest (13.5G), pid 8" in win.text()
+
+
+def test_runners_table_gpu_column():
+    win = FakeWin(cols=200)
+    snap = {"runners": [{"pid": 7, "model_name": "m", "ctx": "1", "gpu": ["nvidia:0", "nvidia:1"]},
+                        {"pid": 8, "model_name": "n", "ctx": "1"}]}
+    mtop.render_runners(win, 0, snap)
+    rows = [win.line(i) for i in range(3, 5)]          # section hdr, table hdr, rule, rows
+    assert "0,1" in rows[0] and rows[1].rstrip().endswith("—")
+
+
+def test_header_shows_ollama_version():
+    w = FakeWin(rows=4, cols=120)
+    snap = {"status": "running", "uptime": "1h 0m", "container": "ollama", "mode": "docker",
+            "server": {"version": "0.33.2"}}
+    mtop.render_header(w, 0, snap, stale=False)
+    assert "ollama 0.33.2" in w.line(1)

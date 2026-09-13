@@ -20,6 +20,7 @@ import json
 import locale
 import os
 import re
+import shlex
 import subprocess
 import sys
 import threading
@@ -27,14 +28,15 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from typing import Any
 
 from .container import ContainerRuntime, detect_runtime
 from .gpu import (AmdSysfsProvider, GpuMonitor, GpuProvider, NvidiaSmiProvider,
-                  RocmSmiProvider, TegraUnifiedProvider)
+                  NvmlProvider, RocmSmiProvider, TegraUnifiedProvider)
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
 
@@ -570,6 +572,93 @@ def read_proc_cmdline(pid: int) -> list[str] | None:
     return args or None
 
 
+# ── Effective server configuration ────────────────────────────────────────────
+#
+# Ollama is configured almost entirely through environment variables, and the
+# RUNNERS section shows what it *negotiated* from them. This is the other half:
+# what was actually set on the server process. Three sources, by launch method:
+#   container  — Config.Env from inspect (always readable)
+#   process    — /proc/<pid>/environ (same user or root only)
+#   systemd    — `systemctl show -p Environment` (unit + drop-ins; not
+#                EnvironmentFile= contents, which systemd does not expose)
+
+ENV_PREFIXES = ("OLLAMA_", "CUDA_VISIBLE_DEVICES", "NVIDIA_VISIBLE_DEVICES",
+                "HIP_", "HSA_", "ROCR_", "GPU_DEVICE_ORDINAL", "GGML_", "LLAMA_")
+ENV_SECRET_MARKERS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "PASS")
+
+
+def inference_env(pairs: Iterable[str]) -> dict[str, str]:
+    """Filter KEY=VALUE strings down to the inference-relevant ones, masked."""
+    out: dict[str, str] = {}
+    for kv in pairs:
+        if "=" not in kv:
+            continue
+        k, v = kv.split("=", 1)
+        if not k.startswith(ENV_PREFIXES):
+            continue
+        if any(m in k.upper() for m in ENV_SECRET_MARKERS) and v:
+            v = "••••"
+        out[k] = v
+    return dict(sorted(out.items()))
+
+
+def read_proc_environ(pid: int) -> list[str] | None:
+    """KEY=VALUE list from /proc/<pid>/environ, or None when unreadable."""
+    try:
+        with open(f"/proc/{pid}/environ", "rb") as f:
+            raw = f.read()
+    except OSError:
+        return None
+    return [a for a in raw.decode("utf-8", "replace").split("\0") if a]
+
+
+def parse_systemd_environment(line: str) -> list[str]:
+    """`Environment=A=1 "B=x y"` -> ["A=1", "B=x y"]."""
+    _, _, val = line.partition("=")
+    try:
+        return shlex.split(val)
+    except ValueError:
+        return val.split()
+
+
+def systemd_environment(unit: str = "ollama.service") -> list[str] | None:
+    ok, out = run_cmd(["systemctl", "show", unit, "--property=Environment"], timeout=3)
+    if not ok:
+        return None
+    for line in out.splitlines():
+        if line.startswith("Environment="):
+            return parse_systemd_environment(line)
+    return []
+
+
+def link_runners_to_gpus(runners: list[dict] | None, gpus: list[dict] | None) -> None:
+    """Join runner processes to cards by PID, both ways, in place.
+
+    Each runner gains ``gpu`` (["nvidia:0", ...]) and ``gpu_mem_mib``; each
+    GPU's ``procs`` entries gain ``model`` when the PID is a known runner.
+    PIDs are host-namespace on both sides (NVML reports host PIDs; runner PIDs
+    come from the host /proc walk), so a runner discovered through the
+    in-container exec fallback — container-namespace PIDs — does not link.
+    """
+    if not runners or not gpus:
+        return
+    by_pid = {r["pid"]: r for r in runners if r.get("pid")}
+    for r in by_pid.values():
+        r.pop("gpu", None)
+        r.pop("gpu_mem_mib", None)
+    for g in gpus:
+        for proc in g.get("procs") or []:
+            r = by_pid.get(proc.get("pid"))
+            if r is None:
+                proc.pop("model", None)
+                continue
+            proc["model"] = r.get("model_name") or r.get("digest", "")[:12]
+            tag = f"{g.get('vendor', '?')}:{g.get('index', '?')}"
+            r.setdefault("gpu", []).append(tag)
+            if proc.get("mem_mib"):
+                r["gpu_mem_mib"] = r.get("gpu_mem_mib", 0) + proc["mem_mib"]
+
+
 # Every name this process has shipped under. Kept as a hint for the *display*
 # only — tree membership is decided by ppid, never by these (see process_tree).
 RUNNER_BASENAMES = {"llama-server", "ollama_llama_server", "ollama-runner"}
@@ -763,8 +852,10 @@ class Collector(threading.Thread):
     def __init__(self, container: str, api_url: str, interval: float,
                  show_gpu: bool, mode: str = "auto", show_raw_ps: bool = False,
                  show_runners: bool = True, runtime: str = "auto",
-                 container_runtime: ContainerRuntime | None = None):
+                 container_runtime: ContainerRuntime | None = None,
+                 show_env: bool = True):
         super().__init__(daemon=True, name="mtop-collector")
+        self.show_env = show_env
         self.container = container
         self.runtime_pref = runtime         # auto | api | cli
         self._runtime: ContainerRuntime | None = container_runtime
@@ -791,6 +882,10 @@ class Collector(threading.Thread):
         self._res_stats: dict | None = None
         self._runners: list[dict] | None = None
         self._gpu_cache: list[dict] | None = None
+        self._last_inspect: dict | None = None
+        # Slow-path too: the version never changes and the environment only
+        # changes with a restart.
+        self._server: dict = {"version": None, "env": {}, "env_source": None}
 
         # Multi-vendor GPU registry, built lazily so `use_docker` is already
         # resolved when the nvidia provider asks for its argv prefixes.
@@ -929,6 +1024,7 @@ class Collector(threading.Thread):
                 self._res_stats = None
             if self.show_gpu:
                 self._gpu_cache = self._gpu_read()
+            self._server = self._server_info(mode, snap.get("pid"))
             self._slow_ts = now
 
         if slow_due and mode == "docker":
@@ -938,6 +1034,7 @@ class Collector(threading.Thread):
         snap["runners"] = (self._runners if mode == "docker"
                            else (self._res_stats or {}).get("runners"))
         snap["gpus"] = self._gpu_cache if self.show_gpu else None
+        snap["server"] = self._server
 
         ok, data = http_get_json(f"{self.api_url}/api/ps")
         snap["models_ok"] = ok
@@ -945,6 +1042,7 @@ class Collector(threading.Thread):
         snap["models_err"] = "" if ok else str(data)
         if snap.get("runners") and snap["models"]:
             match_runners_to_models(snap["runners"], snap["models"])
+        link_runners_to_gpus(snap.get("runners"), snap.get("gpus"))
 
         if self.show_raw_ps and mode in ("docker", "local"):
             if mode == "docker" and self.runtime is not None:
@@ -960,6 +1058,25 @@ class Collector(threading.Thread):
             snap["raw_ps"] = out2
 
         return snap
+
+    def _server_info(self, mode: str, pid: int | None) -> dict:
+        """Ollama version + the inference-relevant environment it was started with."""
+        info: dict = {"version": None, "env": {}, "env_source": None}
+        ok, ver = http_get_json(f"{self.api_url}/api/version", timeout=3)
+        if ok and isinstance(ver, dict):
+            info["version"] = str(ver.get("version") or "") or None
+        if mode == "docker" and self._last_inspect:
+            info["env"] = inference_env(self._last_inspect.get("env") or [])
+            info["env_source"] = "container"
+        elif mode == "local" and pid and IS_LINUX:
+            pairs = read_proc_environ(pid)
+            if pairs is not None:
+                info["env"], info["env_source"] = inference_env(pairs), "process"
+            else:
+                sd = systemd_environment()
+                if sd is not None:
+                    info["env"], info["env_source"] = inference_env(sd), "systemd"
+        return info
 
     # -- local (bare-metal) process source -------------------------------------
 
@@ -1118,6 +1235,7 @@ class Collector(threading.Thread):
         """
         rt = self.runtime
         info = rt.inspect(self.container) if rt is not None else None
+        self._last_inspect = info
         if not info:
             return "not found", "", None, None
         status = info["status"]
@@ -1208,7 +1326,8 @@ class Collector(threading.Thread):
             return attempts
 
         providers: list[GpuProvider] = [
-            NvidiaSmiProvider(nvidia_attempts),
+            NvmlProvider(),                     # driver library: no fork, per-pid VRAM
+            NvidiaSmiProvider(nvidia_attempts),  # superseded when NVML answers
         ]
         if IS_LINUX:
             providers += [
@@ -1429,6 +1548,9 @@ def render_header(win, y: int, snap: dict, stale: bool) -> int:
         field("container: ", status_icon + container, status_attr)
     if uptime and mode != "api" and status != "api-only":
         field("up: ", uptime, curses.color_pair(C_DIM))
+    version = (snap.get("server") or {}).get("version")
+    if version:
+        field("ollama ", version, curses.color_pair(C_DIM))
 
     # Right-align timestamp (or STALE flag) to the inner frame; drop it when
     # the left-hand fields already reach that far.
@@ -1524,6 +1646,17 @@ def render_gpu_stats(win, y: int, snap: dict) -> int:
             vram_str = f"{mem_used:.0f} / {mem_total:.0f} MiB"
             draw_detail_right(win, y - 1, bar_end_x(5, label, 25), vram_str,
                               curses.color_pair(C_DIM))
+
+        # Compute processes on the card (NVML): runner names when we know them.
+        procs = gpu.get("procs") or []
+        if procs:
+            bits = []
+            for pr in procs:
+                who = pr.get("model") or f"pid {pr.get('pid')}"
+                mem = pr.get("mem_mib")
+                bits.append(f"{who} ({mem / 1024:.1f}G)" if mem else who)
+            y = safe_addstr(win, y, 5, "procs: " + ", ".join(bits),
+                            curses.color_pair(C_DIM))
 
         # GTT is a second pool on dGPUs (host memory the card can pull from);
         # only worth a line when something actually lives there.
@@ -1648,6 +1781,9 @@ def render_runners(win, y: int, snap: dict) -> int:
             extras.append("O_DIRECT")
         elif r.get("load_mode"):
             extras.append(f"load:{r['load_mode']}")
+        # Card indices from the NVML pid join; "—" when nothing linked (AMD,
+        # unified parts, or runners seen only through the container exec).
+        gpu_col = ",".join(t.split(":", 1)[1] for t in r.get("gpu") or []) or "—"
         rows.append([
             str(r.get("pid", "—")),
             name,
@@ -1657,24 +1793,68 @@ def render_runners(win, y: int, snap: dict) -> int:
             kv or "—",
             f"{vram / 1024**3:.1f} G" if vram else "—",
             f"{rss / 1024**3:.1f} G" if rss else "—",
+            gpu_col,
             ",".join(extras) or "",
         ])
     y = draw_table(win, y, 3,
-                   ["PID", "MODEL", "CTX", "BATCH", "FA", "KV", "VRAM", "HOST", ""],
-                   rows, [8, 32, 7, 6, 5, 9, 8, 8, 48],
+                   ["PID", "MODEL", "CTX", "BATCH", "FA", "KV", "VRAM", "HOST", "GPU", ""],
+                   rows, [8, 32, 7, 6, 5, 9, 8, 8, 5, 48],
                    hdr_attr=curses.color_pair(C_TABLE_HDR) | curses.A_BOLD)
     y += 1
     return y
 
 
+def render_server_config(win, y: int, snap: dict) -> int:
+    """The environment Ollama was started with (toggle: 'e').
+
+    Pairs flow left to right and wrap at the frame, so a dozen variables take
+    two or three lines instead of a dozen. The source is named because it
+    decides what can be trusted: `container` and `process` are the real
+    environment, `systemd` is only what the unit and its drop-ins declare.
+    """
+    server = snap.get("server") or {}
+    if snap.get("mode") == "api":
+        return y
+    y = section_header(win, y, " SERVER CONFIG ")
+    env = server.get("env") or {}
+    source = server.get("env_source")
+    if not source:
+        if snap.get("mode") == "local":
+            msg = "environment not readable (run mtop as the ollama user or root)"
+        else:
+            msg = "environment unavailable"
+        y = safe_addstr(win, y, 3, msg, curses.color_pair(C_DIM) | curses.A_DIM)
+        return y + 1
+    if not env:
+        y = safe_addstr(win, y, 3, f"no OLLAMA_* variables set — defaults ({source})",
+                        curses.color_pair(C_DIM))
+        return y + 1
+    _, max_x = win.getmaxyx()
+    limit = max_x - 3
+    x = 3
+    for k, v in env.items():
+        pair = f"{k}={v}"
+        if x > 3 and x + len(pair) > limit:
+            y += 1
+            x = 3
+        safe_addstr(win, y, x, k, curses.color_pair(C_DIM))
+        safe_addstr(win, y, x + len(k), "=" + v, curses.color_pair(C_OK))
+        x += len(pair) + 3
+    y += 1
+    y = safe_addstr(win, y, 3, f"source: {source}", curses.color_pair(C_DIM) | curses.A_DIM)
+    return y + 1
+
+
 def render_footer(win, interval: float, raw_ps: bool, can_raw_ps: bool,
-                  runners: bool = True, runtime: str | None = None):
+                  runners: bool = True, runtime: str | None = None,
+                  env: bool = True):
     max_y, max_x = win.getmaxyx()
     footer_y = max_y - 1
     parts = ["q: quit", f"+/-: interval ({interval:.1f}s)"]
     if can_raw_ps:
         parts.append(f"o: raw ps [{'on' if raw_ps else 'off'}]")
         parts.append(f"r: runners [{'on' if runners else 'off'}]")
+        parts.append(f"e: env [{'on' if env else 'off'}]")
     if runtime:
         parts.append(f"via {runtime}")
     parts.append(f"mtop v{__version__}")
@@ -1704,6 +1884,7 @@ def curses_main(stdscr, args):
         mode=args.mode,
         show_runners=not args.no_runners,
         runtime=args.runtime,
+        show_env=not args.no_env,
     )
     collector.start()
 
@@ -1721,6 +1902,8 @@ def curses_main(stdscr, args):
                     collector.show_raw_ps = not collector.show_raw_ps
                 elif key == ord("r"):
                     collector.show_runners = not collector.show_runners
+                elif key == ord("e"):
+                    collector.show_env = not collector.show_env
                 elif key == curses.KEY_RESIZE:
                     stdscr.erase()
             except curses.error:
@@ -1759,12 +1942,14 @@ def curses_main(stdscr, args):
                 y = render_models(stdscr, y, snap)
                 if collector.show_runners:
                     y = render_runners(stdscr, y, snap)
+                if collector.show_env:
+                    y = render_server_config(stdscr, y, snap)
                 if collector.show_raw_ps and "raw_ps" in snap:
                     y = render_ollama_ps(stdscr, y, snap)
 
             render_footer(stdscr, collector.interval, collector.show_raw_ps,
                           mode in ("docker", "local"), collector.show_runners,
-                          snap.get("runtime"))
+                          snap.get("runtime"), collector.show_env)
             stdscr.refresh()
     finally:
         collector.stop()
@@ -1787,6 +1972,7 @@ def json_main(args) -> int:
         mode=args.mode,
         show_runners=not args.no_runners,
         runtime=args.runtime,
+        show_env=not args.no_env,
     )
     snap = collector.collect(time.monotonic())
     if collector.needs_second_sample(snap):
@@ -1808,7 +1994,7 @@ def main():
         description="mtop — Ollama model monitor for Docker containers",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Keys: q=quit, +=faster, -=slower, o=toggle raw ollama ps, "
-               "r=toggle runners\n\n"
+               "r=toggle runners, e=toggle server config\n\n"
                "https://github.com/Quaerendir/mtop",
     )
     parser.add_argument("-c", "--container", default=DEFAULT_CONTAINER,
@@ -1834,6 +2020,9 @@ def main():
     parser.add_argument("--no-runners", action="store_true",
                         help="Hide the RUNNERS section (effective inference "
                              "config parsed from each runner process argv)")
+    parser.add_argument("--no-env", action="store_true",
+                        help="Hide the SERVER CONFIG section (OLLAMA_* environment "
+                             "the server was started with)")
     parser.add_argument("--no-docker", action="store_true",
                         help="Alias for --mode api (kept for compatibility)")
     parser.add_argument("--json", action="store_true",

@@ -20,9 +20,11 @@ There are web dashboards, Prometheus exporters, and chat TUIs for Ollama. But th
 - **Zero-flicker display** — curses double-buffered rendering, no `clear` + print loops
 - **Effective inference config** — `RUNNERS` section parses each runner's argv: context, batch, flash attention, KV cache dtype, layer offload. The only place these are observable
 - **Whole-tree process stats** — the server *and* its per-model `ollama runner` subprocesses, with PSS accounting where available
+- **Server config** — the `OLLAMA_*` / `CUDA_VISIBLE_DEVICES` / `HSA_*` environment the server was started with, from the container, the process, or the systemd unit; next to RUNNERS this is "what was set" vs "what was negotiated"
+- **Which model on which card** — NVIDIA per-process VRAM via NVML (ctypes, no `nvidia-smi` fork) joined to the runner PIDs: a `GPU` column in RUNNERS and a `procs:` line under each card
 - **Loaded models** — name, VRAM/RAM split, context length, processor type, TTL countdown
 - **Container health** — status indicator (●/✗/○), uptime, CPU & memory with progress bars
-- **Multi-vendor GPU monitoring** — NVIDIA via `nvidia-smi` *and* AMD via sysfs, side by side on the same host; utilization, VRAM/GTT, temperature, power draw
+- **Multi-vendor GPU monitoring** — NVIDIA via NVML (`nvidia-smi` as fallback) *and* AMD via sysfs, side by side on the same host; utilization, VRAM/GTT, temperature, power draw
 - **AMD without ROCm** — telemetry comes from `/sys/class/drm/card*/device`, so a bare `amdgpu` driver is enough; `rocm-smi` is only a fallback
 - **Jetson / Tegra / NVIDIA Spark** — automatic fallback to unified memory via `/proc/meminfo`
 - **Non-blocking UI** — all I/O (docker, nvidia-smi, HTTP) runs in a background collector thread; the interface stays responsive at 100 ms even when the API hangs, and stale data is flagged
@@ -90,6 +92,7 @@ Options:
                          cli = docker/podman subprocesses
       --no-gpu           Disable GPU monitoring section
       --no-runners       Hide the RUNNERS section (effective inference config)
+      --no-env           Hide the SERVER CONFIG section (OLLAMA_* environment)
       --no-docker        API-only mode: skip all docker calls (remote instances)
       --json             Print one snapshot as JSON and exit (exit 1 on unhealthy)
   -V, --version          Show version
@@ -139,6 +142,7 @@ mtop
 | `-` | Increase refresh interval (slower) |
 | `o` | Toggle raw `ollama ps` section |
 | `r` | Toggle the `RUNNERS` section |
+| `e` | Toggle the `SERVER CONFIG` section |
 
 ## Display Layout
 
@@ -166,7 +170,7 @@ OLLAMA PS (raw)
 
 | Platform | GPU Monitoring | Notes |
 |----------|---------------|-------|
-| Linux x86_64 + NVIDIA | ✅ Full | `nvidia-smi` on host or in container |
+| Linux x86_64 + NVIDIA | ✅ Full | NVML via ctypes; `nvidia-smi` on host or in container as fallback |
 | NVIDIA Jetson / Orin | ✅ Unified memory | Falls back to `/proc/meminfo` |
 | NVIDIA GB10 Spark | ✅ Unified memory | Tegra-based, same fallback |
 | Linux + AMD (amdgpu) | ✅ Full | sysfs — no ROCm install required |
@@ -183,7 +187,7 @@ OLLAMA PS (raw)
 - **Python 3.10+** (uses `match`-era type hints like `list[str]`, `X | Y`)
 - **Docker or Podman** for container monitoring — access to the socket is enough, the CLI is optional
 - **Ollama** in a container, as a bare-metal process, or reachable via API
-- **nvidia-smi** (optional, for GPU stats)
+- **NVIDIA driver** (optional, for GPU stats — `libnvidia-ml.so.1`, or `nvidia-smi` as fallback)
 
 ## Roadmap
 
@@ -200,6 +204,8 @@ OLLAMA PS (raw)
 - [ ] Log panel (tail Ollama container logs)
 - [x] Effective inference config per runner (context, flash attention, KV dtype)
 - [ ] Request rate / tokens-per-second from Ollama API
+- [x] Effective server environment (`OLLAMA_*`) per source
+- [x] Runner → GPU mapping via NVML per-process memory
 
 ## Contributing
 

@@ -295,3 +295,138 @@ class TestGpuMonitor:
         assert out[0]["unified"] and out[0]["name"] == "NVIDIA GB10"
         empty = gpu.TegraUnifiedProvider(lambda: None)
         assert gpu.GpuMonitor([empty], lambda: 0.0).collect() is None
+
+
+# ── NVML via a fake driver library ───────────────────────────────────────────
+
+import ctypes  # noqa: E402
+
+
+class FakeNvml:
+    """Mimics the handful of libnvidia-ml entry points NvmlProvider calls."""
+
+    def __init__(self, cards, init_rc=0, procs_version="v3"):
+        self.cards = cards            # list of dicts: name, util, mem, temp, power, procs
+        self.init_rc = init_rc
+        self.calls = []
+        if procs_version != "v3":
+            self.nvmlDeviceGetComputeRunningProcesses_v3 = None
+        if procs_version == "v1":
+            self.nvmlDeviceGetComputeRunningProcesses_v2 = None
+
+    def nvmlInit_v2(self):
+        self.calls.append("init")
+        return self.init_rc
+
+    def nvmlDeviceGetCount_v2(self, p):
+        p._obj.value = len(self.cards)
+        return 0
+
+    def nvmlDeviceGetHandleByIndex_v2(self, idx, p):
+        p._obj.value = idx + 1
+        return 0
+
+    def _card(self, dev):
+        return self.cards[dev.value - 1]
+
+    def nvmlDeviceGetName(self, dev, buf, n):
+        buf.value = self._card(dev)["name"].encode()
+        return 0
+
+    def nvmlDeviceGetUtilizationRates(self, dev, p):
+        u = self._card(dev).get("util")
+        if u is None:
+            return 3
+        p._obj.gpu = u
+        return 0
+
+    def nvmlDeviceGetMemoryInfo(self, dev, p):
+        m = self._card(dev).get("mem")
+        if m is None:
+            return 3                              # NOT_SUPPORTED (GB10 / Jetson)
+        p._obj.total, p._obj.used, p._obj.free = m[1], m[0], m[1] - m[0]
+        return 0
+
+    def nvmlDeviceGetTemperature(self, dev, sensor, p):
+        p._obj.value = self._card(dev)["temp"]
+        return 0
+
+    def nvmlDeviceGetPowerUsage(self, dev, p):
+        pw = self._card(dev).get("power")
+        if pw is None:
+            return 3
+        p._obj.value = pw
+        return 0
+
+    def _procs(self, dev, count, infos):
+        procs = self._card(dev).get("procs") or []
+        if infos is None:
+            count._obj.value = len(procs)
+            return 0 if not procs else 7          # INSUFFICIENT_SIZE with the count
+        for i, (pid, mem) in enumerate(procs):
+            infos[i].pid = pid
+            infos[i].usedGpuMemory = mem
+        count._obj.value = len(procs)
+        return 0
+
+    nvmlDeviceGetComputeRunningProcesses_v3 = _procs
+    nvmlDeviceGetComputeRunningProcesses_v2 = _procs
+    nvmlDeviceGetComputeRunningProcesses = _procs
+
+
+class TestNvml:
+    def test_two_cards_with_processes(self):
+        lib = FakeNvml([
+            {"name": "NVIDIA GeForce RTX 4090", "util": 32, "mem": (17382 << 20, 24564 << 20),
+             "temp": 42, "power": 285_100, "procs": [(4711, 13_800 << 20), (4712, 0)]},
+            {"name": "NVIDIA GeForce RTX 3060", "util": 0, "mem": (512 << 20, 12288 << 20),
+             "temp": 31, "power": None, "procs": []},
+        ])
+        p = gpu.NvmlProvider(loader=lambda: lib)
+        out = p.collect()
+        assert [g["name"] for g in out] == ["NVIDIA GeForce RTX 4090", "NVIDIA GeForce RTX 3060"]
+        g0 = out[0]
+        assert g0["util"] == "32" and g0["mem_used"] == "17382" and g0["mem_total"] == "24564"
+        assert g0["temp"] == "42" and g0["power"] == "285.10"
+        assert g0["procs"] == [{"pid": 4711, "mem_mib": 13800}, {"pid": 4712, "mem_mib": None}]
+        assert "power" not in out[1] and out[1]["procs"] == []
+        p.collect()
+        assert lib.calls.count("init") == 1          # initialised once
+
+    def test_unified_part_reports_na_memory(self):
+        lib = FakeNvml([{"name": "NVIDIA GB10", "util": 0, "mem": None, "temp": 41,
+                         "power": 10_710, "procs": [(99, gpu.NVML_VALUE_NOT_AVAILABLE)]}])
+        g = gpu.NvmlProvider(loader=lambda: lib).collect()[0]
+        assert g["mem_used"] == "[N/A]" and g["mem_total"] == "[N/A]"
+        assert g["procs"] == [{"pid": 99, "mem_mib": None}]
+
+    @pytest.mark.parametrize("ver", ["v2", "v1"])
+    def test_older_process_entry_points(self, ver):
+        lib = FakeNvml([{"name": "x", "util": 1, "mem": (1 << 30, 2 << 30), "temp": 1,
+                         "procs": [(5, 1 << 30)]}], procs_version=ver)
+        g = gpu.NvmlProvider(loader=lambda: lib).collect()[0]
+        assert g["procs"] == [{"pid": 5, "mem_mib": 1024}]
+
+    def test_no_library_or_init_failure(self):
+        p = gpu.NvmlProvider(loader=lambda: None)
+        assert p.collect() is None and p.collect() is None
+        p2 = gpu.NvmlProvider(loader=lambda: FakeNvml([], init_rc=9))
+        assert p2.collect() is None
+
+    def test_struct_layout_matches_nvml_header(self):
+        assert ctypes.sizeof(gpu._NvmlProcessV2) == 24
+        assert gpu._NvmlProcessV2.usedGpuMemory.offset == 8
+        assert ctypes.sizeof(gpu._NvmlProcessV1) == 16
+        assert ctypes.sizeof(gpu._NvmlMemory) == 24
+
+    def test_supersedes_nvidia_smi_in_registry(self):
+        lib = FakeNvml([{"name": "nvml-card", "util": 1, "mem": (1 << 30, 2 << 30), "temp": 1}])
+        nvml = gpu.NvmlProvider(loader=lambda: lib)
+        smi = _Fake("nvidia-smi", [[{"vendor": "nvidia", "index": 0, "name": "smi-card",
+                                     "mem_total": "2048"}]] * 3)
+        mon = gpu.GpuMonitor([nvml, smi], lambda: 0.0)
+        assert [g["name"] for g in mon.collect()] == ["nvml-card"]
+        assert smi.calls == 0
+        # when NVML is absent, nvidia-smi still answers
+        mon2 = gpu.GpuMonitor([gpu.NvmlProvider(loader=lambda: None), smi], lambda: 0.0)
+        assert [g["name"] for g in mon2.collect()] == ["smi-card"]

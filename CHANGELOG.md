@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.6.0 — 2026-09-13
+
+### Added
+- **NVML provider** (`mtop.gpu.NvmlProvider`): NVIDIA telemetry through
+  `libnvidia-ml.so.1` via ctypes — the library every driver ships and the
+  one `nvidia-smi` itself calls. No process spawn per cycle, and
+  `nvmlDeviceGetComputeRunningProcesses` gives host PID + bytes for every
+  compute process on each card, which `nvidia-smi --query-gpu` cannot.
+  `nvidia-smi` (host or in-container) stays as the fallback and is skipped
+  when NVML answers, so a card is never listed twice. Unsupported readings
+  (memory on GB10/Jetson, power on some parts) come out as `[N/A]`, which
+  the unified-memory patch already understands.
+- **Runner ↔ GPU join.** Runner PIDs from the host `/proc` walk are matched
+  against NVML's per-card process list: the RUNNERS table gains a `GPU`
+  column (card indices, e.g. `0,1` for a tensor-split model) and the GPU
+  section lists what is on each card (`procs: qwen2.5-coder:32b (18.4G)`).
+  `--json` carries `gpu` and `gpu_mem_mib` per runner and `procs` per GPU.
+  Runners found through the in-container exec fallback have container-
+  namespace PIDs and do not link; the column shows `—`.
+- **SERVER CONFIG section**: the inference-relevant environment the server
+  was started with — `OLLAMA_*`, `CUDA_VISIBLE_DEVICES`, `HIP_*`/`HSA_*`/
+  `ROCR_*`, `GGML_*` — with the source named: `container` (Config.Env from
+  inspect), `process` (`/proc/<pid>/environ`, same user or root), or
+  `systemd` (`systemctl show -p Environment`, which covers the unit and its
+  drop-ins but not `EnvironmentFile=` contents). Anything that looks like a
+  key or token is masked. Toggle with `e`, hide with `--no-env`; `server` in
+  `--json`.
+- **Ollama version** from `/api/version` in the header.
+
+### Verified
+- RTX 5060 (local, systemd): NVML figures match `nvidia-smi`; environment
+  falls back to systemd because the unit runs as another user.
+- DGX Spark (GB10, docker): environment from the container, NVML with
+  `[N/A]` memory patched from `/proc/meminfo`.
+
 ## 0.5.0 — 2026-09-13
 
 ### Added
