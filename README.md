@@ -6,8 +6,7 @@
 ![License: MIT](https://img.shields.io/badge/license-MIT-green)
 ![Platform: Linux](https://img.shields.io/badge/platform-Linux-lightgrey)
 
-<!-- TODO: Replace with actual screenshot/gif -->
-<!-- ![mtop screenshot](screenshot.png) -->
+![mtop on a DGX Spark: Ollama in Docker, two models loaded, NVML per-process memory, runner config, server environment and the access log](docs/screenshot.png)
 
 ## Why?
 
@@ -179,40 +178,20 @@ mtop
 | `e` | Toggle the `SERVER CONFIG` section |
 | `l` | Toggle the `LOGS` section (container logs / journalctl, request stats) |
 
-## Display Layout
+## What you see
 
-A DGX Spark (GB10) running Ollama in Docker, captured from a real session:
+The screenshot above is a real session on a DGX Spark (GB10) with Ollama in Docker and two models loaded. Top to bottom:
 
-```
-╔════════════════════════════ mtop vX.Y.Z — Ollama Model Monitor ════════════════════════════╗
-║ host: CZUHAJSTER   container: ● ollama   up: 20h 28m   ollama 0.33.2     2026-09-13 22:18:12 ║
-╚═════════════════════════════════════════════════════════════════════════════════════════════╝
- ───────────────────────────────── CONTAINER RESOURCES ──────────────────────────────────────
-  CPU  [░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░]   0.1%  ▁▁▂▁▁▁▃▁▁▁                        2% / 20 cores
-  MEM  [░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░]   1.1%  ▁▁▁▁▁▁▁▁▁▁                  1.376GiB / 121.7GiB
- ────────────────────────────────────────── GPU ─────────────────────────────────────────────
-  [nvidia:0] NVIDIA GB10  40°C  11W  (unified memory)
-    UTIL [░░░░░░░░░░░░░░░░░░░░░░░░░]   0.0%  ▁▁▁▁▁▁▂▅▃▁
-    MEM  [███░░░░░░░░░░░░░░░░░░░░░░]  15.7%  ▁▁▁▁▂▂▂▂▂▂                  19515 / 124605 MiB
-    procs: bielik-ocr-64k:latest (14.7G)
- ───────────────────────────────────── LOADED MODELS ────────────────────────────────────────
-  MODEL                       VRAM        RAM         CTX       PROCESSOR         EXPIRES
-  ────────────────────────────────────────────────────────────────────────────────────────
-  bielik-ocr-64k:latest       13.79 G     0.00 G      65536     100% GPU          9m 53s left
- ──────────────────────────────────────── RUNNERS ───────────────────────────────────────────
-  PID       MODEL                    CTX      BATCH   FA     KV      VRAM      HOST      GPU
-  ─────────────────────────────────────────────────────────────────────────────────────────
-  1637884   bielik-ocr-64k:latest    65536    2048    on     f16     13.8 G    1.0 G     0      mmproj,O_DIRECT
- ───────────────────────────────────── SERVER CONFIG ────────────────────────────────────────
-  NVIDIA_VISIBLE_DEVICES=all   OLLAMA_FLASH_ATTENTION=1   OLLAMA_HOST=0.0.0.0   OLLAMA_KEEP_ALIVE=24h
-  OLLAMA_KV_CACHE_TYPE=f16   OLLAMA_MAX_LOADED_MODELS=2   OLLAMA_NUM_PARALLEL=1
-  source: container
- ───────────────────── LOGS · docker-api logs · 1 req/60s · 1×2xx · p50 8.5s ────────────────
-  21:58:18 [GIN] 2026/09/13 - 21:58:18 | 200 |  8.499083048s |  172.18.0.1 | POST  "/api/generate"
- q: quit │ +/-: interval (1.0s) │ o: raw ps [off] │ r: runners [on] │ e: env [on] │ l: logs [on] │ via docker-api
-```
+- **header** — host, container (or `ollama: serve · pid`, or the API URL in api mode), uptime, the Ollama version, and `+N endpoints` when several are polled; `STALE` appears if the collector falls behind
+- **CONTAINER / PROCESS RESOURCES** — CPU normalized to the cgroup / systemd / affinity budget, memory with the accounting named (`pss`, `rss` or cgroup), sparklines of the recent history
+- **GPU** — one block per card, any vendor; `procs:` lists what NVML sees on the card, joined to the runners by PID
+- **LOADED MODELS** — `/api/ps`, one table per endpoint when there are several; PROCESSOR computed exactly as `ollama ps` does
+- **RUNNERS** — the negotiated inference config from each runner's argv, plus the card it sits on
+- **SERVER CONFIG** — the `OLLAMA_*` environment the server was started with and where it was read from
+- **LOGS** — tail of the container log or journal, with request rate and latency parsed from the GIN access log
+- **footer** — keys, the container runtime in use (`via docker-api`), version
 
-`o` adds the raw `ollama ps` table; the GPU column in RUNNERS and the `procs:` line come from NVML's per-process list joined to the runner PIDs.
+`o` adds the raw `ollama ps` table. Refresh the screenshot with `tools/screenshot.py` (see its docstring).
 
 ## Supported Platforms
 
