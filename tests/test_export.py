@@ -177,7 +177,7 @@ class _Snaps:
             self.sleeps += 1
             if self.sleeps > self.limit:
                 raise KeyboardInterrupt
-        monkeypatch.setattr(mtop.time, "sleep", sleep)
+        monkeypatch.setattr(mtop.cli.time, "sleep", sleep)
 
 
 def _args(**kw):
@@ -221,12 +221,12 @@ def test_prometheus_watch_replaces_file_atomically(monkeypatch, tmp_path):
     _Snaps(monkeypatch, [UP, DOWN], 1)
     target = tmp_path / "mtop.prom"
     seen = []
-    real_replace = mtop.os.replace
+    real_replace = mtop.cli.os.replace
 
     def replace(src, dst):
         seen.append((src, dst))
         real_replace(src, dst)
-    monkeypatch.setattr(mtop.os, "replace", replace)
+    monkeypatch.setattr(mtop.cli.os, "replace", replace)
     assert mtop.headless_main(_args(prometheus=True, watch=True, output=str(target))) == 0
     assert len(seen) == 2 and all(dst == str(target) for _, dst in seen)
     assert all(src.startswith(str(target) + ".") for src, _ in seen)
@@ -259,3 +259,36 @@ def test_json_main_alias_defaults(monkeypatch, capsys):
         delattr(ns, a)
     assert mtop.json_main(ns) == 0
     assert json.loads(capsys.readouterr().out)["models_ok"] is True
+
+
+def test_json_output_carries_schema_version(monkeypatch, capsys):
+    _Snaps(monkeypatch, [UP], 0)
+    mtop.headless_main(_args(json=True))
+    out = json.loads(capsys.readouterr().out)
+    assert out["schema_version"] == mtop.JSON_SCHEMA_VERSION == 1
+    assert list(out)[0] == "schema_version"
+
+
+def test_package_import_does_not_load_curses():
+    import subprocess
+    import sys
+    code = ("import sys, mtop; mtop.Collector; mtop.headless_main; "
+            "print('curses' in sys.modules)")
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                       env={"PYTHONPATH": "src", "PATH": ""})
+    assert r.returncode == 0 and r.stdout.strip() == "False", r.stderr
+    assert mtop.render_models and mtop.ui.render_models is mtop.render_models  # lazy hook
+    with pytest.raises(AttributeError):
+        mtop.no_such_thing  # noqa: B018
+
+
+def test_version_single_source():
+    import pathlib
+    import re
+    root = pathlib.Path(__file__).resolve().parent.parent
+    src = (root / "src/mtop/_version.py").read_text()
+    ver = re.search(r'__version__ = "([^"]+)"', src).group(1)
+    assert mtop.__version__ == ver
+    py = (root / "pyproject.toml").read_text()
+    assert 'dynamic = ["version"]' in py and 'path = "src/mtop/_version.py"' in py
+    assert not re.search(r'^version = "', py, re.MULTILINE)

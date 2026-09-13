@@ -3,13 +3,20 @@
 
 The curl one-liner is a real part of this project's value: `mtop` is a thing
 you drop onto a box you SSHed into, not a thing you pip-install there. The
-0.4.0 split into submodules would have broken it, so the release artifact is
-generated instead of hand-maintained.
+package is split into submodules, so the release artifact is generated
+instead of hand-maintained.
 
-Submodules are embedded as source strings and exec'd into real module objects
-registered in sys.modules, rather than concatenated. Concatenation would let
-same-named helpers (`_read`, `IS_LINUX`, ...) clobber each other depending on
-file order — a bug that only shows up at runtime, on someone else's machine.
+Submodules are embedded as source strings and exec'd into real module
+objects registered in sys.modules under their package names, rather than
+concatenated. Concatenation would let same-named helpers (`_read`,
+`IS_LINUX`, ...) clobber each other depending on file order — a bug that
+only shows up at runtime, on someone else's machine.
+
+Submodules may import each other with relative imports (`from .util import
+run_cmd`): a synthetic `mtop` package is registered first and every module
+runs with `__package__ = "mtop"`, so the import system finds the already
+loaded siblings in sys.modules. Modules are embedded in dependency order
+(depth-first over their relative imports), which also rejects cycles.
 
 Usage: python tools/bundle.py [-o dist/mtop.py]
 """
@@ -22,9 +29,9 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 PKG = ROOT / "src" / "mtop"
 
-# `from .gpu import (A, B,\n  C)` — single or parenthesized multi-line.
+# `from .gpu import (A, B,\n  C)` / `from .gpu import A` / `from . import a, b`
 IMPORT_RE = re.compile(
-    r"^from \.(?P<mod>\w+) import (?:\((?P<multi>[^)]*)\)|(?P<single>[^\n(]+))$",
+    r"^from \.(?P<mod>\w*) import (?:\((?P<multi>[^)]*)\)|(?P<single>[^\n(]+))$",
     re.MULTILINE,
 )
 
@@ -33,16 +40,47 @@ LOADER = '''
 import sys as _sys
 import types as _types
 
+_pkg = _types.ModuleType("mtop")
+_pkg.__path__ = []                      # marks it as a package for relative imports
+_pkg.__file__ = "<bundled:mtop>"
+_sys.modules["mtop"] = _pkg
+
 
 def _bundle_load(name: str, source: str):
     mod = _types.ModuleType(name)
     mod.__file__ = "<bundled:%s>" % name
+    mod.__package__ = "mtop"
     exec(compile(source, "mtop/%s.py" % name.rsplit(".", 1)[-1], "exec"),
          mod.__dict__)
     _sys.modules[name] = mod
+    setattr(_pkg, name.rsplit(".", 1)[-1], mod)
     return mod
 
 '''
+
+
+# Any relative import, including ones inside functions (cli imports ui lazily
+# so the headless modes never load curses) — those must be embedded too.
+DEP_RE = re.compile(
+    r"^[ \t]*from \.(?P<mod>\w*) import (?:\((?P<multi>[^)]*)\)|(?P<single>[^\n(]+))$",
+    re.MULTILINE,
+)
+
+
+def deps_of(src: str) -> list[str]:
+    """Sibling modules a source imports relatively, in first-seen order."""
+    out: list[str] = []
+    for m in DEP_RE.finditer(src):
+        mod = m.group("mod")
+        if mod == "":                                   # from . import a, b
+            names = (m.group("multi") or m.group("single")).split(",")
+            for n in names:
+                n = n.strip().split(" as ")[0].strip()
+                if n and n not in out:
+                    out.append(n)
+        elif mod not in out:
+            out.append(mod)
+    return out
 
 
 def main() -> int:
@@ -51,37 +89,55 @@ def main() -> int:
     args = ap.parse_args()
 
     main_src = (PKG / "__init__.py").read_text()
+    sources: dict[str, str] = {}
+    order: list[str] = []
+    visiting: list[str] = []
 
-    embeds: list[str] = []
+    def load(mod: str) -> None:
+        if mod in order:
+            return
+        if mod in visiting:
+            raise SystemExit(f"import cycle: {' -> '.join(visiting + [mod])}")
+        path = PKG / f"{mod}.py"
+        if not path.exists():
+            raise SystemExit(f"src/mtop/{mod}.py not found (imported relatively)")
+        src = path.read_text()
+        if "'''" in src:
+            raise SystemExit(
+                f"src/mtop/{mod}.py contains ''' — the bundler embeds "
+                "sources as r'''...''' literals. Use \"\"\" instead.")
+        visiting.append(mod)
+        for dep in deps_of(src):
+            load(dep)
+        visiting.pop()
+        sources[mod] = src
+        order.append(mod)
+
+    for dep in deps_of(main_src):
+        load(dep)
+
+    embeds = [f"_mod_{m} = _bundle_load('mtop.{m}', r'''\n{sources[m]}\n''')" for m in order]
+
     bindings: list[str] = []
-    seen: set[str] = set()
 
     def replace(match: re.Match) -> str:
         mod = match.group("mod")
         names = [n.strip() for n in
-                 (match.group("multi") or match.group("single")).split(",")
-                 if n.strip()]
-        if mod not in seen:
-            seen.add(mod)
-            src = (PKG / f"{mod}.py").read_text()
-            if "'''" in src:
-                raise SystemExit(
-                    f"src/mtop/{mod}.py contains ''' — the bundler embeds "
-                    "sources as r'''...''' literals. Use \"\"\" instead.")
-            embeds.append(f"_mod_{mod} = _bundle_load('mtop.{mod}', r'''\n{src}\n''')")
+                 (match.group("multi") or match.group("single")).split(",") if n.strip()]
         for n in names:
             if " as " in n:
                 orig, alias = (x.strip() for x in n.split(" as "))
-                bindings.append(f"{alias} = _mod_{mod}.{orig}")
             else:
-                bindings.append(f"{n} = _mod_{mod}.{n}")
-        return f"# (bundled) from .{mod} import {', '.join(names)}"
+                orig = alias = n
+            if mod == "":
+                bindings.append(f"{alias} = _mod_{orig}")
+            else:
+                bindings.append(f"{alias} = _mod_{mod}.{orig}")
+        return f"# (bundled) {match.group(0).splitlines()[0]}"
 
     main_src = IMPORT_RE.sub(replace, main_src)
-
     if not embeds:
-        print("warning: no relative imports found — nothing to bundle",
-              file=sys.stderr)
+        print("warning: no relative imports found — nothing to bundle", file=sys.stderr)
 
     block = LOADER + "\n".join(embeds) + "\n\n" + "\n".join(bindings) + "\n"
 
@@ -90,6 +146,8 @@ def main() -> int:
     marker = '"""\n'
     idx = main_src.index(marker, main_src.index(marker) + len(marker)) + len(marker)
     out_src = main_src[:idx] + block + main_src[idx:]
+    # The bundled file is a script, not the package: make `main()` reachable.
+    out_src += "\n\nif __name__ == \"__main__\":\n    main()\n"
 
     out = pathlib.Path(args.output)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -97,7 +155,7 @@ def main() -> int:
     out.chmod(0o755)
     compile(out_src, str(out), "exec")  # fail loudly here, not on the user's box
     print(f"wrote {out} ({len(out_src.splitlines())} lines, "
-          f"{len(seen)} embedded module(s))")
+          f"{len(order)} embedded module(s): {', '.join(order)})")
     return 0
 
 

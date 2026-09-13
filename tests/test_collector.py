@@ -25,20 +25,21 @@ API_PS = {
 @pytest.fixture
 def local_host(monkeypatch):
     """A Linux host running `ollama serve` under systemd with one runner."""
-    monkeypatch.setattr(mtop, "IS_LINUX", True)
-    monkeypatch.setattr(mtop, "IS_DARWIN", False)
-    monkeypatch.setattr(mtop, "systemd_ollama", lambda: ("running", SERVER_PID, None))
-    monkeypatch.setattr(mtop, "find_ollama_pid", lambda port=None: SERVER_PID)
-    monkeypatch.setattr(mtop, "proc_uptime_sec", lambda pid: 3700.0)
-    monkeypatch.setattr(mtop, "total_ram_bytes", lambda: 64 * GIB)
-    monkeypatch.setattr(mtop, "process_tree", lambda root, children=None: [SERVER_PID, RUNNER_PID])
-    monkeypatch.setattr(mtop, "read_proc_rss_bytes",
+    monkeypatch.setattr(mtop.collector, "IS_LINUX", True)
+    monkeypatch.setattr(mtop.collector, "IS_DARWIN", False)
+    monkeypatch.setattr(mtop.collector, "systemd_ollama", lambda: ("running", SERVER_PID, None))
+    monkeypatch.setattr(mtop.collector, "find_ollama_pid", lambda port=None: SERVER_PID)
+    monkeypatch.setattr(mtop.collector, "proc_uptime_sec", lambda pid: 3700.0)
+    monkeypatch.setattr(mtop.collector, "total_ram_bytes", lambda: 64 * GIB)
+    monkeypatch.setattr(mtop.collector, "process_tree",
+                        lambda root, children=None: [SERVER_PID, RUNNER_PID])
+    monkeypatch.setattr(mtop.collector, "read_proc_rss_bytes",
                         lambda pid: 64 << 20 if pid == SERVER_PID else 7 * GIB)
-    monkeypatch.setattr(mtop, "read_proc_pss_bytes", lambda pid: None)   # other user
+    monkeypatch.setattr(mtop.collector, "read_proc_pss_bytes", lambda pid: None)   # other user
     monkeypatch.setattr(
-        mtop, "read_proc_cmdline",
+        mtop.collector, "read_proc_cmdline",
         lambda pid: OLLAMA_ENGINE_ARGV if pid == RUNNER_PID else ["ollama", "serve"])
-    monkeypatch.setattr(mtop, "http_get_json",
+    monkeypatch.setattr(mtop.util, "http_get_json",
                         lambda url, timeout=5, headers=None, context=None: (True, API_PS))
 
     ticks = {"n": 0}
@@ -46,7 +47,7 @@ def local_host(monkeypatch):
 
     def cpu_ticks(pid):
         return samples[min(ticks["n"], 1)][pid]
-    monkeypatch.setattr(mtop, "read_proc_cpu_ticks", cpu_ticks)
+    monkeypatch.setattr(mtop.collector, "read_proc_cpu_ticks", cpu_ticks)
 
     def advance():
         ticks["n"] += 1
@@ -89,7 +90,7 @@ def test_cpu_percent_needs_two_samples(local_host):
 
 def test_json_main_takes_second_cpu_sample_in_local_mode(local_host, monkeypatch, capsys):
     advance = local_host
-    monkeypatch.setattr(mtop.time, "sleep", lambda s: advance())
+    monkeypatch.setattr(mtop.cli.time, "sleep", lambda s: advance())
     args = argparse.Namespace(container="ollama", api_url="http://localhost:11434",
                               interval=1.0, no_gpu=True, mode="local", no_runners=False,
                               runtime="auto", no_env=False, endpoints=None)
@@ -102,7 +103,7 @@ def test_json_main_takes_second_cpu_sample_in_local_mode(local_host, monkeypatch
 
 
 def test_json_main_exit_code_when_api_down(local_host, monkeypatch, capsys):
-    monkeypatch.setattr(mtop, "http_get_json",
+    monkeypatch.setattr(mtop.util, "http_get_json",
                         lambda url, timeout=5, headers=None, context=None: (False, "refused"))
     args = argparse.Namespace(container="ollama", api_url="http://localhost:11434",
                               interval=1.0, no_gpu=True, mode="local", no_runners=False,
@@ -118,7 +119,7 @@ def test_raw_ps_passes_api_url_to_cli(local_host, monkeypatch):
     def run_cmd(cmd, timeout=5, env=None):
         seen["cmd"], seen["env"] = cmd, env
         return True, "NAME  ID  SIZE  PROCESSOR  UNTIL\n"
-    monkeypatch.setattr(mtop, "run_cmd", run_cmd)
+    monkeypatch.setattr(mtop.collector, "run_cmd", run_cmd)
     c = _collector(api_url="http://127.0.0.1:11435", show_raw_ps=True)
     snap = c.collect(0.0)
     assert seen["cmd"] == ["ollama", "ps"]
@@ -127,7 +128,7 @@ def test_raw_ps_passes_api_url_to_cli(local_host, monkeypatch):
 
 
 def test_systemd_cpu_quota_becomes_cpu_limit(local_host, monkeypatch):
-    monkeypatch.setattr(mtop, "systemd_ollama", lambda: ("running", SERVER_PID, 4.0))
+    monkeypatch.setattr(mtop.collector, "systemd_ollama", lambda: ("running", SERVER_PID, 4.0))
     assert _collector().collect(0.0)["cpu_limit"] == 4.0
 
 
@@ -138,9 +139,9 @@ def test_api_port_only_for_loopback():
 
 
 def test_auto_mode_upgrades_from_api_once_source_appears(monkeypatch):
-    monkeypatch.setattr(mtop, "http_get_json",
+    monkeypatch.setattr(mtop.util, "http_get_json",
                         lambda url, timeout=5, headers=None, context=None: (True, {"models": []}))
-    monkeypatch.setattr(mtop, "IS_LINUX", True)
+    monkeypatch.setattr(mtop.collector, "IS_LINUX", True)
     probes = {"docker": False, "local": False}
     monkeypatch.setattr(mtop.Collector, "_detect_docker", lambda self: probes["docker"])
     monkeypatch.setattr(mtop.Collector, "_detect_local", lambda self: probes["local"])
@@ -177,7 +178,7 @@ def test_models_table_handles_null_sizes(win):
 def test_header_fields_do_not_overlap_on_narrow_terminal(monkeypatch):
     class U:
         nodename = "a-rather-long-hostname-for-testing"
-    monkeypatch.setattr(mtop.os, "uname", lambda: U())
+    monkeypatch.setattr(mtop.ui.os, "uname", lambda: U())
     snap = {"status": "running", "uptime": "3d 14h", "container": "ollama",
             "mode": "local", "pid": 4711, "res_stats": {"procs": 3}}
     for cols in (50, 60, 80, 120):
@@ -261,12 +262,12 @@ class FakeRuntime:
 
 @pytest.fixture
 def docker_host(monkeypatch):
-    monkeypatch.setattr(mtop, "IS_LINUX", True)
-    monkeypatch.setattr(mtop, "http_get_json",
+    monkeypatch.setattr(mtop.collector, "IS_LINUX", True)
+    monkeypatch.setattr(mtop.util, "http_get_json",
                         lambda url, timeout=5, headers=None, context=None: (True, API_PS))
     # host /proc walk finds nothing for the container init pid -> exec fallback
-    monkeypatch.setattr(mtop, "process_tree", lambda root, children=None: [root])
-    monkeypatch.setattr(mtop, "read_proc_cmdline", lambda pid: None)
+    monkeypatch.setattr(mtop.collector, "process_tree", lambda root, children=None: [root])
+    monkeypatch.setattr(mtop.collector, "read_proc_cmdline", lambda pid: None)
     return FakeRuntime()
 
 
@@ -296,8 +297,8 @@ def test_docker_mode_auto_detects_and_locks(docker_host, monkeypatch):
 
 
 def test_docker_mode_without_runtime_is_not_found(monkeypatch):
-    monkeypatch.setattr(mtop, "detect_runtime", lambda runner, prefer: None)
-    monkeypatch.setattr(mtop, "http_get_json",
+    monkeypatch.setattr(mtop.collector, "detect_runtime", lambda runner, prefer: None)
+    monkeypatch.setattr(mtop.util, "http_get_json",
                         lambda url, timeout=5, headers=None, context=None: (True, {"models": []}))
     c = _collector(mode="docker")
     snap = c.collect(0.0)
@@ -338,7 +339,7 @@ def _http(table):
 
 
 def test_server_info_docker_from_inspect_env(docker_host, monkeypatch):
-    monkeypatch.setattr(mtop, "http_get_json", _http(VERSION_AND_PS))
+    monkeypatch.setattr(mtop.util, "http_get_json", _http(VERSION_AND_PS))
     rt = docker_host
 
     def inspect(name):
@@ -352,32 +353,32 @@ def test_server_info_docker_from_inspect_env(docker_host, monkeypatch):
 
 
 def test_server_info_local_prefers_process_then_systemd(local_host, monkeypatch):
-    monkeypatch.setattr(mtop, "http_get_json", _http(VERSION_AND_PS))
-    monkeypatch.setattr(mtop, "read_proc_environ", lambda pid: ["OLLAMA_NUM_PARALLEL=2"])
-    monkeypatch.setattr(mtop, "systemd_environment",
+    monkeypatch.setattr(mtop.util, "http_get_json", _http(VERSION_AND_PS))
+    monkeypatch.setattr(mtop.collector, "read_proc_environ", lambda pid: ["OLLAMA_NUM_PARALLEL=2"])
+    monkeypatch.setattr(mtop.collector, "systemd_environment",
                         lambda unit="ollama.service": ["OLLAMA_HOST=x"])
     snap = _collector().collect(100.0)
     assert snap["server"]["env"] == {"OLLAMA_NUM_PARALLEL": "2"}
     assert snap["server"]["env_source"] == "process"
 
-    monkeypatch.setattr(mtop, "read_proc_environ", lambda pid: None)
+    monkeypatch.setattr(mtop.collector, "read_proc_environ", lambda pid: None)
     snap = _collector().collect(100.0)
     assert snap["server"] == {"version": "0.33.2", "env": {"OLLAMA_HOST": "x"},
                               "env_source": "systemd"}
 
-    monkeypatch.setattr(mtop, "systemd_environment", lambda unit="ollama.service": None)
+    monkeypatch.setattr(mtop.collector, "systemd_environment", lambda unit="ollama.service": None)
     snap = _collector().collect(100.0)
     assert snap["server"]["env_source"] is None and snap["server"]["version"] == "0.33.2"
 
 
 def test_server_info_version_failure_is_none(local_host, monkeypatch):
-    monkeypatch.setattr(mtop, "read_proc_environ", lambda pid: [])
+    monkeypatch.setattr(mtop.collector, "read_proc_environ", lambda pid: [])
     snap = _collector().collect(100.0)      # local_host's http stub only knows /api/ps
     assert snap["server"]["version"] is None and snap["server"]["env_source"] == "process"
 
 
 def test_runners_linked_to_gpus_in_snapshot(local_host, monkeypatch):
-    monkeypatch.setattr(mtop, "read_proc_environ", lambda pid: [])
+    monkeypatch.setattr(mtop.collector, "read_proc_environ", lambda pid: [])
     gpus = [{"vendor": "nvidia", "index": 0, "name": "x", "util": "1", "mem_used": "1",
              "mem_total": "2", "temp": "1", "procs": [{"pid": RUNNER_PID, "mem_mib": 14000}]}]
     monkeypatch.setattr(mtop.Collector, "_gpu_read", lambda self: gpus)
@@ -445,7 +446,7 @@ def _endpoint_stub(monkeypatch, table):
     def get(url, timeout=5, headers=None, context=None):
         calls.append((url, headers))
         return table.get(url, (False, "refused"))
-    monkeypatch.setattr(mtop, "http_get_json", get)
+    monkeypatch.setattr(mtop.util, "http_get_json", get)
     return calls
 
 

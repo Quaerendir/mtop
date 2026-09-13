@@ -160,13 +160,13 @@ def test_docker_api_logs_route(sock_dir):
 
 def test_collector_logs_local_via_journal(monkeypatch):
     from test_collector import SERVER_PID, API_PS  # noqa: F401  (fixtures below)
-    monkeypatch.setattr(mtop, "IS_LINUX", True)
-    monkeypatch.setattr(mtop, "systemd_ollama", lambda: ("running", SERVER_PID, None))
-    monkeypatch.setattr(mtop, "find_ollama_pid", lambda port=None: SERVER_PID)
-    monkeypatch.setattr(mtop, "proc_uptime_sec", lambda pid: 1.0)
+    monkeypatch.setattr(mtop.collector, "IS_LINUX", True)
+    monkeypatch.setattr(mtop.collector, "systemd_ollama", lambda: ("running", SERVER_PID, None))
+    monkeypatch.setattr(mtop.collector, "find_ollama_pid", lambda port=None: SERVER_PID)
+    monkeypatch.setattr(mtop.collector, "proc_uptime_sec", lambda pid: 1.0)
     monkeypatch.setattr(mtop.Collector, "_local_stats", lambda self, pid: None)
-    monkeypatch.setattr(mtop, "read_proc_environ", lambda pid: [])
-    monkeypatch.setattr(mtop, "http_get_json",
+    monkeypatch.setattr(mtop.collector, "read_proc_environ", lambda pid: [])
+    monkeypatch.setattr(mtop.util, "http_get_json",
                         lambda url, timeout=5, headers=None, context=None: (True, API_PS))
     import time as _t
     now = _t.time()
@@ -186,13 +186,13 @@ def test_collector_logs_local_via_journal(monkeypatch):
 
 def test_collector_logs_no_source_for_manual_serve(monkeypatch):
     from test_collector import SERVER_PID
-    monkeypatch.setattr(mtop, "IS_LINUX", True)
-    monkeypatch.setattr(mtop, "systemd_ollama", lambda: None)
-    monkeypatch.setattr(mtop, "find_ollama_pid", lambda port=None: SERVER_PID)
-    monkeypatch.setattr(mtop, "proc_uptime_sec", lambda pid: 1.0)
+    monkeypatch.setattr(mtop.collector, "IS_LINUX", True)
+    monkeypatch.setattr(mtop.collector, "systemd_ollama", lambda: None)
+    monkeypatch.setattr(mtop.collector, "find_ollama_pid", lambda port=None: SERVER_PID)
+    monkeypatch.setattr(mtop.collector, "proc_uptime_sec", lambda pid: 1.0)
     monkeypatch.setattr(mtop.Collector, "_local_stats", lambda self, pid: None)
-    monkeypatch.setattr(mtop, "read_proc_environ", lambda pid: [])
-    monkeypatch.setattr(mtop, "http_get_json",
+    monkeypatch.setattr(mtop.collector, "read_proc_environ", lambda pid: [])
+    monkeypatch.setattr(mtop.util, "http_get_json",
                         lambda url, timeout=5, headers=None, context=None: (True, {"models": []}))
     c = mtop.Collector(container="ollama", api_url="http://localhost:11434", interval=1.0,
                        show_gpu=False, mode="local", show_logs=True)
@@ -201,7 +201,7 @@ def test_collector_logs_no_source_for_manual_serve(monkeypatch):
 
 
 def test_history_recorded_per_slow_cycle(monkeypatch):
-    monkeypatch.setattr(mtop, "http_get_json",
+    monkeypatch.setattr(mtop.util, "http_get_json",
                         lambda url, timeout=5, headers=None, context=None: (True, {"models": []}))
     gpus = [{"vendor": "nvidia", "index": 0, "name": "x", "util": "40", "mem_used": "50",
              "mem_total": "200", "temp": "1"}]

@@ -152,7 +152,8 @@ docker run --rm -it -v /var/run/docker.sock:/var/run/docker.sock \
   --network host python:3.12-slim sh -c \
   "curl -fsSL https://github.com/Quaerendir/mtop/releases/latest/download/mtop.py -o m.py && python m.py"
 
-# One-shot health/state snapshot for scripting
+# One-shot health/state snapshot for scripting (schema_version=1 is the first key;
+# it changes only when a field changes meaning or goes away)
 mtop --json | jq '.models[].name'
 
 # Stream one JSON line per second (NDJSON) — feed it to jq, a log shipper, or a file
@@ -181,7 +182,7 @@ mtop
 ## Display Layout
 
 ```
-─── mtop v0.4.2 — Ollama Model Monitor ───
+─── mtop vX.Y.Z — Ollama Model Monitor ───
 host: gpu-rig     container: ● ollama     up: 3d 14h     2026-03-11 15:42:01
 ────────────────────────────────────────────────────────────────────────────────
 CONTAINER RESOURCES
@@ -252,7 +253,7 @@ PRs welcome. Keep it stdlib-only — the zero-dependency constraint is a feature
 git clone https://github.com/Quaerendir/mtop.git
 cd mtop
 pip install -e ".[dev]"      # + pytest, ruff
-# hack on src/mtop/*.py
+# hack on src/mtop/*.py — util, procfs, runner, collector, ui, cli, container, gpu, logs, export
 mtop
 
 ruff check src tools tests
@@ -262,7 +263,7 @@ pytest                       # stdlib-only fakes: no GPU, docker or Ollama neede
 python tools/bundle.py       # -> dist/mtop.py
 ```
 
-`dist/mtop.py` is generated — never edit it by hand. CI builds it on every
+`dist/mtop.py` is generated — never edit it by hand. The version lives in `src/mtop/_version.py` only. CI builds it on every
 push and attaches it to the GitHub release when a `v*` tag is pushed.
 
 ## License

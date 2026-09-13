@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ollama-mtop"
-version = "0.10.0"
+dynamic = ["version"]
 description = "htop for Ollama — curses-based TUI monitor for models, GPU, and Docker containers"
 readme = "README.md"
 license = {text = "MIT"}
@@ -47,6 +47,9 @@ Issues = "https://github.com/Quaerendir/mtop/issues"
 
 [project.scripts]
 mtop = "mtop:main"
+
+[tool.hatch.version]
+path = "src/mtop/_version.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/mtop"]

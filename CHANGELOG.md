@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.11.0 — 2026-09-14
+
+### Changed
+- **Package split.** The 2,500-line `__init__.py` is now `util` (subprocess,
+  HTTP, Endpoint, formatting), `procfs` (bare-metal discovery and /proc
+  accounting), `runner` (argv parsing, environment filter, the runner ↔
+  model ↔ GPU joins), `collector` (the background thread), `ui` (curses)
+  and `cli` (arguments, headless modes, entry point), next to the existing
+  `container`, `gpu`, `logs` and `export`. `mtop` re-exports the public
+  names, so `import mtop; mtop.Collector` and the test seams still work —
+  monkeypatch the module a name is *used* in (`mtop.collector.find_ollama_pid`).
+- **Only `mtop.ui` imports curses**, and `cli.main()` loads it on demand: the
+  package imports and `--json` / `--prometheus` run where curses does not
+  exist (Windows). Curses-only names are still reachable as `mtop.render_*`
+  through a lazy hook.
+- **One version source**: `src/mtop/_version.py`; pyproject declares
+  `dynamic = ["version"]` and hatch reads it from there.
+- `tools/bundle.py` follows relative imports between submodules (including
+  ones inside functions), registers a synthetic `mtop` package so
+  `from .util import run_cmd` resolves inside the single file, and embeds
+  modules in dependency order. Eleven modules, one file, still stdlib only.
+
+### Added
+- `schema_version` (currently 1) as the first key of every `--json` / NDJSON
+  document. It is bumped when a field changes meaning or goes away; new
+  fields do not bump it.
+
 ## 0.10.0 — 2026-09-13
 
 ### Added

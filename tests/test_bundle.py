@@ -12,7 +12,10 @@ def _bundle(tmp_path):
     out = tmp_path / "mtop.py"
     r = subprocess.run([sys.executable, str(ROOT / "tools" / "bundle.py"), "-o", str(out)],
                        capture_output=True, text=True, check=True)
-    assert "4 embedded module" in r.stdout
+    assert "embedded module(s): " in r.stdout
+    embedded = r.stdout.split("embedded module(s): ")[1].strip().rstrip(")").split(", ")
+    assert "ui" in embedded and "cli" in embedded          # lazy import inside cli.main()
+    assert embedded.index("util") < embedded.index("collector") < embedded.index("cli")
     return out
 
 
