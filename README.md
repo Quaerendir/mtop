@@ -214,7 +214,7 @@ OLLAMA PS (raw)
 | Ollama in Podman | ✅ Full | compat API on the Podman socket, or the `podman` CLI |
 | Bare-metal Ollama (systemd) | ✅ process stats | `--mode local`; CPU/MEM from `/proc`, no root needed |
 | Manual `ollama serve` | ✅ process stats | auto-detected via `/proc` cmdline scan |
-| macOS (Apple Silicon) | ⚠️ Partial, untested | `--mode local` process stats via `ps`/`sysctl`; GPU utilization and in-use memory via `ioreg` (no root); no temperature/power without root |
+| macOS (Apple Silicon) | ✅ Unified memory (no temp/power) | Verified on M5 Pro, macOS 26.6: GPU utilization and in-use memory via `ioreg`, no root; `--mode local` process stats via `ps`/`sysctl`; temperature/power need root (`powermetrics`) |
 | WSL2 | ⚠️ Partial | Works if Docker + nvidia-container-toolkit configured |
 
 ## Requirements

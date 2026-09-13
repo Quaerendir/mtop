@@ -12,18 +12,30 @@
   unprivileged user (that is what `intel_gpu_top` needs CAP_PERFMON for),
   so those read N/A and the screen says so.
 - **Apple Silicon provider** (`AppleGpuProvider`, macOS): `ioreg -a -r -c
-  IOAccelerator` parsed with `plistlib` — "Device Utilization %" and "In use
-  system memory" from the AGX PerformanceStatistics, chip name from
-  `machdep.cpu.brand_string`, unified memory total from `hw.memsize`. No
-  root, no `powermetrics`; temperature and power are not available without
-  root and read N/A.
+  IOAccelerator -d 1` parsed with `plistlib` — "Device Utilization %" and
+  "In use system memory" from the AGX PerformanceStatistics, GPU name from
+  the accelerator's `model` property (`machdep.cpu.brand_string` as the
+  fallback) plus `gpu-core-count`, unified memory total from `hw.memsize`.
+  No root, no `powermetrics`; temperature and power are not available
+  without root and read N/A.
+
+  Verified on an M5 Pro (20-core GPU, `AGXAcceleratorG17X`, macOS 26.6.2):
+  every key the parser reads is present with the expected type, `ioreg`
+  answers in ~20 ms, and `--json` reports `Apple M5 Pro (20 cores)` with
+  2–18 % utilization and 400–770 MiB in use of 49152 MiB on an idle desktop.
+  The test plist is trimmed from that machine's real output.
+
+### Fixed
+- Tests: the fake Engine API daemon binds its unix socket in a short `/tmp`
+  directory instead of pytest's `tmp_path`. On macOS `tmp_path` lives under
+  `/var/folders/…` and overflowed the 104-byte `sun_path` ("AF_UNIX path
+  too long"), erroring 12 tests that pass on Linux.
 
 ### Caveat
-- Neither provider has been run on real hardware — no Arc, Xe or Apple
-  Silicon was available. Both are built from the kernel sysfs ABI docs and
-  the IOAccelerator keys other monitors read, and are covered by tests on
-  synthetic trees / plists. `MTOP_SYSFS_DRM` points the Intel provider at a
-  copy of a real tree; reports welcome.
+- The Intel provider has not been run on real hardware — no Arc or Xe was
+  available. It is built from the kernel sysfs ABI docs and covered by
+  tests on a synthetic tree; `MTOP_SYSFS_DRM` points it at a copy of a real
+  tree. Reports welcome.
 
 ## 0.9.0 — 2026-09-13
 

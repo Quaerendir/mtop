@@ -82,9 +82,9 @@ def frame(kind, payload: bytes) -> bytes:
 
 
 @pytest.fixture
-def daemon(tmp_path):
+def daemon(sock_dir):
     """Start a fake Engine API on a unix socket; yields (DockerApi, routes, log)."""
-    sock = str(tmp_path / "d.sock")
+    sock = str(sock_dir / "d.sock")
     routes, log = {}, []
     routes[("GET", "/version")] = (200, {"Version": "29.2.1", "ApiVersion": "1.53",
                                          "Platform": {"Name": "Docker Engine - Community"}})

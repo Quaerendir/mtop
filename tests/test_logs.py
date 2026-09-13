@@ -135,11 +135,11 @@ def _frame(kind, payload):
     return bytes([kind, 0, 0, 0]) + struct.pack(">I", len(payload)) + payload
 
 
-def test_docker_api_logs_route(tmp_path):
+def test_docker_api_logs_route(sock_dir):
     from test_container import _UnixHTTPServer, make_handler
     import threading
     from mtop import container as ct
-    sock = str(tmp_path / "d.sock")
+    sock = str(sock_dir / "d.sock")
     routes, log = {}, []
     routes[("GET", "/containers/ollama/logs")] = (
         200, _frame(2, b"2026-09-13T21:42:00Z " + GIN_OK.encode() + b"\n"))

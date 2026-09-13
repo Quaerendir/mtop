@@ -502,21 +502,35 @@ class TestIntelSysfs:
         assert gpu.IntelSysfsProvider().collect()[0]["name"] == "Intel 8086:FFFF"
 
 
-# ── Apple via canned ioreg plist (no hardware available) ─────────────────────
+# ── Apple via a canned ioreg plist ───────────────────────────────────────────
+#
+# The first entry is trimmed from `ioreg -a -r -c IOAccelerator -d 1` on an
+# M5 Pro (macOS 26.6): same class name, keys, value types and magnitudes.
 
 IOREG_PLIST = """<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <array>
   <dict>
-    <key>IOClass</key><string>AGXAcceleratorG14X</string>
-    <key>gpu-core-count</key><integer>38</integer>
+    <key>IOClass</key><string>AGXAcceleratorG17X</string>
+    <key>IOObjectClass</key><string>AGXAcceleratorG17X</string>
+    <key>IORegistryEntryName</key><string>AGXAcceleratorG17X</string>
+    <key>gpu-core-count</key><integer>20</integer>
+    <key>model</key><string>Apple M5 Pro</string>
+    <key>vendor-id</key><data>axAAAA==</data>
     <key>PerformanceStatistics</key>
     <dict>
-      <key>Device Utilization %</key><integer>37</integer>
-      <key>Renderer Utilization %</key><integer>35</integer>
-      <key>In use system memory</key><integer>7516192768</integer>
-      <key>Alloc system memory</key><integer>8000000000</integer>
+      <key>Alloc system memory</key><integer>1368686592</integer>
+      <key>Allocated PB Size</key><integer>52428800</integer>
+      <key>Device Utilization %</key><integer>18</integer>
+      <key>In use system memory</key><integer>770834432</integer>
+      <key>In use system memory (driver)</key><integer>0</integer>
+      <key>Renderer Utilization %</key><integer>18</integer>
+      <key>SplitSceneCount</key><integer>0</integer>
+      <key>TiledSceneBytes</key><integer>1572864</integer>
+      <key>Tiler Utilization %</key><integer>5</integer>
+      <key>lastRecoveryTime</key><integer>0</integer>
+      <key>recoveryCount</key><integer>0</integer>
     </dict>
   </dict>
   <dict>
@@ -535,25 +549,40 @@ class TestAppleIoreg:
         return run
 
     def test_parse_and_collect(self):
+        # No brand_string in the table: the name must come from ioreg "model".
         run = self._runner({"ioreg": (True, IOREG_PLIST),
-                            "machdep.cpu.brand_string": (True, "Apple M2 Max\n"),
-                            "hw.memsize": (True, str(64 << 30))})
+                            "hw.memsize": (True, "51539607552\n")})
         out = gpu.AppleGpuProvider(run).collect()
         assert len(out) == 1
         g = out[0]
-        assert g["vendor"] == "apple" and g["name"] == "Apple M2 Max (38 cores)"
-        assert g["util"] == "37" and g["unified"] is True
-        assert g["mem_used"] == "7168" and g["mem_total"] == str(64 * 1024)
+        assert g["vendor"] == "apple" and g["name"] == "Apple M5 Pro (20 cores)"
+        assert g["util"] == "18" and g["unified"] is True
+        assert g["mem_used"] == "735" and g["mem_total"] == "49152"
         assert g["temp"] == "N/A"
+
+    def test_parse_keeps_only_agx_with_stats(self):
+        entries = gpu.AppleGpuProvider.parse_ioreg(IOREG_PLIST)
+        assert [e["class"] for e in entries] == ["AGXAcceleratorG17X"]
+        assert entries[0]["model"] == "Apple M5 Pro" and entries[0]["cores"] == 20
+
+    def test_model_as_data_blob(self):
+        # ioreg renders some string properties as <data>; NUL-terminated.
+        plist = IOREG_PLIST.replace("<key>model</key><string>Apple M5 Pro</string>",
+                                    "<key>model</key><data>QXBwbGUgTTUgUHJvAA==</data>")
+        assert gpu.AppleGpuProvider.parse_ioreg(plist)[0]["model"] == "Apple M5 Pro"
 
     def test_no_agx_entries_or_ioreg_failure(self):
         assert gpu.AppleGpuProvider(self._runner({})).collect() is None
-        plist = IOREG_PLIST.replace("AGXAcceleratorG14X", "IntelAccelerator")
+        plist = IOREG_PLIST.replace("AGXAcceleratorG17X", "IntelAccelerator")
         run = self._runner({"ioreg": (True, plist)})
         assert gpu.AppleGpuProvider(run).collect() is None
         assert gpu.AppleGpuProvider.parse_ioreg("not a plist") == []
 
-    def test_missing_sysctl_values(self):
-        run = self._runner({"ioreg": (True, IOREG_PLIST)})
+    def test_name_falls_back_to_brand_string_then_generic(self):
+        plist = IOREG_PLIST.replace("<key>model</key><string>Apple M5 Pro</string>", "")
+        run = self._runner({"ioreg": (True, plist),
+                            "machdep.cpu.brand_string": (True, "Apple M2 Max\n")})
+        assert gpu.AppleGpuProvider(run).collect()[0]["name"] == "Apple M2 Max (20 cores)"
+        run = self._runner({"ioreg": (True, plist)})
         g = gpu.AppleGpuProvider(run).collect()[0]
-        assert g["name"] == "Apple GPU (38 cores)" and g["mem_total"] == "N/A"
+        assert g["name"] == "Apple GPU (20 cores)" and g["mem_total"] == "N/A"

@@ -561,12 +561,14 @@ class IntelSysfsProvider(GpuProvider):
 
 # ── Apple Silicon via ioreg ───────────────────────────────────────────────────
 #
-# UNVERIFIED ON HARDWARE. Built from the IOAccelerator PerformanceStatistics
-# keys the AGX driver publishes (as read by tools like asitop and macmon):
-# "Device Utilization %", "Renderer Utilization %", "In use system memory".
-# `ioreg -a` prints an XML plist, which plistlib parses — no root, no
-# powermetrics. Temperature and power are not available without root and are
-# reported N/A; the GPU shares system RAM, so the memory total is hw.memsize.
+# Verified on an M5 Pro (AGXAcceleratorG17X, macOS 26.6). The AGX driver
+# publishes a PerformanceStatistics dict on its IOAccelerator entry with
+# "Device Utilization %", "Renderer Utilization %", "Tiler Utilization %",
+# "In use system memory" and "Alloc system memory"; the entry itself carries
+# "model" ("Apple M5 Pro") and "gpu-core-count". `ioreg -a` prints an XML
+# plist, which plistlib parses — no root, no powermetrics, ~20 ms a call.
+# Temperature and power are not available without root and are reported N/A;
+# the GPU shares system RAM, so the memory total is hw.memsize.
 
 class AppleGpuProvider(GpuProvider):
     name = "apple-ioreg"
@@ -577,6 +579,8 @@ class AppleGpuProvider(GpuProvider):
         self._total_mib: int | None = None
 
     def _chip_name(self) -> str:
+        """Fallback when the accelerator entry has no "model": the CPU brand
+        string names the same SoC ("Apple M5 Pro")."""
         if self._name is None:
             ok, out = self._run(["sysctl", "-n", "machdep.cpu.brand_string"], 2)
             self._name = out.strip() if ok and out.strip() else "Apple GPU"
@@ -608,8 +612,12 @@ class AppleGpuProvider(GpuProvider):
             cls = str(e.get("IOClass", ""))
             if not cls.startswith("AGX"):          # Apple silicon accelerators only
                 continue
+            model = e.get("model")
+            if isinstance(model, bytes):           # ioreg emits some strings as <data>
+                model = model.decode("utf-8", "replace").rstrip("\x00")
             out.append({
                 "class": cls,
+                "model": model.strip() if isinstance(model, str) and model.strip() else None,
                 "util": stats.get("Device Utilization %", stats.get("Renderer Utilization %")),
                 "in_use": stats.get("In use system memory"),
                 "cores": e.get("gpu-core-count"),
@@ -626,7 +634,7 @@ class AppleGpuProvider(GpuProvider):
         total = self._total()
         gpus = []
         for idx, e in enumerate(entries):
-            name = self._chip_name()
+            name = e.get("model") or self._chip_name()
             if e.get("cores"):
                 name += f" ({e['cores']} cores)"
             used = e.get("in_use")

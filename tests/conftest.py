@@ -2,7 +2,9 @@
 
 import curses
 import pathlib
+import shutil
 import sys
+import tempfile
 
 import pytest
 
@@ -40,6 +42,18 @@ class FakeWin:
 @pytest.fixture
 def win():
     return FakeWin()
+
+
+@pytest.fixture
+def sock_dir():
+    """A short directory for AF_UNIX sockets. sun_path is 104 bytes on macOS
+    and pytest's tmp_path lives under $TMPDIR (/var/folders/xx/.../pytest-N/
+    <test name>0/), which overflows it with "AF_UNIX path too long"."""
+    d = tempfile.mkdtemp(prefix="mtop-", dir="/tmp")
+    try:
+        yield pathlib.Path(d)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
 
 
 @pytest.fixture(autouse=True)
