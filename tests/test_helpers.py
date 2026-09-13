@@ -149,3 +149,112 @@ def test_link_runners_to_gpus_both_ways():
     assert runners[0]["gpu"] == ["nvidia:0", "nvidia:1"] and runners[0]["gpu_mem_mib"] == 8000
     mtop.link_runners_to_gpus(None, gpus)
     mtop.link_runners_to_gpus(runners, None)
+
+
+# ── endpoints, auth, TLS ─────────────────────────────────────────────────────
+
+import http.server  # noqa: E402
+import ssl  # noqa: E402
+import threading  # noqa: E402
+
+
+@pytest.mark.parametrize("value,expected", [
+    ("http://gpu-rig:11434", (None, "http://gpu-rig:11434")),
+    ("rig=http://gpu-rig:11434", ("rig", "http://gpu-rig:11434")),
+    ("gpu-rig:11434", (None, "gpu-rig:11434")),
+    ("http://x/?a=b", (None, "http://x/?a=b")),
+    ("my.box=https://u:p@x", ("my.box", "https://u:p@x")),
+    ("bad label=http://x", (None, "bad label=http://x")),
+])
+def test_parse_endpoint_arg(value, expected):
+    assert mtop.parse_endpoint_arg(value) == expected
+
+
+def test_split_userinfo():
+    url, h = mtop.split_userinfo("https://marek:s3cret%40x@gpu-rig:8443/ollama")
+    assert url == "https://gpu-rig:8443/ollama"
+    assert h == {"Authorization": "Basic bWFyZWs6czNjcmV0QHg="}      # marek:s3cret@x
+    assert mtop.split_userinfo("http://gpu-rig:11434") == ("http://gpu-rig:11434", {})
+    url6, h6 = mtop.split_userinfo("http://u:p@[::1]:11434")
+    assert url6 == "http://[::1]:11434" and "Authorization" in h6
+
+
+def test_parse_header_arg():
+    assert mtop.parse_header_arg("Authorization: Bearer abc:def") == \
+        ("Authorization", "Bearer abc:def")
+    assert mtop.parse_header_arg("X-Empty:") == ("X-Empty", "")
+    with pytest.raises(ValueError):
+        mtop.parse_header_arg("no-colon")
+    with pytest.raises(ValueError):
+        mtop.parse_header_arg(": value")
+
+
+def test_make_ssl_context():
+    assert mtop.make_ssl_context() is None
+    ctx = mtop.make_ssl_context(insecure=True)
+    assert ctx.verify_mode == ssl.CERT_NONE and ctx.check_hostname is False
+    with pytest.raises(FileNotFoundError):
+        mtop.make_ssl_context(cacert="/nonexistent/ca.pem")
+
+
+def test_endpoint_label_headers_and_describe():
+    ep = mtop.Endpoint("rig=https://u:p@gpu-rig:8443/", {"X-Api": "1"}, insecure=True)
+    assert ep.url == "https://gpu-rig:8443" and ep.label == "rig"
+    assert ep.headers["X-Api"] == "1" and ep.headers["Authorization"].startswith("Basic ")
+    assert ep.describe() == {"label": "rig", "url": "https://gpu-rig:8443",
+                             "auth": True, "tls": "insecure"}
+    plain = mtop.Endpoint("gpu-rig:11434")
+    assert plain.label == "gpu-rig:11434" and plain.url == "http://gpu-rig:11434"
+    assert plain.describe()["tls"] == "default" and plain.describe()["auth"] is False
+
+
+@pytest.fixture
+def auth_server():
+    """A stand-in for Ollama behind a proxy: 401 without the expected header."""
+    seen = []
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            seen.append(dict(self.headers))
+            if self.headers.get("Authorization") != "Bearer sekret":
+                self.send_response(401, "Unauthorized")
+                self.end_headers()
+                return
+            body = json.dumps({"models": [{"name": "remote:7b", "size": 1, "size_vram": 1,
+                                           "context_length": 1}]}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        yield f"http://127.0.0.1:{srv.server_address[1]}", seen
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+import json  # noqa: E402
+
+
+def test_http_get_json_sends_headers_and_reports_http_errors(auth_server):
+    base, seen = auth_server
+    ok, err = mtop.http_get_json(base + "/api/ps")
+    assert ok is False and err == "HTTP 401 Unauthorized"
+    ok, data = mtop.http_get_json(base + "/api/ps", headers={"Authorization": "Bearer sekret"})
+    assert ok is True and data["models"][0]["name"] == "remote:7b"
+    assert seen[-1]["Accept"] == "application/json"
+
+
+def test_endpoint_get_json_uses_its_headers(auth_server):
+    base, _ = auth_server
+    ep = mtop.Endpoint("proxy=" + base, {"Authorization": "Bearer sekret"})
+    ok, data = ep.get_json("/api/ps")
+    assert ok and data["models"]
+    assert mtop.Endpoint(base).get_json("/api/ps") == (False, "HTTP 401 Unauthorized")

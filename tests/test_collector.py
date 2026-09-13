@@ -38,7 +38,8 @@ def local_host(monkeypatch):
     monkeypatch.setattr(
         mtop, "read_proc_cmdline",
         lambda pid: OLLAMA_ENGINE_ARGV if pid == RUNNER_PID else ["ollama", "serve"])
-    monkeypatch.setattr(mtop, "http_get_json", lambda url, timeout=5: (True, API_PS))
+    monkeypatch.setattr(mtop, "http_get_json",
+                        lambda url, timeout=5, headers=None, context=None: (True, API_PS))
 
     ticks = {"n": 0}
     samples = [{SERVER_PID: 100, RUNNER_PID: 1000}, {SERVER_PID: 150, RUNNER_PID: 1200}]
@@ -91,7 +92,7 @@ def test_json_main_takes_second_cpu_sample_in_local_mode(local_host, monkeypatch
     monkeypatch.setattr(mtop.time, "sleep", lambda s: advance())
     args = argparse.Namespace(container="ollama", api_url="http://localhost:11434",
                               interval=1.0, no_gpu=True, mode="local", no_runners=False,
-                              runtime="auto", no_env=False)
+                              runtime="auto", no_env=False, endpoints=None)
     rc = mtop.json_main(args)
     out = json.loads(capsys.readouterr().out)
     assert rc == 0
@@ -101,10 +102,11 @@ def test_json_main_takes_second_cpu_sample_in_local_mode(local_host, monkeypatch
 
 
 def test_json_main_exit_code_when_api_down(local_host, monkeypatch, capsys):
-    monkeypatch.setattr(mtop, "http_get_json", lambda url, timeout=5: (False, "refused"))
+    monkeypatch.setattr(mtop, "http_get_json",
+                        lambda url, timeout=5, headers=None, context=None: (False, "refused"))
     args = argparse.Namespace(container="ollama", api_url="http://localhost:11434",
                               interval=1.0, no_gpu=True, mode="local", no_runners=False,
-                              runtime="auto", no_env=False)
+                              runtime="auto", no_env=False, endpoints=None)
     assert mtop.json_main(args) == 1
     out = json.loads(capsys.readouterr().out)
     assert out["models_ok"] is False and out["models_err"] == "refused"
@@ -136,7 +138,8 @@ def test_api_port_only_for_loopback():
 
 
 def test_auto_mode_upgrades_from_api_once_source_appears(monkeypatch):
-    monkeypatch.setattr(mtop, "http_get_json", lambda url, timeout=5: (True, {"models": []}))
+    monkeypatch.setattr(mtop, "http_get_json",
+                        lambda url, timeout=5, headers=None, context=None: (True, {"models": []}))
     monkeypatch.setattr(mtop, "IS_LINUX", True)
     probes = {"docker": False, "local": False}
     monkeypatch.setattr(mtop.Collector, "_detect_docker", lambda self: probes["docker"])
@@ -259,7 +262,8 @@ class FakeRuntime:
 @pytest.fixture
 def docker_host(monkeypatch):
     monkeypatch.setattr(mtop, "IS_LINUX", True)
-    monkeypatch.setattr(mtop, "http_get_json", lambda url, timeout=5: (True, API_PS))
+    monkeypatch.setattr(mtop, "http_get_json",
+                        lambda url, timeout=5, headers=None, context=None: (True, API_PS))
     # host /proc walk finds nothing for the container init pid -> exec fallback
     monkeypatch.setattr(mtop, "process_tree", lambda root, children=None: [root])
     monkeypatch.setattr(mtop, "read_proc_cmdline", lambda pid: None)
@@ -293,7 +297,8 @@ def test_docker_mode_auto_detects_and_locks(docker_host, monkeypatch):
 
 def test_docker_mode_without_runtime_is_not_found(monkeypatch):
     monkeypatch.setattr(mtop, "detect_runtime", lambda runner, prefer: None)
-    monkeypatch.setattr(mtop, "http_get_json", lambda url, timeout=5: (True, {"models": []}))
+    monkeypatch.setattr(mtop, "http_get_json",
+                        lambda url, timeout=5, headers=None, context=None: (True, {"models": []}))
     c = _collector(mode="docker")
     snap = c.collect(0.0)
     assert snap["status"] == "not found" and snap["runtime"] is None
@@ -327,7 +332,7 @@ VERSION_AND_PS = {"/api/version": (True, {"version": "0.33.2"}), "/api/ps": (Tru
 
 
 def _http(table):
-    def get(url, timeout=5):
+    def get(url, timeout=5, headers=None, context=None):
         return table.get("/api" + url.rsplit("/api", 1)[-1], (False, "nope"))
     return get
 
@@ -429,3 +434,86 @@ def test_header_shows_ollama_version():
             "server": {"version": "0.33.2"}}
     mtop.render_header(w, 0, snap, stale=False)
     assert "ollama 0.33.2" in w.line(1)
+
+
+# ── several endpoints ────────────────────────────────────────────────────────
+
+def _endpoint_stub(monkeypatch, table):
+    """http_get_json keyed by full URL; unknown URLs are 'refused'."""
+    calls = []
+
+    def get(url, timeout=5, headers=None, context=None):
+        calls.append((url, headers))
+        return table.get(url, (False, "refused"))
+    monkeypatch.setattr(mtop, "http_get_json", get)
+    return calls
+
+
+def _ps(*names):
+    return (True, {"models": [{"name": n, "size": 10, "size_vram": 10, "context_length": 2048}
+                              for n in names]})
+
+
+def test_multi_endpoint_snapshot(monkeypatch):
+    calls = _endpoint_stub(monkeypatch, {
+        "http://localhost:11434/api/ps": _ps("local:7b"),
+        "http://localhost:11434/api/version": (True, {"version": "0.33.2"}),
+        "http://gpu-rig:11434/api/ps": _ps("big:70b", "vision:11b"),
+        "http://gpu-rig:11434/api/version": (True, {"version": "0.32.0"}),
+    })
+    eps = [mtop.Endpoint("http://localhost:11434"), mtop.Endpoint("rig=gpu-rig:11434"),
+           mtop.Endpoint("dead=http://10.0.0.9:11434", {"Authorization": "Bearer x"})]
+    c = _collector(mode="api", endpoints=eps)
+    snap = c.collect(100.0)
+    assert c.api_url == "http://localhost:11434"
+    # primary keeps the legacy top-level fields
+    assert snap["models_ok"] and [m["name"] for m in snap["models"]] == ["local:7b"]
+    labels = [e["label"] for e in snap["endpoints"]]
+    assert labels == ["localhost:11434", "rig", "dead"]
+    rig, dead = snap["endpoints"][1], snap["endpoints"][2]
+    assert [m["name"] for m in rig["models"]] == ["big:70b", "vision:11b"]
+    assert rig["version"] == "0.32.0" and snap["server"]["version"] == "0.33.2"
+    assert dead["models_ok"] is False and dead["models_err"] == "refused"
+    # per-endpoint headers travel with the request
+    assert any(u.startswith("http://10.0.0.9") and h == {"Authorization": "Bearer x"}
+               for u, h in calls)
+
+
+def test_single_endpoint_has_no_pool_and_list_of_one(monkeypatch):
+    _endpoint_stub(monkeypatch, {"http://localhost:11434/api/ps": _ps()})
+    c = _collector(mode="api")
+    assert c._pool is None
+    snap = c.collect(0.0)
+    assert len(snap["endpoints"]) == 1 and snap["endpoints"][0]["label"] == "localhost:11434"
+
+
+def test_json_main_lists_endpoints(monkeypatch, capsys):
+    _endpoint_stub(monkeypatch, {"http://a:11434/api/ps": _ps("x"), "http://b:11434/api/ps": _ps()})
+    args = argparse.Namespace(container="ollama", api_url="http://a:11434", interval=1.0,
+                              no_gpu=True, mode="api", no_runners=False, runtime="auto",
+                              no_env=False,
+                              endpoints=[mtop.Endpoint("a:11434"), mtop.Endpoint("b:11434")])
+    assert mtop.json_main(args) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert [e["label"] for e in out["endpoints"]] == ["a:11434", "b:11434"]
+
+
+def test_render_models_per_endpoint(win):
+    snap = {"endpoints": [
+        {"label": "local", "version": "0.33.2", "models_ok": True,
+         "models": [{"name": "a:7b", "size": 4, "size_vram": 4, "context_length": 1}]},
+        {"label": "rig", "models_ok": False, "models_err": "HTTP 401 Unauthorized"},
+    ]}
+    mtop.render_models(win, 0, snap)
+    text = win.text()
+    assert "LOADED MODELS · local · ollama 0.33.2" in text and "a:7b" in text
+    assert "LOADED MODELS · rig" in text and "API error: HTTP 401 Unauthorized" in text
+
+
+def test_header_counts_extra_endpoints():
+    w = FakeWin(rows=4, cols=140)
+    snap = {"status": "api-only", "uptime": "", "container": "ollama", "mode": "api",
+            "api_url": "http://localhost:11434",
+            "endpoints": [{"label": "a"}, {"label": "b"}, {"label": "c"}]}
+    mtop.render_header(w, 0, snap, stale=False)
+    assert "+2 endpoints" in w.line(1)

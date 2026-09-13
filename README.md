@@ -36,6 +36,8 @@ There are web dashboards, Prometheus exporters, and chat TUIs for Ollama. But th
 - **Docker Engine API over the socket** — no `docker` binary needed: mtop talks to `/var/run/docker.sock` (or a rootless / Podman socket, or `$DOCKER_HOST`) with stdlib `http.client`; the `docker`/`podman` CLI is only a fallback. One-shot stats mean no 2 s `docker stats` stall per cycle
 - **Podman** — same code path via the compat API socket or the `podman` CLI
 - **Respects `$OLLAMA_HOST`** — works with remote Ollama instances out of the box
+- **Several instances at once** — repeat `-u`; each remote gets its own LOADED MODELS table. Two Ollama instances on a mixed CUDA + ROCm host, or a fleet of remote boxes, on one screen
+- **Behind a reverse proxy** — `-H 'Authorization: Bearer …'`, `$OLLAMA_API_KEY`, basic auth in the URL, `--insecure` / `--cacert` for private certificates
 - **Zero external dependencies** — only Python stdlib (`curses`, `urllib`, `json`, `subprocess`)
 
 ## Quick Start
@@ -77,7 +79,8 @@ PYTHONPATH=src python -m mtop
 ## Usage
 
 ```
-mtop [-c CONTAINER] [-i INTERVAL] [-u URL] [-m MODE] [--runtime RT] [--no-gpu] [--json] [-V] [-h]
+mtop [-c CONTAINER] [-i INTERVAL] [-u URL ...] [-H HEADER] [--insecure] [--cacert FILE]
+     [-m MODE] [--runtime RT] [--no-gpu] [--json] [-V] [-h]
 
 Options:
   -c, --container NAME   Docker container name (default: ollama)
@@ -86,7 +89,14 @@ Options:
                          api   = models only, no host resource stats
   -i, --interval SECS    Refresh interval in seconds (default: 1.0)
   -u, --api-url URL      Ollama API base URL (default: $OLLAMA_HOST or http://localhost:11434)
-                         Scheme-less values (gpu-rig:11434) are accepted, like Ollama itself
+                         Scheme-less values (gpu-rig:11434) are accepted, like Ollama itself.
+                         Repeatable: the first is the primary (host stats, runners), the
+                         rest are API-only. Optional label: -u rig=http://gpu-rig:11434.
+                         Credentials in the URL (https://user:pw@host) become basic auth.
+  -H, --header 'N: v'    Extra HTTP header for every API request (repeatable);
+                         $OLLAMA_API_KEY is sent as 'Authorization: Bearer …' automatically
+      --insecure         Skip TLS certificate verification for https:// endpoints
+      --cacert FILE      CA bundle (PEM) to verify https:// endpoints against
       --runtime RT       How to reach the container runtime: auto|api|cli (default: auto)
                          api = Engine API on $DOCKER_HOST or a docker/podman socket
                          cli = docker/podman subprocesses
@@ -116,6 +126,12 @@ mtop
 
 # Monitor a remote Ollama instance — API only, no local docker/GPU noise
 mtop -u 192.168.1.100:11434 --mode api
+
+# Several instances: the local one with full host stats, two remotes API-only
+mtop -u localhost:11434 -u rig=gpu-rig:11434 -u spark=192.168.3.6:11434
+
+# Ollama behind a reverse proxy with a private CA and a bearer token
+OLLAMA_API_KEY=… mtop -u https://ollama.internal --cacert /etc/ssl/internal-ca.pem
 
 # Podman (rootless): the socket is found automatically; or point at it
 DOCKER_HOST=unix://$XDG_RUNTIME_DIR/podman/podman.sock mtop
@@ -195,7 +211,7 @@ OLLAMA PS (raw)
 - [x] AMD GPU support (sysfs first, `rocm-smi` fallback)
 - [ ] Apple Silicon GPU stats (via `powermetrics`)
 - [ ] Model pull progress tracking
-- [ ] Multiple container / multi-host support
+- [x] Multi-host support (repeatable `-u`, per-endpoint model tables)
 - [x] Docker Engine API over the socket, Podman support
 - [x] Configurable layout (raw `ollama ps` toggle; more sections to follow)
 - [ ] Model actions — unload on keypress (`keep_alive: 0`), extend TTL

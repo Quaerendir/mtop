@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.7.0 — 2026-09-13
+
+### Added
+- **Several endpoints.** `-u` is repeatable, optionally labelled
+  (`-u rig=http://gpu-rig:11434`). The first is the *primary* — the one the
+  docker/local source, the runner match and the raw `ollama ps` refer to;
+  the rest are API-only and get their own LOADED MODELS table with the
+  endpoint's label and version. All endpoints are polled in parallel, so a
+  dead remote costs its timeout once per cycle, not once per endpoint in
+  sequence. `--json` gains an `endpoints` list; the top-level `models` /
+  `models_ok` / `api_url` keep describing the primary. This is the answer to
+  the mixed CUDA + ROCm host from the 0.4.0 notes: two instances, two `-u`.
+- **Auth.** `-H 'Name: value'` (repeatable) adds a header to every API
+  request; `OLLAMA_API_KEY` becomes `Authorization: Bearer …`, the same
+  variable the ollama CLI uses; credentials in a URL
+  (`https://user:pw@host`) become basic auth, which urllib does not do on
+  its own. HTTP failures now read `HTTP 401 Unauthorized` on screen instead
+  of a bare urllib reason.
+- **TLS.** `--insecure` skips certificate verification, `--cacert FILE`
+  verifies against a private CA — for Ollama behind a reverse proxy with an
+  internal certificate.
+
 ## 0.6.0 — 2026-09-13
 
 ### Added

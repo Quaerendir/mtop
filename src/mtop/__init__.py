@@ -10,17 +10,20 @@ keys at a fixed 100 ms poll. Slow or hung data sources can no longer
 freeze the UI — stale data is flagged instead.
 
 Usage:
-    mtop [-c CONTAINER] [-i INTERVAL] [-u URL] [-m MODE] [--runtime RT]
-         [--no-gpu] [--no-runners] [--json] [-h]
+    mtop [-c CONTAINER] [-i INTERVAL] [-u URL ...] [-H HEADER] [--insecure]
+         [-m MODE] [--runtime RT] [--no-gpu] [--no-runners] [--json] [-h]
 """
 
 import argparse
+import base64
+import concurrent.futures
 import curses
 import json
 import locale
 import os
 import re
 import shlex
+import ssl
 import subprocess
 import sys
 import threading
@@ -36,13 +39,14 @@ from .container import ContainerRuntime, detect_runtime
 from .gpu import (AmdSysfsProvider, GpuMonitor, GpuProvider, NvidiaSmiProvider,
                   NvmlProvider, RocmSmiProvider, TegraUnifiedProvider)
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
 
 DEFAULT_CONTAINER = "ollama"
 DEFAULT_INTERVAL = 1.0
 DEFAULT_API_BASE = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
+API_KEY_ENV = "OLLAMA_API_KEY"    # same variable the ollama CLI uses for Bearer auth
 
 UI_POLL_MS = 100          # curses getch timeout — UI responsiveness, not data rate
 SLOW_FLOOR = 2.0          # minimum cadence for docker stats / nvidia-smi
@@ -146,17 +150,111 @@ def api_port(url: str) -> int | None:
         return None
 
 
-def http_get_json(url: str, timeout: int = 5) -> tuple[bool, Any]:
-    """GET JSON from URL, return (success, data_or_error_string)."""
+def http_get_json(url: str, timeout: int = 5, headers: dict[str, str] | None = None,
+                  context: ssl.SSLContext | None = None) -> tuple[bool, Any]:
+    """GET JSON from URL, return (success, data_or_error_string).
+
+    `headers` carry auth (Bearer / Basic / anything a reverse proxy wants);
+    `context` a custom TLS setup (--insecure, --cacert). HTTP errors surface
+    as "HTTP 401 Unauthorized"-style strings so the screen says *why*.
+    """
     try:
-        req = urllib.request.Request(url, headers={"Accept": "application/json"})
-        opener = _DIRECT_OPENER if is_loopback_url(url) else _PROXY_OPENER
+        req = urllib.request.Request(url, headers={"Accept": "application/json",
+                                                   **(headers or {})})
+        if context is not None:
+            opener = urllib.request.build_opener(
+                urllib.request.HTTPSHandler(context=context),
+                *([urllib.request.ProxyHandler({})] if is_loopback_url(url) else []))
+        else:
+            opener = _DIRECT_OPENER if is_loopback_url(url) else _PROXY_OPENER
         with opener.open(req, timeout=timeout) as resp:
             return True, json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        return False, f"HTTP {e.code} {e.reason}"
     except urllib.error.URLError as e:
         return False, str(e.reason)
     except Exception as e:
         return False, str(e)
+
+
+def make_ssl_context(insecure: bool = False,
+                     cacert: str | None = None) -> ssl.SSLContext | None:
+    """TLS context for --insecure / --cacert; None means urllib's default."""
+    if not insecure and not cacert:
+        return None
+    ctx = ssl.create_default_context(cafile=cacert) if cacert else ssl.create_default_context()
+    if insecure:
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
+def split_userinfo(url: str) -> tuple[str, dict[str, str]]:
+    """`https://user:pw@host` -> (`https://host`, {"Authorization": "Basic ..."}).
+
+    urllib does not turn URL credentials into a header on its own, and a
+    reverse proxy in front of Ollama is most often protected with basic auth.
+    """
+    parts = urllib.parse.urlsplit(url)
+    if not parts.username and not parts.password:
+        return url, {}
+    user = urllib.parse.unquote(parts.username or "")
+    pw = urllib.parse.unquote(parts.password or "")
+    cred = f"{user}:{pw}"
+    host = parts.hostname or ""
+    if ":" in host:                      # IPv6 literal
+        host = f"[{host}]"
+    netloc = host + (f":{parts.port}" if parts.port else "")
+    clean = urllib.parse.urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+    token = base64.b64encode(cred.encode()).decode()
+    return clean, {"Authorization": f"Basic {token}"}
+
+
+def parse_header_arg(value: str) -> tuple[str, str]:
+    """`Name: value` -> ("Name", "value"); raises ValueError otherwise."""
+    name, sep, val = value.partition(":")
+    if not sep or not name.strip():
+        raise ValueError(f"expected 'Name: value', got {value!r}")
+    return name.strip(), val.strip()
+
+
+_LABEL_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+def parse_endpoint_arg(value: str) -> tuple[str | None, str]:
+    """`label=URL` or bare `URL` -> (label_or_None, url).
+
+    A label is a plain word before the first '='; anything with a '/' or ':'
+    before the '=' is part of a URL (query strings and the like).
+    """
+    head, sep, rest = value.partition("=")
+    if sep and _LABEL_RE.match(head) and rest:
+        return head, rest
+    return None, value
+
+
+class Endpoint:
+    """One Ollama API base URL plus how to talk to it (auth, TLS, label)."""
+
+    def __init__(self, spec: str, headers: dict[str, str] | None = None,
+                 insecure: bool = False, cacert: str | None = None):
+        label, url = parse_endpoint_arg(spec)
+        url = normalize_api_url(url)
+        url, basic = split_userinfo(url)
+        self.url = url
+        self.headers = {**(headers or {}), **basic}
+        self.context = make_ssl_context(insecure, cacert)
+        self.label = label or (urllib.parse.urlsplit(url).netloc or url)
+
+    def get_json(self, path: str, timeout: int = 5) -> tuple[bool, Any]:
+        return http_get_json(self.url + path, timeout, self.headers or None, self.context)
+
+    def describe(self) -> dict:
+        return {"label": self.label, "url": self.url,
+                "auth": "Authorization" in self.headers,
+                "tls": ("insecure" if self.context is not None
+                        and self.context.verify_mode == ssl.CERT_NONE
+                        else "custom-ca" if self.context is not None else "default")}
 
 
 def bytes_to_gib(b: int | float) -> str:
@@ -853,14 +951,21 @@ class Collector(threading.Thread):
                  show_gpu: bool, mode: str = "auto", show_raw_ps: bool = False,
                  show_runners: bool = True, runtime: str = "auto",
                  container_runtime: ContainerRuntime | None = None,
-                 show_env: bool = True):
+                 show_env: bool = True, endpoints: list[Endpoint] | None = None):
         super().__init__(daemon=True, name="mtop-collector")
         self.show_env = show_env
         self.container = container
         self.runtime_pref = runtime         # auto | api | cli
         self._runtime: ContainerRuntime | None = container_runtime
         self._runtime_probed = container_runtime is not None
-        self.api_url = api_url
+        # The first endpoint is the *primary*: it is the one the docker/local
+        # source, the runner match and the raw `ollama ps` refer to. Any
+        # further endpoints are API-only — models and version, nothing about
+        # the host they run on.
+        self.endpoints = endpoints or [Endpoint(api_url)]
+        self.primary = self.endpoints[0]
+        self.api_url = self.primary.url
+        self._versions: dict[str, str | None] = {}
         # Used to pick the right `ollama serve` when several are running, and
         # only meaningful for a loopback URL — a remote API can't be a local pid.
         self.api_port = api_port(api_url) if is_loopback_url(api_url) else None
@@ -886,6 +991,9 @@ class Collector(threading.Thread):
         # Slow-path too: the version never changes and the environment only
         # changes with a restart.
         self._server: dict = {"version": None, "env": {}, "env_source": None}
+        self._pool = (concurrent.futures.ThreadPoolExecutor(
+            max_workers=len(self.endpoints), thread_name_prefix="mtop-api")
+            if len(self.endpoints) > 1 else None)
 
         # Multi-vendor GPU registry, built lazily so `use_docker` is already
         # resolved when the nvidia provider asks for its argv prefixes.
@@ -1036,10 +1144,12 @@ class Collector(threading.Thread):
         snap["gpus"] = self._gpu_cache if self.show_gpu else None
         snap["server"] = self._server
 
-        ok, data = http_get_json(f"{self.api_url}/api/ps")
-        snap["models_ok"] = ok
-        snap["models"] = data.get("models", []) if ok else []
-        snap["models_err"] = "" if ok else str(data)
+        results = self._fetch_models()
+        primary = results[0]
+        snap["models_ok"] = primary["models_ok"]
+        snap["models"] = primary["models"]
+        snap["models_err"] = primary["models_err"]
+        snap["endpoints"] = results
         if snap.get("runners") and snap["models"]:
             match_runners_to_models(snap["runners"], snap["models"])
         link_runners_to_gpus(snap.get("runners"), snap.get("gpus"))
@@ -1059,12 +1169,36 @@ class Collector(threading.Thread):
 
         return snap
 
+    def _fetch_models(self) -> list[dict]:
+        """/api/ps from every endpoint, in parallel so one dead remote does not
+        stall the cycle by its full timeout. Order matches self.endpoints."""
+        def one(ep: Endpoint) -> dict:
+            ok, data = ep.get_json("/api/ps")
+            return {
+                "label": ep.label, "url": ep.url,
+                "models_ok": ok,
+                "models": (data.get("models", []) if ok and isinstance(data, dict) else []),
+                "models_err": "" if ok else str(data),
+                "version": self._versions.get(ep.label),
+            }
+        if self._pool is None:
+            return [one(self.endpoints[0])]
+        return list(self._pool.map(one, self.endpoints))
+
+    def _fetch_versions(self) -> None:
+        def one(ep: Endpoint) -> tuple[str, str | None]:
+            ok, ver = ep.get_json("/api/version", timeout=3)
+            v = str(ver.get("version") or "") if ok and isinstance(ver, dict) else ""
+            return ep.label, (v or None)
+        pairs = (self._pool.map(one, self.endpoints) if self._pool is not None
+                 else [one(self.endpoints[0])])
+        self._versions.update(dict(pairs))
+
     def _server_info(self, mode: str, pid: int | None) -> dict:
         """Ollama version + the inference-relevant environment it was started with."""
         info: dict = {"version": None, "env": {}, "env_source": None}
-        ok, ver = http_get_json(f"{self.api_url}/api/version", timeout=3)
-        if ok and isinstance(ver, dict):
-            info["version"] = str(ver.get("version") or "") or None
+        self._fetch_versions()
+        info["version"] = self._versions.get(self.primary.label)
         if mode == "docker" and self._last_inspect:
             info["env"] = inference_env(self._last_inspect.get("env") or [])
             info["env_source"] = "container"
@@ -1551,6 +1685,9 @@ def render_header(win, y: int, snap: dict, stale: bool) -> int:
     version = (snap.get("server") or {}).get("version")
     if version:
         field("ollama ", version, curses.color_pair(C_DIM))
+    extra = len(snap.get("endpoints") or []) - 1
+    if extra > 0:
+        field("+", f"{extra} endpoint{'s' if extra > 1 else ''}", curses.color_pair(C_DIM))
 
     # Right-align timestamp (or STALE flag) to the inner frame; drop it when
     # the left-hand fields already reach that far.
@@ -1673,16 +1810,26 @@ def render_gpu_stats(win, y: int, snap: dict) -> int:
 
 
 def render_models(win, y: int, snap: dict) -> int:
-    """Display loaded models from the snapshot (/api/ps)."""
-    y = section_header(win, y, " LOADED MODELS ")
+    """Loaded models from /api/ps — one table per endpoint when there are several."""
+    endpoints = snap.get("endpoints") or [snap]
+    if len(endpoints) == 1:
+        return render_models_table(win, y, endpoints[0], " LOADED MODELS ")
+    for ep in endpoints:
+        ver = f" · ollama {ep['version']}" if ep.get("version") else ""
+        y = render_models_table(win, y, ep, f" LOADED MODELS · {ep.get('label', '?')}{ver} ")
+    return y
 
-    if not snap.get("models_ok", False):
-        y = safe_addstr(win, y, 3, f"API error: {snap.get('models_err', '?')}",
+
+def render_models_table(win, y: int, ep: dict, title: str) -> int:
+    y = section_header(win, y, title)
+
+    if not ep.get("models_ok", False):
+        y = safe_addstr(win, y, 3, f"API error: {ep.get('models_err', '?')}",
                         curses.color_pair(C_ERR))
         y += 1
         return y
 
-    models = snap.get("models", [])
+    models = ep.get("models", [])
     if not models:
         y = safe_addstr(win, y, 3, "No models currently loaded",
                         curses.color_pair(C_WARN) | curses.A_DIM)
@@ -1885,6 +2032,7 @@ def curses_main(stdscr, args):
         show_runners=not args.no_runners,
         runtime=args.runtime,
         show_env=not args.no_env,
+        endpoints=args.endpoints,
     )
     collector.start()
 
@@ -1973,6 +2121,7 @@ def json_main(args) -> int:
         show_runners=not args.no_runners,
         runtime=args.runtime,
         show_env=not args.no_env,
+        endpoints=args.endpoints,
     )
     snap = collector.collect(time.monotonic())
     if collector.needs_second_sample(snap):
@@ -2001,9 +2150,19 @@ def main():
                         help=f"Docker container name (default: {DEFAULT_CONTAINER})")
     parser.add_argument("-i", "--interval", type=float, default=DEFAULT_INTERVAL,
                         help=f"Refresh interval in seconds (default: {DEFAULT_INTERVAL})")
-    parser.add_argument("-u", "--api-url", default=DEFAULT_API_BASE,
+    parser.add_argument("-u", "--api-url", action="append", dest="api_urls", metavar="URL",
                         help="Ollama API base URL (default: $OLLAMA_HOST or "
-                             f"{DEFAULT_API_BASE})")
+                             f"{DEFAULT_API_BASE}). Repeat for several instances; the "
+                             "first is the primary (host stats, runners), the rest are "
+                             "API-only. Optional label: -u rig=http://gpu-rig:11434. "
+                             "Credentials in the URL become basic auth.")
+    parser.add_argument("-H", "--header", action="append", default=[], metavar="'Name: value'",
+                        help="Extra HTTP header for every API request (repeatable), e.g. "
+                             "'Authorization: Bearer ...' for an instance behind a proxy")
+    parser.add_argument("--insecure", action="store_true",
+                        help="Skip TLS certificate verification for https:// endpoints")
+    parser.add_argument("--cacert", metavar="FILE",
+                        help="CA bundle (PEM) to verify https:// endpoints against")
     parser.add_argument("-m", "--mode", choices=["auto", "docker", "local", "api"],
                         default="auto",
                         help="Data source (default: auto — probe docker, then a "
@@ -2031,7 +2190,24 @@ def main():
     parser.add_argument("-V", "--version", action="version",
                         version=f"mtop {__version__}")
     args = parser.parse_args()
-    args.api_url = normalize_api_url(args.api_url)
+    headers: dict[str, str] = {}
+    key = os.environ.get(API_KEY_ENV, "").strip()
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    for h in args.header:
+        try:
+            name, val = parse_header_arg(h)
+        except ValueError as e:
+            parser.error(str(e))
+        headers[name] = val
+    if args.cacert and not os.path.exists(args.cacert):
+        parser.error(f"--cacert: no such file: {args.cacert}")
+    try:
+        args.endpoints = [Endpoint(u, headers, args.insecure, args.cacert)
+                          for u in (args.api_urls or [DEFAULT_API_BASE])]
+    except ValueError as e:
+        parser.error(str(e))
+    args.api_url = args.endpoints[0].url
     # --no-docker is the v0.2.0 spelling of "api only"; let it win only when the
     # user didn't pass an explicit --mode, so `--mode local --no-docker` errors
     # toward the explicit choice rather than silently overriding it.
