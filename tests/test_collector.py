@@ -293,7 +293,11 @@ def test_docker_mode_auto_detects_and_locks(docker_host, monkeypatch):
     rt.status = "exited"
     snap = c.collect(103.0)
     assert snap["mode"] == "docker" and snap["status"] == "exited"
-    assert "res_stats" not in snap                        # short-circuits when down
+    # container down: no stats/runners, but the API is still polled and the
+    # document keeps the same keys (schema_version contract)
+    assert snap["res_stats"] is None and snap["runners"] is None and snap["pid"] is None
+    assert snap["models_ok"] is True and snap["endpoints"][0]["label"] == "localhost:11434"
+    assert rt.stats_calls == 1                            # not called while down
 
 
 def test_docker_mode_without_runtime_is_not_found(monkeypatch):
@@ -518,3 +522,79 @@ def test_header_counts_extra_endpoints():
             "endpoints": [{"label": "a"}, {"label": "b"}, {"label": "c"}]}
     mtop.render_header(w, 0, snap, stale=False)
     assert "+2 endpoints" in w.line(1)
+
+
+def test_dead_extra_endpoint_does_not_stall_the_cycle(monkeypatch):
+    import threading
+    import time as _t
+    release = threading.Event()
+
+    def get(url, timeout=5, headers=None, context=None):
+        if url.startswith("http://dead"):
+            release.wait(timeout)                      # hangs until released / timeout
+            return (True, {"models": [{"name": "late", "size": 1, "size_vram": 1}]}) \
+                if release.is_set() else (False, "timed out")
+        if url.endswith("/api/version"):
+            return True, {"version": "0.33.2"}
+        return _ps("local:7b")
+    monkeypatch.setattr(mtop.util, "http_get_json", get)
+    monkeypatch.setattr(mtop.collector, "EXTRA_WAIT", 0.2)
+    eps = [mtop.Endpoint("localhost:11434"), mtop.Endpoint("dead=http://dead:11434")]
+    c = _collector(mode="api", endpoints=eps)
+    t0 = _t.monotonic()
+    snap = c.collect(100.0)
+    assert _t.monotonic() - t0 < 1.5                     # not the 5 s timeout
+    dead = snap["endpoints"][1]
+    assert dead["pending"] is True and dead["models_ok"] is False
+    assert "no answer within" in dead["models_err"]
+    assert snap["models_ok"] is True                    # primary unaffected
+    # the request is still in flight and is not re-submitted
+    f1 = c._ps_pending["dead"]
+    c.collect(101.0)
+    assert c._ps_pending["dead"] is f1
+    release.set()
+    f1.result(timeout=2)
+    snap = c.collect(103.0)
+    assert "pending" not in snap["endpoints"][1]
+    assert [m["name"] for m in snap["endpoints"][1]["models"]] == ["late"]
+    c.close()
+    assert c._pool is None
+
+
+def test_extra_endpoint_carries_last_answer_while_pending(monkeypatch):
+    import threading
+    gate = threading.Event()
+    gate.set()
+    calls = {"n": 0}
+
+    def get(url, timeout=5, headers=None, context=None):
+        if url.startswith("http://slow") and url.endswith("/api/ps"):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return _ps("first")
+            gate.wait(timeout)
+            return _ps("second")
+        if url.endswith("/api/version"):
+            return True, {"version": "1"}
+        return _ps()
+    monkeypatch.setattr(mtop.util, "http_get_json", get)
+    monkeypatch.setattr(mtop.collector, "EXTRA_WAIT", 0.2)
+    c = _collector(mode="api", endpoints=[mtop.Endpoint("localhost:11434"),
+                                          mtop.Endpoint("slow=http://slow:1")])
+    assert [m["name"] for m in c.collect(100.0)["endpoints"][1]["models"]] == ["first"]
+    gate.clear()
+    ep = c.collect(101.0)["endpoints"][1]
+    assert ep["pending"] is True and [m["name"] for m in ep["models"]] == ["first"]
+    gate.set()
+    c._ps_pending["slow"].result(timeout=2)
+    assert [m["name"] for m in c.collect(102.0)["endpoints"][1]["models"]] == ["second"]
+    c.close()
+
+
+def test_endpoint_results_include_auth_and_tls(monkeypatch):
+    _endpoint_stub(monkeypatch, {"http://localhost:11434/api/ps": _ps()})
+    c = _collector(mode="api", endpoints=[mtop.Endpoint("localhost:11434",
+                                                        {"Authorization": "Bearer x"},
+                                                        insecure=True)])
+    ep = c.collect(100.0)["endpoints"][0]
+    assert ep["auth"] is True and ep["tls"] == "insecure"

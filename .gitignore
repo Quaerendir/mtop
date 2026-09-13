@@ -27,7 +27,4 @@ Thumbs.db
 *.whl
 *.tar.gz
 
-# generated single-file artifact
-dist/
-__pycache__/
-*.py[co]
+# generated single-file artifact: dist/ (already ignored above)

@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.11.1 — 2026-09-14
+
+### Fixed
+- **A dead extra endpoint stalled every cycle.** `-u localhost -u dead=…`
+  made each collector pass wait the full 5 s `/api/ps` timeout (plus 3 s for
+  `/api/version` on the slow path), so the primary — answering in
+  milliseconds — showed as STALE. Measured: 8 s per cycle. Introduced in
+  0.7.0. The primary is still awaited in full; extras share one 1 s budget
+  after it, and whichever has not answered keeps its request in flight
+  while the cycle reuses its last answer flagged `pending: true` (or
+  `models_err: "no answer within 1s"` when there is none). In-flight
+  requests are not re-submitted, so nothing piles up.
+- **Docker mode returned early when the container was down**, so the
+  `--json` document lost `models`, `models_ok` and `endpoints` and a `-u`
+  pointing at another host went dark with the container. It now behaves
+  like local mode: no stats or runners, API still polled, same keys.
+- `Ctrl-C` during the first `--json` / `--prometheus` sample printed a
+  traceback; it now exits 130 (one-shot) or 0 (`--watch`). The endpoint
+  thread pool is shut down on exit, so a hung remote no longer delays the
+  process by its timeout.
+- The missing log source for a manual `ollama serve` was re-probed with a
+  `systemctl show` every slow cycle while LOGS was on; it is probed once per
+  mode and again on the `l` toggle.
+- `Collector.api_port` derived from the primary endpoint, not the raw
+  `api_url` argument.
+
+### Changed
+- `endpoints[]` in `--json` carry `auth` (bool) and `tls`
+  (`default` | `custom-ca` | `insecure`) per endpoint.
+- `--help` description and the README layout example reflect the current
+  program instead of the Docker-only 0.2.0 one; constants tidied after the
+  0.11.0 split.
+
 ## 0.11.0 — 2026-09-14
 
 ### Changed

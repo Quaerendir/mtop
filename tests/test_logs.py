@@ -184,6 +184,34 @@ def test_collector_logs_local_via_journal(monkeypatch):
     assert "logs" not in c.collect(103.0)
 
 
+def test_missing_log_source_probed_once_per_mode(monkeypatch):
+    from test_collector import SERVER_PID
+    monkeypatch.setattr(mtop.collector, "IS_LINUX", True)
+    probes = []
+
+    def sd():
+        probes.append(1)
+        return None
+    monkeypatch.setattr(mtop.collector, "systemd_ollama", sd)
+    monkeypatch.setattr(mtop.collector, "find_ollama_pid", lambda port=None: SERVER_PID)
+    monkeypatch.setattr(mtop.collector, "proc_uptime_sec", lambda pid: 1.0)
+    monkeypatch.setattr(mtop.Collector, "_local_stats", lambda self, pid: None)
+    monkeypatch.setattr(mtop.collector, "read_proc_environ", lambda pid: [])
+    monkeypatch.setattr(mtop.util, "http_get_json",
+                        lambda url, timeout=5, headers=None, context=None: (True, {"models": []}))
+    c = mtop.Collector(container="ollama", api_url="http://localhost:11434", interval=1.0,
+                       show_gpu=False, mode="local", show_logs=True)
+    c.collect(100.0)
+    n = len(probes)                      # status probes + one log-source probe
+    c.collect(103.0)
+    c.collect(106.0)
+    # each cycle adds exactly one probe (the status check), none for the log source
+    assert len(probes) == n + 2
+    c.reset_log_source()
+    c.collect(109.0)
+    assert len(probes) == n + 4          # status + a fresh log-source probe
+
+
 def test_collector_logs_no_source_for_manual_serve(monkeypatch):
     from test_collector import SERVER_PID
     monkeypatch.setattr(mtop.collector, "IS_LINUX", True)

@@ -19,6 +19,7 @@ import sys
 
 from .util import CLK_TCK, IS_DARWIN, run_cmd, to_float
 
+
 def read_unified_memory() -> tuple[str, int, int] | None:
     """Detect Tegra/Jetson/Spark unified-memory platforms via device-tree.
 

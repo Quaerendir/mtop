@@ -292,3 +292,11 @@ def test_version_single_source():
     py = (root / "pyproject.toml").read_text()
     assert 'dynamic = ["version"]' in py and 'path = "src/mtop/_version.py"' in py
     assert not re.search(r'^version = "', py, re.MULTILINE)
+
+
+def test_ctrl_c_before_watch_loop(monkeypatch):
+    def boom(c, now):
+        raise KeyboardInterrupt
+    monkeypatch.setattr(mtop.Collector, "collect", boom)
+    assert mtop.headless_main(_args(json=True)) == 130
+    assert mtop.headless_main(_args(json=True, watch=True)) == 0

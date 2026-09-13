@@ -11,11 +11,13 @@ the headless modes; mtop.export renders Prometheus text.
 
 This package re-exports the public names so `import mtop; mtop.Collector`
 keeps working, and so tests can monkeypatch through it (patch the module the
-name is *used* in: mtop.collector.http_get_json, not mtop.http_get_json).
+name is *used* in: mtop.collector.find_ollama_pid, mtop.util.http_get_json —
+not mtop.find_ollama_pid).
 
 Usage:
     mtop [-c CONTAINER] [-i INTERVAL] [-u URL ...] [-H HEADER] [--insecure]
-         [-m MODE] [--runtime RT] [--no-gpu] [--no-runners] [--json] [-h]
+         [-m MODE] [--runtime RT] [--no-gpu] [--no-runners] [--logs]
+         [--json | --prometheus] [--watch] [-o FILE] [-h]
 """
 
 from . import cli, collector, container, export, gpu, logs, procfs, runner, util

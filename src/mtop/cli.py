@@ -20,14 +20,8 @@ from .util import Endpoint, parse_header_arg
 JSON_SCHEMA_VERSION = 1   # bump when a --json field changes meaning or is removed
 
 DEFAULT_CONTAINER = "ollama"
-
-
 DEFAULT_INTERVAL = 1.0
-
-
 DEFAULT_API_BASE = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
-
-
 API_KEY_ENV = "OLLAMA_API_KEY"    # same variable the ollama CLI uses for Bearer auth
 
 
@@ -95,26 +89,25 @@ def headless_main(args) -> int:
             return json.dumps(snap, separators=(",", ":")) + "\n"
         return json.dumps(snap, indent=2) + "\n"
 
-    snap = collector.collect(time.monotonic())
-    if collector.needs_second_sample(snap):
-        # CPU% is a delta between two samples (/proc ticks, or one-shot Engine
-        # API stats), so a single pass can only ever say 0.00%. Take a second
-        # one. The docker CLI path samples internally and would pay another
-        # ~2 s for nothing, so it is excluded.
-        time.sleep(JSON_CPU_WINDOW)
-        collector.force_slow()
-        snap = collector.collect(time.monotonic())
-    write_output(render(snap), args.output, append=(watch and fmt == "json"))
-    if not watch:
-        return 0 if snapshot_healthy(snap) else 1
-
     try:
+        snap = collector.collect(time.monotonic())
+        if collector.needs_second_sample(snap):
+            # CPU% is a delta between two samples (/proc ticks, or one-shot
+            # Engine API stats), so a single pass can only ever say 0.00%.
+            # Take a second one. The docker CLI path samples internally and
+            # would pay another ~2 s for nothing, so it is excluded.
+            time.sleep(JSON_CPU_WINDOW)
+            collector.force_slow()
+            snap = collector.collect(time.monotonic())
+        write_output(render(snap), args.output, append=(watch and fmt == "json"))
+        if not watch:
+            return 0 if snapshot_healthy(snap) else 1
         while True:
             time.sleep(args.interval)
             snap = collector.collect(time.monotonic())
             write_output(render(snap), args.output, append=(fmt == "json"))
     except KeyboardInterrupt:
-        return 0
+        return 0 if watch else 130
     except BrokenPipeError:
         # `mtop --json --watch | head -3`: the reader is gone. Detach stdout
         # so the interpreter's exit-time flush does not print a traceback.
@@ -123,6 +116,8 @@ def headless_main(args) -> int:
         except OSError:
             pass
         return 0
+    finally:
+        collector.close()
 
 
 def json_main(args) -> int:
@@ -136,7 +131,8 @@ def json_main(args) -> int:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="mtop — Ollama model monitor for Docker containers",
+        description="mtop — htop for Ollama: models, runners, GPUs and the server "
+                    "(container, systemd or manual), as a TUI or a JSON/Prometheus exporter",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Keys: q=quit, +=faster, -=slower, o=toggle raw ollama ps, "
                "r=toggle runners, e=toggle server config, l=toggle logs\n\n"

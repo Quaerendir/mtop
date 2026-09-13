@@ -31,21 +31,12 @@ from .util import (CLK_TCK, IS_DARWIN, IS_LINUX, Endpoint, api_port, fmt_duratio
                    is_loopback_url, relative_time, run_cmd, to_float)
 
 SLOW_FLOOR = 2.0          # minimum cadence for docker stats / nvidia-smi
-
-
 STALE_FACTOR = 3.0        # snapshot older than interval*factor => flagged stale
-
-
 JSON_CPU_WINDOW = 0.5     # --json: seconds between the two /proc CPU samples
-
-
 HISTORY_LEN = 240         # sparkline samples kept (one per slow cycle, >= 2 s each)
-
-
 LOG_FETCH = 200           # log lines fetched per slow cycle (request stats window)
-
-
 DEFAULT_LOG_LINES = 8     # log lines shown on screen
+EXTRA_WAIT = 1.0          # seconds a non-primary endpoint may hold up a cycle
 
 
 class Collector(threading.Thread):
@@ -96,9 +87,16 @@ class Collector(threading.Thread):
         self.primary = self.endpoints[0]
         self.api_url = self.primary.url
         self._versions: dict[str, str | None] = {}
+        # In-flight /api/ps and /api/version futures per endpoint label, and
+        # the last answer each extra endpoint gave. A dead remote must not
+        # hold the primary's cycle hostage: extras get EXTRA_WAIT, then the
+        # cycle carries their previous result forward marked `pending`.
+        self._ps_pending: dict[str, concurrent.futures.Future] = {}
+        self._ver_pending: dict[str, concurrent.futures.Future] = {}
+        self._ps_last: dict[str, dict] = {}
         # Used to pick the right `ollama serve` when several are running, and
         # only meaningful for a loopback URL — a remote API can't be a local pid.
-        self.api_port = api_port(api_url) if is_loopback_url(api_url) else None
+        self.api_port = api_port(self.api_url) if is_loopback_url(self.api_url) else None
         self.interval = interval
         self.show_gpu = show_gpu
         self.mode = mode                    # requested: auto|docker|local|api
@@ -166,6 +164,14 @@ class Collector(threading.Thread):
 
     def stop(self):
         self._stop.set()
+        self.close()
+
+    def close(self) -> None:
+        """Release the endpoint thread pool (one-shot modes call this on exit,
+        so a hung remote does not delay process exit by its timeout)."""
+        if self._pool is not None:
+            self._pool.shutdown(wait=False, cancel_futures=True)
+            self._pool = None
 
     def snapshot(self) -> dict:
         with self._lock:
@@ -241,7 +247,13 @@ class Collector(threading.Thread):
             snap.update(status=status, uptime=uptime, cpu_limit=cpu_limit,
                         pid=init_pid, uptime_sec=self._uptime_sec)
             if status != "running":
-                return snap
+                # container down: no stats/runners, but the API may still
+                # answer (a -u pointing elsewhere, or a restart race) and the
+                # --json document keeps the same keys either way.
+                snap["cpu_limit"] = None
+                snap["pid"] = None
+                self._res_stats = None
+                self._runners = None
         elif mode == "local":
             status, pid, uptime, cpu_limit = self._local_status()
             snap.update(status=status, uptime=uptime,
@@ -254,9 +266,10 @@ class Collector(threading.Thread):
         else:  # api
             snap.update(status="api-only", uptime="", cpu_limit=None, pid=None)
 
+        source_up = snap.get("status") == "running"
         slow_due = now - self._slow_ts >= max(SLOW_FLOOR, self.interval)
         if slow_due:
-            if mode == "docker":
+            if mode == "docker" and source_up:
                 self._res_stats = self._docker_stats_read()
             elif mode == "local" and snap.get("pid"):
                 self._res_stats = self._local_stats(snap["pid"])
@@ -268,7 +281,7 @@ class Collector(threading.Thread):
             self._logs = self._read_logs(mode) if self.show_logs else None
             self._slow_ts = now
 
-        if slow_due and mode == "docker":
+        if slow_due and mode == "docker" and source_up:
             self._runners = self._docker_runners(snap.get("pid"))
 
         snap["res_stats"] = self._res_stats if mode != "api" else None
@@ -307,30 +320,86 @@ class Collector(threading.Thread):
 
         return snap
 
+    def _ps_result(self, ep: Endpoint) -> dict:
+        ok, data = ep.get_json("/api/ps")
+        return {
+            **ep.describe(),
+            "models_ok": ok,
+            "models": (data.get("models", []) if ok and isinstance(data, dict) else []),
+            "models_err": "" if ok else str(data),
+        }
+
     def _fetch_models(self) -> list[dict]:
-        """/api/ps from every endpoint, in parallel so one dead remote does not
-        stall the cycle by its full timeout. Order matches self.endpoints."""
-        def one(ep: Endpoint) -> dict:
-            ok, data = ep.get_json("/api/ps")
-            return {
-                "label": ep.label, "url": ep.url,
-                "models_ok": ok,
-                "models": (data.get("models", []) if ok and isinstance(data, dict) else []),
-                "models_err": "" if ok else str(data),
-                "version": self._versions.get(ep.label),
-            }
+        """/api/ps from every endpoint. Order matches self.endpoints.
+
+        The primary is awaited in full (its timeout bounds the cycle, as with
+        a single endpoint). Extras share one EXTRA_WAIT budget after that;
+        whichever has not answered keeps its request running in the pool and
+        the cycle reuses its last answer, flagged `pending`, so a dead remote
+        costs the screen nothing but a marker. A pending request is not
+        re-submitted until it finishes, so nothing piles up.
+        """
         if self._pool is None:
-            return [one(self.endpoints[0])]
-        return list(self._pool.map(one, self.endpoints))
+            res = self._ps_result(self.endpoints[0])
+            res["version"] = self._versions.get(res["label"])
+            return [res]
+
+        futs: dict[str, concurrent.futures.Future] = {}
+        for ep in self.endpoints:
+            f = self._ps_pending.get(ep.label)
+            if f is None or f.done():
+                f = self._pool.submit(self._ps_result, ep)
+                self._ps_pending[ep.label] = f
+            futs[ep.label] = f
+
+        results: list[dict] = []
+        deadline: float | None = None
+        for i, ep in enumerate(self.endpoints):
+            f = futs[ep.label]
+            if i == 0:
+                res = f.result()
+                deadline = time.monotonic() + EXTRA_WAIT
+            else:
+                try:
+                    res = f.result(timeout=max(0.0, deadline - time.monotonic()))
+                except concurrent.futures.TimeoutError:
+                    last = self._ps_last.get(ep.label)
+                    res = dict(last) if last else {
+                        **ep.describe(), "models_ok": False, "models": [],
+                        "models_err": f"no answer within {EXTRA_WAIT:g}s"}
+                    res["pending"] = True
+            if not res.get("pending"):
+                self._ps_last[ep.label] = res
+            res["version"] = self._versions.get(ep.label)
+            results.append(res)
+        return results
 
     def _fetch_versions(self) -> None:
+        """/api/version per endpoint, refreshed on the slow path.
+
+        Same non-blocking rule as _fetch_models: submit, wait EXTRA_WAIT for
+        all, keep whatever answered; the rest is read on a later slow cycle.
+        """
         def one(ep: Endpoint) -> tuple[str, str | None]:
             ok, ver = ep.get_json("/api/version", timeout=3)
             v = str(ver.get("version") or "") if ok and isinstance(ver, dict) else ""
             return ep.label, (v or None)
-        pairs = (self._pool.map(one, self.endpoints) if self._pool is not None
-                 else [one(self.endpoints[0])])
-        self._versions.update(dict(pairs))
+
+        if self._pool is None:
+            label, v = one(self.endpoints[0])
+            self._versions[label] = v
+            return
+        for ep in self.endpoints:
+            f = self._ver_pending.get(ep.label)
+            if f is None or f.done():
+                if f is not None and f.done() and not f.cancelled():
+                    label, v = f.result()
+                    self._versions[label] = v
+                self._ver_pending[ep.label] = self._pool.submit(one, ep)
+        done, _ = concurrent.futures.wait(list(self._ver_pending.values()), timeout=EXTRA_WAIT)
+        for f in done:
+            label, v = f.result()
+            self._versions[label] = v
 
     def _record_history(self, snap: dict) -> None:
         def push(key: str, value: float | None) -> None:
@@ -359,9 +428,15 @@ class Collector(threading.Thread):
             return JournalLogs(run_cmd)
         return None
 
+    def reset_log_source(self) -> None:
+        """Re-probe the log source on the next read (the `l` key toggles)."""
+        self._log_mode = None
+
     def _read_logs(self, mode: str) -> dict:
         """Tail the server log; request stats over the fetched lines."""
-        if self._log_source is None or self._log_mode != mode:
+        if self._log_mode != mode:
+            # Probed once per mode, including a *missing* source: a manual
+            # `ollama serve` would otherwise cost a `systemctl show` per cycle.
             self._log_source = self._build_log_source(mode)
             self._log_mode = mode
         src = self._log_source

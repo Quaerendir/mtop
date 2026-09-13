@@ -14,39 +14,20 @@ from datetime import datetime
 
 from ._version import __version__
 from .collector import STALE_FACTOR, Collector
+from .procfs import host_cpu_count
 from .runner import processor_label
 from .util import bytes_to_gib, relative_time, to_float
 
 UI_POLL_MS = 100          # curses getch timeout — UI responsiveness, not data rate
-
-
 C_HEADER = 1
-
-
 C_OK = 2
-
-
 C_WARN = 3
-
-
 C_ERR = 4
-
-
 C_DIM = 5
-
-
 C_ACCENT = 6
-
-
 C_TABLE_HDR = 7
-
-
 C_GPU = 8
-
-
 C_AMD = 9
-
-
 C_INTEL = 10
 
 
@@ -340,7 +321,7 @@ def render_resources(win, y: int, snap: dict) -> int:
     # CPU% arrives summed-across-cores (docker {{.CPUPerc}} or /proc ticks
     # delta); normalize against the effective core budget.
     cpu_raw = to_float(str(stats["cpu"]).rstrip("%")) or 0.0
-    ncpu = snap.get("cpu_limit") or float(os.cpu_count() or 1)
+    ncpu = snap.get("cpu_limit") or host_cpu_count()
     cpu_normalized = min(cpu_raw / ncpu, 100.0)
     if ncpu == int(ncpu):
         cpu_detail = f"{cpu_raw:.0f}% / {int(ncpu)} cores"
@@ -739,6 +720,7 @@ def curses_main(stdscr, args):
                     collector.show_env = not collector.show_env
                 elif key == ord("l"):
                     collector.show_logs = not collector.show_logs
+                    collector.reset_log_source()
                     collector.force_slow()      # fetch on the next cycle, not in 2 s
                 elif key == curses.KEY_RESIZE:
                     stdscr.erase()

@@ -23,6 +23,9 @@ from typing import Any
 from .export import parse_iso
 
 FOREVER_AFTER_SEC = 10 * 365 * 86400   # expires_at this far out == keep_alive -1
+IS_LINUX = sys.platform.startswith("linux")
+IS_DARWIN = sys.platform == "darwin"
+CLK_TCK = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
 
 
 def normalize_api_url(url: str) -> str:
@@ -65,11 +68,7 @@ def run_cmd(cmd: list[str], timeout: int = 5,
 # proxy. Go's ProxyFromEnvironment — and therefore Ollama's own client — skips
 # loopback. Mirror that: env proxies for remote hosts, none for loopback.
 _PROXY_OPENER = urllib.request.build_opener()
-
-
 _DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-
-
 _LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1", "0.0.0.0", "[::1]"}
 
 
@@ -156,8 +155,6 @@ def parse_header_arg(value: str) -> tuple[str, str]:
     if not sep or not name.strip():
         raise ValueError(f"expected 'Name: value', got {value!r}")
     return name.strip(), val.strip()
-
-
 _LABEL_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 
@@ -242,15 +239,6 @@ def relative_time(iso_str: str) -> str:
             return f"{d}d{suffix}"
     except Exception:
         return iso_str[:19]
-
-
-IS_LINUX = sys.platform.startswith("linux")
-
-
-IS_DARWIN = sys.platform == "darwin"
-
-
-CLK_TCK = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
 
 
 def fmt_duration(sec: float) -> str:
