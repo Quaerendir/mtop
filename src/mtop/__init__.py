@@ -36,10 +36,11 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .container import ContainerRuntime, detect_runtime
+from .export import parse_iso, parse_size, prometheus_text
 from .gpu import (AmdSysfsProvider, GpuMonitor, GpuProvider, NvidiaSmiProvider,
                   NvmlProvider, RocmSmiProvider, TegraUnifiedProvider)
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
 
@@ -273,23 +274,12 @@ def relative_time(iso_str: str) -> str:
     """Convert ISO timestamp to relative future/past string."""
     if not iso_str:
         return "—"
+    target = parse_iso(iso_str)
+    if target is None:
+        return iso_str[:19]
     try:
-        # Handle various ISO formats from Ollama
-        iso_str = iso_str.replace("Z", "+00:00")
-        if "." in iso_str:
-            # Truncate nanoseconds to 6 digits for fromisoformat
-            dot_pos = iso_str.index(".")
-            plus_pos = iso_str.find("+", dot_pos)
-            if plus_pos == -1:
-                plus_pos = iso_str.find("-", dot_pos + 1)
-            if plus_pos != -1:
-                frac = iso_str[dot_pos + 1 : plus_pos][:6]
-                iso_str = iso_str[: dot_pos + 1] + frac + iso_str[plus_pos:]
-        target = datetime.fromisoformat(iso_str)
         if target.year <= 1:
             return "never"          # Go zero time: no expiry scheduled
-        if target.tzinfo is None:
-            target = target.replace(tzinfo=timezone.utc)
         now = datetime.now(timezone.utc)
         delta = target - now
         total_sec = int(delta.total_seconds())
@@ -988,6 +978,7 @@ class Collector(threading.Thread):
         self._runners: list[dict] | None = None
         self._gpu_cache: list[dict] | None = None
         self._last_inspect: dict | None = None
+        self._uptime_sec: float | None = None     # numeric twin of snap["uptime"]
         # Slow-path too: the version never changes and the environment only
         # changes with a restart.
         self._server: dict = {"version": None, "env": {}, "env_source": None}
@@ -1108,13 +1099,14 @@ class Collector(threading.Thread):
         if mode == "docker":
             status, uptime, cpu_limit, init_pid = self._inspect_container()
             snap.update(status=status, uptime=uptime, cpu_limit=cpu_limit,
-                        pid=init_pid)
+                        pid=init_pid, uptime_sec=self._uptime_sec)
             if status != "running":
                 return snap
         elif mode == "local":
             status, pid, uptime, cpu_limit = self._local_status()
             snap.update(status=status, uptime=uptime,
-                        cpu_limit=cpu_limit or host_cpu_count(), pid=pid)
+                        cpu_limit=cpu_limit or host_cpu_count(), pid=pid,
+                        uptime_sec=self._uptime_sec)
             if status != "running":
                 # process gone but API might still answer (remote -u, race) —
                 # fall through so models still render
@@ -1234,10 +1226,12 @@ class Collector(threading.Thread):
             if pid is not None:
                 status = "running"
         uptime = ""
+        self._uptime_sec = None
         if pid and IS_LINUX:
             up = proc_uptime_sec(pid)
             if up is not None:
                 uptime = fmt_duration(up)
+                self._uptime_sec = up
         return status, pid, uptime, cpu_limit
 
     def _local_stats(self, pid: int) -> dict | None:
@@ -1304,13 +1298,17 @@ class Collector(threading.Thread):
         # share is a bigger error than double-counting shared library pages.
         mem = pss if (pss_complete and pss) else rss
         mem_pct = (mem / total * 100.0) if total else 0.0
+        cpu_pct = max(0.0, cpu_pct)
         return {
-            "cpu": f"{max(0.0, cpu_pct):.2f}%",
+            "cpu": f"{cpu_pct:.2f}%",
             "mem_usage": f"{mem / 1024**3:.1f}GiB / {total / 1024**3:.1f}GiB",
             "mem_pct": f"{mem_pct:.1f}%",
             "mem_kind": "pss" if (pss_complete and pss) else "rss",
             "procs": len(tree),
             "runners": runners,
+            "cpu_pct": round(cpu_pct, 2),
+            "mem_used_bytes": int(mem),
+            "mem_limit_bytes": int(total),
         }
 
     def _local_stats_macos(self, pid: int, total: int) -> dict | None:
@@ -1356,6 +1354,9 @@ class Collector(threading.Thread):
             "mem_kind": "rss",
             "procs": len(tree),
             "runners": runners,
+            "cpu_pct": round(cpu_pct, 2),
+            "mem_used_bytes": int(rss),
+            "mem_limit_bytes": int(total),
         }
 
     def _inspect_container(self) -> tuple[str, str, float | None, int | None]:
@@ -1374,8 +1375,13 @@ class Collector(threading.Thread):
             return "not found", "", None, None
         status = info["status"]
         uptime = ""
+        self._uptime_sec = None
         if status == "running" and info["started_at"]:
             uptime = relative_time(info["started_at"]).replace(" ago", "")
+            started = parse_iso(info["started_at"])
+            if started is not None:
+                self._uptime_sec = max(
+                    0.0, (datetime.now(timezone.utc) - started).total_seconds())
 
         cpu_limit: float | None = None
         nano, quota = info["nano_cpus"], info["cpu_quota"]
@@ -1390,7 +1396,15 @@ class Collector(threading.Thread):
 
     def _docker_stats_read(self) -> dict | None:
         rt = self.runtime
-        return rt.stats(self.container) if rt is not None else None
+        stats = rt.stats(self.container) if rt is not None else None
+        if stats and "mem_used_bytes" not in stats:
+            # CLI path: only the docker-formatted strings; derive the numbers
+            # the exporters want.
+            used, _, limit = str(stats.get("mem_usage", "")).partition("/")
+            stats["mem_used_bytes"] = parse_size(used)
+            stats["mem_limit_bytes"] = parse_size(limit)
+            stats["cpu_pct"] = to_float(str(stats.get("cpu", "")).rstrip("%"))
+        return stats
 
     def _docker_runners(self, init_pid: int | None) -> list[dict] | None:
         """Runner argv for a containerized Ollama.
@@ -2103,14 +2117,45 @@ def curses_main(stdscr, args):
         collector.stop()
 
 
-# ── One-shot JSON mode ────────────────────────────────────────────────────────
+# ── Headless modes: --json / --prometheus, once or --watch ────────────────────
 
-def json_main(args) -> int:
-    """--json: run one collection pass, dump JSON to stdout.
+def snapshot_healthy(snap: dict) -> bool:
+    return snap.get("status") in ("running", "api-only") and bool(snap.get("models_ok", False))
 
-    Exit code 0 when the source (container/process) is up (or api mode) and
-    the API answered; 1 otherwise. Suitable for cron, Prometheus textfile
-    collectors (post-processed), or Ansible facts.
+
+def write_output(text: str, path: str | None, append: bool = False) -> None:
+    """stdout, or a file: appended (NDJSON) or replaced atomically (tmp + rename).
+
+    Atomic replacement is what the node_exporter textfile collector wants —
+    it must never read a half-written .prom file.
+    """
+    if not path:
+        sys.stdout.write(text)
+        sys.stdout.flush()
+        return
+    if append:
+        with open(path, "a") as f:
+            f.write(text)
+        return
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
+def headless_main(args) -> int:
+    """--json / --prometheus: one snapshot, or a stream with --watch.
+
+    --json           one indented JSON document (the pre-0.8 --json output)
+    --json --watch   one compact JSON object per line (NDJSON), every interval
+    --prometheus     text exposition format for a textfile collector or a pipe
+    --prometheus --watch   re-rendered every interval; with -o the file is
+                     replaced atomically each time, so `mtop --prometheus
+                     --watch -o /var/lib/node_exporter/textfile/mtop.prom`
+                     is a complete exporter setup with no cron and no port.
+
+    Exit code (one-shot): 0 when the source is up and the API answered, 1
+    otherwise. --watch runs until Ctrl-C and exits 0.
     """
     collector = Collector(
         container=args.container,
@@ -2123,6 +2168,18 @@ def json_main(args) -> int:
         show_env=not args.no_env,
         endpoints=args.endpoints,
     )
+    fmt = "prometheus" if args.prometheus else "json"
+    watch = bool(args.watch)
+
+    def render(snap: dict) -> str:
+        snap = dict(snap)
+        snap.pop("ts", None)  # monotonic value is meaningless outside the process
+        if fmt == "prometheus":
+            return prometheus_text(snap, __version__)
+        if watch:
+            return json.dumps(snap, separators=(",", ":")) + "\n"
+        return json.dumps(snap, indent=2) + "\n"
+
     snap = collector.collect(time.monotonic())
     if collector.needs_second_sample(snap):
         # CPU% is a delta between two samples (/proc ticks, or one-shot Engine
@@ -2132,10 +2189,33 @@ def json_main(args) -> int:
         time.sleep(JSON_CPU_WINDOW)
         collector.force_slow()
         snap = collector.collect(time.monotonic())
-    snap.pop("ts", None)  # monotonic value is meaningless outside the process
-    print(json.dumps(snap, indent=2))
-    healthy = snap.get("status") in ("running", "api-only") and snap.get("models_ok", False)
-    return 0 if healthy else 1
+    write_output(render(snap), args.output, append=(watch and fmt == "json"))
+    if not watch:
+        return 0 if snapshot_healthy(snap) else 1
+
+    try:
+        while True:
+            time.sleep(args.interval)
+            snap = collector.collect(time.monotonic())
+            write_output(render(snap), args.output, append=(fmt == "json"))
+    except KeyboardInterrupt:
+        return 0
+    except BrokenPipeError:
+        # `mtop --json --watch | head -3`: the reader is gone. Detach stdout
+        # so the interpreter's exit-time flush does not print a traceback.
+        try:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        except OSError:
+            pass
+        return 0
+
+
+def json_main(args) -> int:
+    """Kept for callers of the pre-0.8 name."""
+    for attr, default in (("prometheus", False), ("watch", False), ("output", None)):
+        if not hasattr(args, attr):
+            setattr(args, attr, default)
+    return headless_main(args)
 
 
 def main():
@@ -2187,6 +2267,17 @@ def main():
     parser.add_argument("--json", action="store_true",
                         help="One-shot: print a single snapshot as JSON and exit "
                              "(exit code 1 on unhealthy)")
+    parser.add_argument("--prometheus", action="store_true",
+                        help="One-shot: print the snapshot in Prometheus text exposition "
+                             "format and exit (exit code 1 on unhealthy)")
+    parser.add_argument("--watch", action="store_true",
+                        help="With --json/--prometheus: keep emitting every INTERVAL "
+                             "seconds until Ctrl-C. --json --watch prints NDJSON (one "
+                             "compact object per line)")
+    parser.add_argument("-o", "--output", metavar="FILE",
+                        help="Write to FILE instead of stdout. Prometheus output "
+                             "replaces the file atomically (tmp + rename) — point it at "
+                             "the node_exporter textfile directory; NDJSON is appended")
     parser.add_argument("-V", "--version", action="version",
                         version=f"mtop {__version__}")
     args = parser.parse_args()
@@ -2214,8 +2305,12 @@ def main():
     if args.no_docker and args.mode == "auto":
         args.mode = "api"
 
-    if args.json:
-        sys.exit(json_main(args))
+    if args.watch and not (args.json or args.prometheus):
+        parser.error("--watch needs --json or --prometheus")
+    if args.json and args.prometheus:
+        parser.error("--json and --prometheus are mutually exclusive")
+    if args.json or args.prometheus:
+        sys.exit(headless_main(args))
 
     # curses encodes with the C library's locale; without this, a LANG=C shell
     # (minimal containers, some SSH jump hosts) turns every █ ░ ─ ║ into '?'.

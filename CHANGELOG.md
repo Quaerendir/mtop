@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.8.0 — 2026-09-13
+
+### Added
+- **`--prometheus`**: the snapshot in Prometheus text exposition format, one
+  shot, exit code as `--json`. Metrics are prefixed `mtop_` and grouped by
+  a second token: `mtop_up`, `mtop_api_up{endpoint}`,
+  `mtop_models_loaded`, `mtop_model_{size,vram}_bytes`,
+  `mtop_model_context_length`, `mtop_model_expires_seconds` (`+Inf` for
+  `keep_alive -1`), `mtop_server_{cpu_percent,cpu_limit_cores,
+  memory_bytes,memory_limit_bytes,processes,uptime_seconds}`,
+  `mtop_runner_info{pid,model,engine,ctx,batch,flash_attn,kv_cache,gpu,…}`,
+  `mtop_runner_{rss,vram,gpu_memory}_bytes`, `mtop_gpu_{info,
+  utilization_percent,memory_used_bytes,memory_total_bytes,
+  temperature_celsius,power_watts,gtt_*,process_memory_bytes}`. Output is
+  validated against the official `prometheus_client` parser.
+- **`--watch`**: keep emitting every `-i` seconds until Ctrl-C.
+  `--json --watch` prints NDJSON (one compact object per line);
+  `--prometheus --watch` re-renders the exposition.
+- **`-o FILE`**: Prometheus output replaces the file atomically (tmp +
+  rename), NDJSON is appended. `mtop --prometheus --watch -o
+  /var/lib/node_exporter/textfile/mtop.prom` is therefore a complete
+  exporter setup with no cron, no port and no dependency.
+- Numeric twins of the display strings in `--json`: `res_stats.cpu_pct`,
+  `mem_used_bytes`, `mem_limit_bytes` on every path (parsed from the docker
+  CLI strings where that is the source) and a top-level `uptime_sec`.
+
+### Changed
+- `mtop.export` holds the ISO-8601 and size parsers the collector and the
+  exporter share; `relative_time` now uses the same parser as the exporter.
+- `--json --watch | head` exits quietly instead of printing a
+  BrokenPipeError at interpreter shutdown.
+
 ## 0.7.0 — 2026-09-13
 
 ### Added

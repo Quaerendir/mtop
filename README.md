@@ -29,7 +29,8 @@ There are web dashboards, Prometheus exporters, and chat TUIs for Ollama. But th
 - **Jetson / Tegra / NVIDIA Spark** — automatic fallback to unified memory via `/proc/meminfo`
 - **Non-blocking UI** — all I/O (docker, nvidia-smi, HTTP) runs in a background collector thread; the interface stays responsive at 100 ms even when the API hangs, and stale data is flagged
 - **Interactive** — `q` to quit, `+`/`-` to adjust refresh interval, `o` to toggle raw `ollama ps`
-- **Scriptable** — `--json` one-shot mode for cron, Prometheus textfile collectors, or Ansible facts (exit code 1 on unhealthy)
+- **Scriptable** — `--json` one-shot mode for cron or Ansible facts (exit code 1 on unhealthy); `--json --watch` streams NDJSON
+- **Prometheus exporter without a port** — `--prometheus` prints text exposition format; `--prometheus --watch -o …/textfile/mtop.prom` keeps a node_exporter textfile fresh with atomic writes, no cron needed
 - **API-only mode** — `--no-docker` for monitoring remote Ollama instances without local docker calls
 - **cgroup-aware CPU bar** — normalizes against the container's `--cpus`/quota limit, not the host core count
 - **Docker *and* bare-metal** — auto-detects the source: a Docker container, a systemd `ollama.service`, or a manual `ollama serve`; monitors process CPU/MEM via `/proc` (Linux, no root) or `ps`/`sysctl` (macOS)
@@ -80,7 +81,7 @@ PYTHONPATH=src python -m mtop
 
 ```
 mtop [-c CONTAINER] [-i INTERVAL] [-u URL ...] [-H HEADER] [--insecure] [--cacert FILE]
-     [-m MODE] [--runtime RT] [--no-gpu] [--json] [-V] [-h]
+     [-m MODE] [--runtime RT] [--no-gpu] [--json | --prometheus] [--watch] [-o FILE] [-V] [-h]
 
 Options:
   -c, --container NAME   Docker container name (default: ollama)
@@ -105,6 +106,11 @@ Options:
       --no-env           Hide the SERVER CONFIG section (OLLAMA_* environment)
       --no-docker        API-only mode: skip all docker calls (remote instances)
       --json             Print one snapshot as JSON and exit (exit 1 on unhealthy)
+      --prometheus       Print one snapshot in Prometheus text exposition format and exit
+      --watch            With --json/--prometheus: emit every INTERVAL seconds until Ctrl-C
+                         (--json --watch prints NDJSON, one compact object per line)
+  -o, --output FILE      Write to FILE instead of stdout: Prometheus output replaces the file
+                         atomically (tmp + rename), NDJSON is appended
   -V, --version          Show version
   -h, --help             Show help
 ```
@@ -143,6 +149,12 @@ docker run --rm -it -v /var/run/docker.sock:/var/run/docker.sock \
 
 # One-shot health/state snapshot for scripting
 mtop --json | jq '.models[].name'
+
+# Stream one JSON line per second (NDJSON) — feed it to jq, a log shipper, or a file
+mtop --json --watch -i 1 | jq -c '{t: .wallclock, models: [.models[].name]}'
+
+# Prometheus, no port: keep a node_exporter textfile fresh (atomic writes)
+mtop --prometheus --watch -i 15 -o /var/lib/node_exporter/textfile_collector/mtop.prom
 
 # Using OLLAMA_HOST environment variable
 export OLLAMA_HOST=http://gpu-rig:11434
@@ -219,6 +231,7 @@ OLLAMA PS (raw)
 - [x] systemd/bare-metal Ollama support (process stats via `/proc`, no Docker required)
 - [ ] Log panel (tail Ollama container logs)
 - [x] Effective inference config per runner (context, flash attention, KV dtype)
+- [x] Prometheus text exposition (`--prometheus`) and NDJSON streaming (`--watch`)
 - [ ] Request rate / tokens-per-second from Ollama API
 - [x] Effective server environment (`OLLAMA_*`) per source
 - [x] Runner → GPU mapping via NVML per-process memory
