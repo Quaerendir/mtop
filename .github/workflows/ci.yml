@@ -1,0 +1,62 @@
+name: ci
+
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: python -m pip install -e ".[dev]"
+      - run: ruff check src tools tests
+      - run: pytest -q
+
+  bundle:
+    # The curl one-liner ships dist/mtop.py; make sure it still builds and runs.
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - run: python tools/bundle.py
+      - run: python dist/mtop.py --version
+      - run: python dist/mtop.py --help
+      - name: smoke (api mode against a dead port; exit 1 is the expected verdict)
+        run: |
+          python dist/mtop.py --json --mode api --no-gpu -u 127.0.0.1:1 > snap.json || test $? -eq 1
+          python -c "import json; d=json.load(open('snap.json')); assert d['mode']=='api', d"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mtop.py
+          path: dist/mtop.py
+
+  release:
+    # Tag v1.2.3 -> GitHub release with dist/mtop.py attached, which is what
+    # README's releases/latest/download/mtop.py link resolves to.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: bundle
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: mtop.py
+          path: dist
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/mtop.py
+          generate_release_notes: true

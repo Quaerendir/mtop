@@ -17,12 +17,15 @@ Usage:
 import argparse
 import curses
 import json
+import locale
 import os
+import re
 import subprocess
 import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from typing import Any
@@ -30,7 +33,7 @@ from typing import Any
 from .gpu import (AmdSysfsProvider, GpuMonitor, GpuProvider, NvidiaSmiProvider,
                   RocmSmiProvider, TegraUnifiedProvider)
 
-__version__ = "0.4.1"
+__version__ = "0.4.2"
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
 
@@ -41,6 +44,8 @@ DEFAULT_API_BASE = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 UI_POLL_MS = 100          # curses getch timeout — UI responsiveness, not data rate
 SLOW_FLOOR = 2.0          # minimum cadence for docker stats / nvidia-smi
 STALE_FACTOR = 3.0        # snapshot older than interval*factor => flagged stale
+JSON_CPU_WINDOW = 0.5     # --json: seconds between the two /proc CPU samples
+FOREVER_AFTER_SEC = 10 * 365 * 86400   # expires_at this far out == keep_alive -1
 
 # ── Color pairs (initialized in curses_main) ─────────────────────────────────
 
@@ -56,8 +61,19 @@ C_AMD = 9
 
 
 def init_colors():
+    """Set up color pairs, or do nothing on a terminal without colors.
+
+    ``start_color()`` raises on TERM=dumb / vt100-style terminals, which is
+    what a minimal SSH jump host or a CI log often is. Without pairs every
+    ``color_pair(n)`` is a plain attribute and the layout still renders.
+    """
+    if not curses.has_colors():
+        return
     curses.start_color()
-    curses.use_default_colors()
+    try:
+        curses.use_default_colors()
+    except curses.error:
+        pass
     curses.init_pair(C_HEADER, curses.COLOR_CYAN, -1)
     curses.init_pair(C_OK, curses.COLOR_GREEN, -1)
     curses.init_pair(C_WARN, curses.COLOR_YELLOW, -1)
@@ -83,10 +99,12 @@ def normalize_api_url(url: str) -> str:
     return url
 
 
-def run_cmd(cmd: list[str], timeout: int = 5) -> tuple[bool, str]:
+def run_cmd(cmd: list[str], timeout: int = 5,
+            env: dict[str, str] | None = None) -> tuple[bool, str]:
     """Run a command, return (success, stdout_or_stderr)."""
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                           env=env)
         if r.returncode == 0:
             return True, r.stdout.strip()
         return False, r.stderr.strip() or r.stdout.strip()
@@ -98,11 +116,39 @@ def run_cmd(cmd: list[str], timeout: int = 5) -> tuple[bool, str]:
         return False, str(e)
 
 
+# urllib honors $http_proxy for *every* host, including 127.0.0.1, so on a
+# box with a corporate proxy the local Ollama call comes back as a 502 from the
+# proxy. Go's ProxyFromEnvironment — and therefore Ollama's own client — skips
+# loopback. Mirror that: env proxies for remote hosts, none for loopback.
+_PROXY_OPENER = urllib.request.build_opener()
+_DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+_LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1", "0.0.0.0", "[::1]"}
+
+
+def is_loopback_url(url: str) -> bool:
+    try:
+        host = (urllib.parse.urlsplit(url).hostname or "").lower()
+    except ValueError:
+        return False
+    return host in _LOOPBACK_HOSTS or host.startswith("127.")
+
+
+def api_port(url: str) -> int | None:
+    """Port of the API URL, defaulting to Ollama's 11434 when unspecified."""
+    try:
+        parts = urllib.parse.urlsplit(url)
+        return parts.port or (443 if parts.scheme == "https" else 11434)
+    except ValueError:
+        return None
+
+
 def http_get_json(url: str, timeout: int = 5) -> tuple[bool, Any]:
     """GET JSON from URL, return (success, data_or_error_string)."""
     try:
         req = urllib.request.Request(url, headers={"Accept": "application/json"})
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        opener = _DIRECT_OPENER if is_loopback_url(url) else _PROXY_OPENER
+        with opener.open(req, timeout=timeout) as resp:
             return True, json.loads(resp.read().decode())
     except urllib.error.URLError as e:
         return False, str(e.reason)
@@ -139,9 +185,17 @@ def relative_time(iso_str: str) -> str:
                 frac = iso_str[dot_pos + 1 : plus_pos][:6]
                 iso_str = iso_str[: dot_pos + 1] + frac + iso_str[plus_pos:]
         target = datetime.fromisoformat(iso_str)
+        if target.year <= 1:
+            return "never"          # Go zero time: no expiry scheduled
+        if target.tzinfo is None:
+            target = target.replace(tzinfo=timezone.utc)
         now = datetime.now(timezone.utc)
         delta = target - now
         total_sec = int(delta.total_seconds())
+        if total_sec >= FOREVER_AFTER_SEC:
+            # keep_alive -1: Ollama schedules expiry ~292 years out and
+            # `ollama ps` prints "Forever". "106394d left" is not helpful.
+            return "forever"
         suffix = " left" if total_sec >= 0 else " ago"
         total_sec = abs(total_sec)
         if total_sec < 60:
@@ -199,6 +253,30 @@ IS_DARWIN = sys.platform == "darwin"
 CLK_TCK = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
 
 
+def host_cpu_count() -> float:
+    """CPUs this process may actually run on (cgroup cpuset / taskset aware)."""
+    try:
+        return float(len(os.sched_getaffinity(0)))
+    except (AttributeError, OSError):
+        return float(os.cpu_count() or 1)
+
+
+def parse_systemd_cpu_quota(value: str) -> float | None:
+    """`CPUQuotaPerSecUSec` -> effective core budget, or None for unlimited.
+
+    systemd prints it as a human duration: 'infinity', '2s', '500ms',
+    '1.5s', '1min 30s'. One CPU-second per second is one core.
+    """
+    v = value.strip().lower()
+    if not v or v == "infinity":
+        return None
+    units = {"us": 1e-6, "ms": 1e-3, "s": 1.0, "min": 60.0, "h": 3600.0}
+    total = 0.0
+    for num, unit in re.findall(r"(\d+(?:\.\d+)?)\s*(us|ms|min|s|h)", v):
+        total += float(num) * units[unit]
+    return total or None
+
+
 def total_ram_bytes() -> int:
     """System RAM in bytes (for the process MEM% denominator)."""
     if IS_DARWIN:
@@ -217,12 +295,81 @@ def total_ram_bytes() -> int:
     return 0
 
 
-def find_ollama_pid() -> int | None:
+def listening_inodes(port: int) -> set[str]:
+    """Socket inodes in LISTEN state on `port`, from /proc/net/tcp{,6}."""
+    inodes: set[str] = set()
+    for path in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            with open(path) as f:
+                next(f, None)                          # header
+                for line in f:
+                    fields = line.split()
+                    if len(fields) < 10 or fields[3] != "0A":
+                        continue
+                    if int(fields[1].rsplit(":", 1)[1], 16) == port:
+                        inodes.add(fields[9])
+        except (OSError, ValueError, IndexError):
+            continue
+    return inodes
+
+
+def pid_owns_socket(pid: int, inodes: set[str]) -> bool:
+    """True if any fd of `pid` is one of the given socket inodes.
+
+    Needs read access to /proc/<pid>/fd, i.e. same user or root; a
+    PermissionError simply means "don't know".
+    """
+    if not inodes:
+        return False
+    try:
+        for fd in os.listdir(f"/proc/{pid}/fd"):
+            try:
+                target = os.readlink(f"/proc/{pid}/fd/{fd}")
+            except OSError:
+                continue
+            if target.startswith("socket:[") and target[8:-1] in inodes:
+                return True
+    except OSError:
+        return False
+    return False
+
+
+def proc_starttime_ticks(pid: int) -> int:
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return int(f.read().rsplit(")", 1)[1].split()[19])
+    except (OSError, ValueError, IndexError):
+        return sys.maxsize
+
+
+def find_ollama_pids() -> list[int]:
+    """Every `ollama serve` PID visible in /proc (Linux only), unordered."""
+    pids: list[int] = []
+    if not os.path.isdir("/proc"):
+        return pids
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        args = read_proc_cmdline(int(entry))
+        if not args:
+            continue
+        if os.path.basename(args[0]) == "ollama" and any(a == "serve" for a in args[1:]):
+            pids.append(int(entry))
+    return pids
+
+
+def find_ollama_pid(port: int | None = None) -> int | None:
     """Find the Ollama *server* PID (the one running `serve`).
 
     Linux: scan /proc for a process whose argv[0] basename is 'ollama' and
     which has 'serve' among its args — this excludes `ollama run`/`ollama ps`
     clients. macOS: pgrep. Returns None if not found.
+
+    With several servers (a user's manual `ollama serve` next to the systemd
+    one, or a second instance for a ROCm card) the /proc directory order is
+    effectively random. Prefer the process that owns the listening socket on
+    the API port when /proc/<pid>/fd is readable, else the oldest one — the
+    same answer every cycle either way.
 
     Note: on a Docker host the containerized `ollama serve` is *also* visible
     in host /proc, so callers must probe Docker before falling back here (auto
@@ -239,37 +386,25 @@ def find_ollama_pid() -> int | None:
             return int(first) if first.isdigit() else None
         return None
 
-    if not os.path.isdir("/proc"):
+    pids = find_ollama_pids()
+    if not pids:
         return None
-    for entry in os.listdir("/proc"):
-        if not entry.isdigit():
-            continue
-        try:
-            with open(f"/proc/{entry}/cmdline", "rb") as f:
-                raw = f.read()
-        except (FileNotFoundError, PermissionError, ProcessLookupError):
-            continue
-        args = [a for a in raw.decode("utf-8", "replace").split("\x00") if a]
-        if not args:
-            continue
-        if os.path.basename(args[0]) == "ollama" and any(a == "serve" for a in args[1:]):
-            return int(entry)
-    return None
+    if len(pids) == 1:
+        return pids[0]
+    if port:
+        inodes = listening_inodes(port)
+        for pid in sorted(pids):
+            if pid_owns_socket(pid, inodes):
+                return pid
+    return min(pids, key=proc_starttime_ticks)
 
 
-def systemd_ollama() -> tuple[str, int] | None:
-    """Query the ollama systemd unit. Returns (status, main_pid) or None.
+def parse_systemd_show(out: str) -> tuple[str, int, float | None] | None:
+    """Normalize `systemctl show` output to (status, main_pid, cpu_limit).
 
-    status is normalized: running / starting / failed / not found.
-    Only used for discovery + status; the numbers come from /proc.
+    status: running / starting / failed. cpu_limit is the unit's CPUQuota=
+    as a core count, or None when unlimited.
     """
-    ok, out = run_cmd(
-        ["systemctl", "show", "ollama.service",
-         "--property=ActiveState,SubState,MainPID"],
-        timeout=3,
-    )
-    if not ok:
-        return None
     props: dict[str, str] = {}
     for line in out.splitlines():
         if "=" in line:
@@ -282,13 +417,31 @@ def systemd_ollama() -> tuple[str, int] | None:
         pid = int(props.get("MainPID", "0"))
     except ValueError:
         pid = 0
+    quota = parse_systemd_cpu_quota(props.get("CPUQuotaPerSecUSec", ""))
     if active == "active" and pid > 0:
-        return "running", pid
+        return "running", pid, quota
     if active == "activating":
-        return "starting", pid
+        return "starting", pid, quota
     if active == "failed":
-        return "failed", pid
+        return "failed", pid, quota
     return None
+
+
+def systemd_ollama() -> tuple[str, int, float | None] | None:
+    """Query the ollama systemd unit. Returns (status, main_pid, cpu_limit)
+    or None when the unit is absent/inactive.
+
+    Only used for discovery, status and the CPU budget; the numbers come
+    from /proc.
+    """
+    ok, out = run_cmd(
+        ["systemctl", "show", "ollama.service",
+         "--property=ActiveState,SubState,MainPID,CPUQuotaPerSecUSec"],
+        timeout=3,
+    )
+    if not ok:
+        return None
+    return parse_systemd_show(out)
 
 
 def read_proc_cpu_ticks(pid: int) -> int | None:
@@ -432,11 +585,16 @@ _RUNNER_FLAGS: dict[str, tuple[str, bool]] = {
     "-ngl": ("ngl", True),
     "--cache-type-k": ("kv_k", True), "-ctk": ("kv_k", True),
     "--cache-type-v": ("kv_v", True), "-ctv": ("kv_v", True),
+    "--kv-cache-type": ("kv", True),      # new engine: one flag for K and V
+    "--threads": ("threads", True), "-t": ("threads", True),
+    "--ollama-engine": ("ollama_engine", False),
+    "--multiuser-cache": ("multiuser_cache", False),
     "--mmproj": ("mmproj", True),
     "--port": ("port", True),
     "--tensor-split": ("tensor_split", True), "-ts": ("tensor_split", True),
     "--main-gpu": ("main_gpu", True), "-mg": ("main_gpu", True),
-    "--direct-io": ("direct_io", False),
+    "--direct-io": ("direct_io", False),   # pre-0.33 spelling
+    "--load-mode": ("load_mode", True),    # 0.33+: mmap | dio | ...
     "--no-mmap": ("no_mmap", False),
     "--context-shift": ("context_shift", False),
 }
@@ -484,6 +642,14 @@ def parse_runner_argv(args: list[str]) -> dict | None:
         if i + 1 < len(args):
             out[key] = args[i + 1]
         i += 2
+
+    # The Ollama engine spells the KV cache dtype as one flag; fold it into
+    # the K/V pair the renderer already understands.
+    kv = out.pop("kv", None)
+    if kv is not None:
+        out.setdefault("kv_k", kv)
+        out.setdefault("kv_v", kv)
+    out["engine"] = "ollama" if out.pop("ollama_engine", False) else "llama"
 
     model = out.get("model", "")
     digest = ""
@@ -548,6 +714,20 @@ def proc_uptime_sec(pid: int) -> float | None:
         return None
 
 
+def processor_label(size: int | float | None, size_vram: int | float | None) -> str:
+    """The PROCESSOR column exactly as `ollama ps` computes it (cmd/cmd.go)."""
+    size = size or 0
+    size_vram = size_vram or 0
+    if size_vram == 0:
+        return "100% CPU"
+    if size_vram == size:
+        return "100% GPU"
+    if size_vram > size or size == 0:
+        return "Unknown"
+    cpu = round((size - size_vram) / size * 100)
+    return f"{cpu}%/{100 - cpu}% CPU/GPU"
+
+
 def fmt_duration(sec: float) -> str:
     sec = int(sec)
     if sec < 3600:
@@ -584,6 +764,9 @@ class Collector(threading.Thread):
         super().__init__(daemon=True, name="mtop-collector")
         self.container = container
         self.api_url = api_url
+        # Used to pick the right `ollama serve` when several are running, and
+        # only meaningful for a loopback URL — a remote API can't be a local pid.
+        self.api_port = api_port(api_url) if is_loopback_url(api_url) else None
         self.interval = interval
         self.show_gpu = show_gpu
         self.mode = mode                    # requested: auto|docker|local|api
@@ -663,7 +846,11 @@ class Collector(threading.Thread):
     def _detect_local(self) -> bool:
         if IS_LINUX and systemd_ollama() is not None:
             return True
-        return find_ollama_pid() is not None
+        return find_ollama_pid(self.api_port) is not None
+
+    def force_slow(self) -> None:
+        """Make the next collect() refresh the slow-path caches."""
+        self._slow_ts = 0.0
 
     def collect(self, now: float) -> dict:
         """One full collection pass. Also used synchronously by --json."""
@@ -692,9 +879,9 @@ class Collector(threading.Thread):
             if status != "running":
                 return snap
         elif mode == "local":
-            status, pid, uptime = self._local_status()
-            snap.update(status=status, uptime=uptime, cpu_limit=float(os.cpu_count() or 1),
-                        pid=pid)
+            status, pid, uptime, cpu_limit = self._local_status()
+            snap.update(status=status, uptime=uptime,
+                        cpu_limit=cpu_limit or host_cpu_count(), pid=pid)
             if status != "running":
                 # process gone but API might still answer (remote -u, race) —
                 # fall through so models still render
@@ -730,11 +917,15 @@ class Collector(threading.Thread):
             match_runners_to_models(snap["runners"], snap["models"])
 
         if self.show_raw_ps and mode in ("docker", "local"):
+            env = None
             if mode == "docker":
                 cmd = ["docker", "exec", self.container, "ollama", "ps"]
             else:
                 cmd = ["ollama", "ps"]
-            ok2, out2 = run_cmd(cmd)
+                # The CLI reads $OLLAMA_HOST; without this a `-u` pointing at
+                # another instance would list the wrong server's models.
+                env = {**os.environ, "OLLAMA_HOST": self.api_url}
+            ok2, out2 = run_cmd(cmd, env=env)
             snap["raw_ps_ok"] = ok2
             snap["raw_ps"] = out2
 
@@ -742,21 +933,23 @@ class Collector(threading.Thread):
 
     # -- local (bare-metal) process source -------------------------------------
 
-    def _local_status(self) -> tuple[str, int | None, str]:
-        """(status, pid, uptime_str) for a bare-metal ollama server.
+    def _local_status(self) -> tuple[str, int | None, str, float | None]:
+        """(status, pid, uptime_str, cpu_limit) for a bare-metal ollama server.
 
-        Prefers systemd (gives a real activating/failed distinction and the
-        MainPID) and falls back to a /proc or pgrep scan for manual
-        `ollama serve` launches.
+        Prefers systemd (gives a real activating/failed distinction, the
+        MainPID and any CPUQuota=) and falls back to a /proc or pgrep scan for
+        manual `ollama serve` launches.
         """
         pid: int | None = None
         status = "not found"
+        cpu_limit: float | None = None
         if IS_LINUX:
             sd = systemd_ollama()
             if sd is not None:
-                status, pid = sd
+                status, pid, cpu_limit = sd
+                pid = pid or None
         if pid is None:
-            pid = find_ollama_pid()
+            pid = find_ollama_pid(self.api_port)
             if pid is not None:
                 status = "running"
         uptime = ""
@@ -764,7 +957,7 @@ class Collector(threading.Thread):
             up = proc_uptime_sec(pid)
             if up is not None:
                 uptime = fmt_duration(up)
-        return status, pid, uptime
+        return status, pid, uptime, cpu_limit
 
     def _local_stats(self, pid: int) -> dict | None:
         """CPU/MEM for the local server process, in the same shape docker uses.
@@ -917,7 +1110,7 @@ class Collector(threading.Thread):
         except (ValueError, IndexError):
             pass
         if not cpu_limit or cpu_limit <= 0:
-            cpu_limit = float(os.cpu_count() or 1)
+            cpu_limit = host_cpu_count()
         init_pid = None
         try:
             if len(parts) > 5 and parts[5].strip():
@@ -978,7 +1171,7 @@ class Collector(threading.Thread):
                 pid_now = int(head.split("/")[2])
             except (IndexError, ValueError):
                 continue
-            args = [a for a in body.replace("\x00", "\0").split("\0") if a.strip()]
+            args = [a for a in body.split("\0") if a.strip()]
             if len(args) < 2:
                 args = [a for a in body.split() if a]
             info = parse_runner_argv(args)
@@ -1045,6 +1238,18 @@ def safe_addstr(win, y: int, x: int, text: str, attr=0) -> int:
         except curses.error:
             pass
     return y + 1
+
+
+def put(win, y: int, x: int, text: str, attr=0, limit: int | None = None) -> int:
+    """Write text at (y, x) and return the x just past it.
+
+    `limit` is an exclusive right edge (e.g. a frame border column) the text
+    must not run into; the window edge always applies via safe_addstr.
+    """
+    if limit is not None:
+        text = text[: max(0, limit - x)]
+    safe_addstr(win, y, x, text, attr)
+    return x + len(text)
 
 
 def draw_detail_right(win, y: int, min_x: int, text: str, attr=0):
@@ -1188,39 +1393,39 @@ def render_header(win, y: int, snap: dict, stale: bool) -> int:
     safe_addstr(win, y, 1, "║", curses.color_pair(C_HEADER))
     safe_addstr(win, y, inner_right, "║", curses.color_pair(C_HEADER))
 
-    col2 = 32
-    col3 = 64
-    safe_addstr(win, y, 3, "host: ", curses.color_pair(C_DIM))
-    # Clamp hostname so it can never bleed into the container field.
-    host_room = max(1, col2 - 9 - 1)
-    host_show = hostname if len(hostname) <= host_room else hostname[: host_room - 1] + "…"
-    safe_addstr(win, y, 9, host_show, curses.color_pair(C_ACCENT))
+    # Fields flow left to right with a fixed gap instead of sitting on
+    # hardcoded columns (32/64), which overlapped on anything under ~90 cols.
+    gap = 3
+    x = 3
+    lim = inner_right - 1                # keep one blank before the right ║
+
+    def field(label: str, value: str, value_attr) -> None:
+        nonlocal x
+        x = put(win, y, x, label, curses.color_pair(C_DIM), limit=lim)
+        x = put(win, y, x, value, value_attr, limit=lim) + gap
+
+    host_show = hostname if len(hostname) <= 22 else hostname[:21] + "…"
+    field("host: ", host_show, curses.color_pair(C_ACCENT))
     if mode == "api" or status == "api-only":
-        safe_addstr(win, y, col2, "api: ", curses.color_pair(C_DIM))
-        safe_addstr(win, y, col2 + 5, status_icon + snap.get("api_url", ""), status_attr)
+        field("api: ", status_icon + snap.get("api_url", ""), status_attr)
     elif mode == "local":
-        label = "ollama: "
         # "+2r" = two model runner subprocesses rolled into the stats below.
         procs = (snap.get("res_stats") or {}).get("procs") or 1
         runners = f" +{procs - 1}r" if procs > 1 else ""
-        val = status_icon + (f"serve · pid {pid}{runners}" if pid else "serve")
-        safe_addstr(win, y, col2, label, curses.color_pair(C_DIM))
-        safe_addstr(win, y, col2 + len(label), val, status_attr)
-        if uptime:
-            safe_addstr(win, y, col3, f"up: {uptime}", curses.color_pair(C_DIM))
+        field("ollama: ", status_icon + (f"serve · pid {pid}{runners}" if pid else "serve"),
+              status_attr)
     else:
-        safe_addstr(win, y, col2, "container: ", curses.color_pair(C_DIM))
-        safe_addstr(win, y, col2 + 11, status_icon + container, status_attr)
-        if uptime:
-            safe_addstr(win, y, col3, f"up: {uptime}", curses.color_pair(C_DIM))
+        field("container: ", status_icon + container, status_attr)
+    if uptime and mode != "api" and status != "api-only":
+        field("up: ", uptime, curses.color_pair(C_DIM))
 
-    # Right-align timestamp (or STALE flag) to the inner frame.
+    # Right-align timestamp (or STALE flag) to the inner frame; drop it when
+    # the left-hand fields already reach that far.
     right_str = f"STALE {now}" if stale else now
     right_attr = (curses.color_pair(C_ERR) | curses.A_BOLD) if stale \
         else curses.color_pair(C_DIM)
     time_x = inner_right - len(right_str) - 1
-    uptime_end = col3 + (len(f"up: {uptime}") if uptime else 0)
-    if time_x > uptime_end + 1:
+    if time_x >= x:
         safe_addstr(win, y, time_x, right_str, right_attr)
     y += 1
 
@@ -1341,19 +1546,15 @@ def render_models(win, y: int, snap: dict) -> int:
         return y
 
     headers = ["MODEL", "VRAM", "RAM", "CTX", "PROCESSOR", "EXPIRES"]
-    col_widths = [36, 10, 10, 8, 14, 14]
+    col_widths = [36, 10, 10, 8, 16, 14]
     rows = []
     for m in models:
         name = m.get("name", "?")
-        size_vram = m.get("size_vram", 0)
-        size_total = m.get("size", 0)
+        size_vram = m.get("size_vram") or 0
+        size_total = m.get("size") or 0
         size_ram = max(0, size_total - size_vram)
         ctx = str(m.get("context_length", 0))
-        # Try to get processor info from details
-        details = m.get("details", {})
-        processor = "GPU" if size_ram == 0 else "CPU+GPU" if size_vram > 0 else "CPU"
-        if isinstance(details, dict):
-            processor = details.get("processor", processor)
+        processor = processor_label(size_total, size_vram)
         expires = relative_time(m.get("expires_at", ""))
         rows.append([
             name,
@@ -1422,12 +1623,20 @@ def render_runners(win, y: int, snap: dict) -> int:
         vram = r.get("vram")
         name = r.get("model_name") or (r.get("digest", "")[:12] or "—")
         extras = []
+        if r.get("engine") == "ollama":
+            extras.append("ollama-engine")
         if r.get("ngl"):
             extras.append(f"ngl:{r['ngl']}")
+        if r.get("threads"):
+            extras.append(f"thr:{r['threads']}")
         if r.get("mmproj"):
             extras.append("mmproj")
-        if r.get("direct_io"):
+        if r.get("multiuser_cache"):
+            extras.append("multiuser")
+        if r.get("direct_io") or r.get("load_mode") == "dio":
             extras.append("O_DIRECT")
+        elif r.get("load_mode"):
+            extras.append(f"load:{r['load_mode']}")
         rows.append([
             str(r.get("pid", "—")),
             name,
@@ -1441,7 +1650,7 @@ def render_runners(win, y: int, snap: dict) -> int:
         ])
     y = draw_table(win, y, 3,
                    ["PID", "MODEL", "CTX", "BATCH", "FA", "KV", "VRAM", "HOST", ""],
-                   rows, [8, 32, 7, 6, 5, 9, 8, 8, 20],
+                   rows, [8, 32, 7, 6, 5, 9, 8, 8, 48],
                    hdr_attr=curses.color_pair(C_TABLE_HDR) | curses.A_BOLD)
     y += 1
     return y
@@ -1468,7 +1677,10 @@ def render_footer(win, interval: float, raw_ps: bool, can_raw_ps: bool,
 
 def curses_main(stdscr, args):
     init_colors()
-    curses.curs_set(0)  # hide cursor
+    try:
+        curses.curs_set(0)  # hide cursor
+    except curses.error:
+        pass                # terminal can't; harmless
     stdscr.timeout(UI_POLL_MS)  # fixed fast poll — data cadence lives in Collector
 
     collector = Collector(
@@ -1561,6 +1773,14 @@ def json_main(args) -> int:
         show_runners=not args.no_runners,
     )
     snap = collector.collect(time.monotonic())
+    if snap.get("mode") == "local" and snap.get("pid"):
+        # Process CPU% is a delta between two /proc samples, so a single pass
+        # can only ever say 0.00%. Take a second one; the docker path doesn't
+        # need this (docker stats samples internally) and would pay another
+        # ~2 s for nothing.
+        time.sleep(JSON_CPU_WINDOW)
+        collector.force_slow()
+        snap = collector.collect(time.monotonic())
     snap.pop("ts", None)  # monotonic value is meaningless outside the process
     print(json.dumps(snap, indent=2))
     healthy = snap.get("status") in ("running", "api-only") and snap.get("models_ok", False)
@@ -1611,6 +1831,12 @@ def main():
     if args.json:
         sys.exit(json_main(args))
 
+    # curses encodes with the C library's locale; without this, a LANG=C shell
+    # (minimal containers, some SSH jump hosts) turns every █ ░ ─ ║ into '?'.
+    try:
+        locale.setlocale(locale.LC_ALL, "")
+    except locale.Error:
+        pass
     try:
         curses.wrapper(curses_main, args)
     except KeyboardInterrupt:

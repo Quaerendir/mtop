@@ -63,11 +63,15 @@ def _read_int(path: str) -> int | None:
         return None
 
 
-def _mib(v: float | None) -> float:
-    """rocm-smi reports VRAM in bytes on some builds, MiB on others."""
-    if not v:
-        return 0.0
-    return v / (1 << 20) if v > (1 << 30) else v
+def _mib_scale(total: float | None) -> float:
+    """rocm-smi reports VRAM in bytes on some builds, MiB on others.
+
+    Decide per *card* from the total: a total of 1 GiB-as-a-number or more
+    can only be bytes (no card has a PiB of VRAM). Deciding per value, as an
+    earlier cut did, misread a used figure under 1 GiB in a bytes-reporting
+    build as MiB — 536870912 bytes became "512 GiB used".
+    """
+    return float(1 << 20) if (total or 0) >= (1 << 30) else 1.0
 
 
 def meminfo_mib() -> tuple[int, int] | None:
@@ -297,10 +301,16 @@ class RocmSmiProvider(GpuProvider):
         self._run = runner
 
     @staticmethod
-    def _pick(d: dict, *needles: str) -> str | None:
+    def _pick(d: dict, *needles: str, exclude: tuple[str, ...] = ()) -> str | None:
+        """First value whose key contains every needle and none of `exclude`.
+
+        `exclude` matters: 'VRAM Total Used Memory (B)' contains both 'vram'
+        and 'total', so without it the *total* lookup returns the used figure
+        whenever that key happens to come first in the JSON object.
+        """
         for k, v in d.items():
             kl = k.lower()
-            if all(n in kl for n in needles):
+            if all(n in kl for n in needles) and not any(x in kl for x in exclude):
                 return str(v)
         return None
 
@@ -318,8 +328,9 @@ class RocmSmiProvider(GpuProvider):
         for idx, (key, card) in enumerate(sorted(data.items())):
             if not isinstance(card, dict) or "card" not in key.lower():
                 continue
-            used = _to_float(self._pick(card, "vram", "used") or "")
-            total = _to_float(self._pick(card, "vram", "total") or "")
+            used = _to_float(self._pick(card, "vram", "used") or "") or 0.0
+            total = _to_float(self._pick(card, "vram", "total", exclude=("used",)) or "") or 0.0
+            scale = _mib_scale(total)
             util = self._pick(card, "gpu", "use") or self._pick(card, "activity")
             temp = self._pick(card, "temperature", "edge") or self._pick(card, "temp")
             name = (self._pick(card, "card", "series")
@@ -331,8 +342,8 @@ class RocmSmiProvider(GpuProvider):
                 "util": (util or "N/A").strip("% "),
                 # rocm-smi reports VRAM in bytes; some builds in MiB. Heuristic:
                 # anything over 1 GiB-as-a-number is bytes.
-                "mem_used": f"{_mib(used):.0f}",
-                "mem_total": f"{_mib(total):.0f}",
+                "mem_used": f"{used / scale:.0f}",
+                "mem_total": f"{total / scale:.0f}",
                 "temp": (temp or "N/A").strip("c° "),
             })
         return gpus or None

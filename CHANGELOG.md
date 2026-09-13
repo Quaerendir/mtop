@@ -1,5 +1,80 @@
 # Changelog
 
+## 0.4.2 — 2026-09-13
+
+### Fixed
+- **`--json` in local mode always reported `cpu: "0.00%"`.** Process CPU% is a
+  delta between two `/proc` samples and a one-shot run took one. It now takes
+  a second sample 0.5 s later; docker mode is unaffected (`docker stats`
+  samples internally) and does not pay the extra wait.
+- **`keep_alive: -1` rendered as `106394d left`.** Ollama schedules the expiry
+  ~292 years out and `ollama ps` prints `Forever`; mtop now says `forever`.
+  Go's zero time (`0001-01-01`) renders as `never` instead of `739871d ago`.
+- **Runner argv from the Ollama engine was only half parsed.** Current builds
+  spell the KV cache dtype as one `--kv-cache-type` flag rather than
+  `-ctk`/`-ctv`, so the KV column was empty on every new-engine runner.
+  `--threads`, `--ollama-engine` and `--multiuser-cache` are recognised too;
+  they show up as `thr:N`, `ollama-engine` and `multiuser` in the flags column.
+  0.33 also replaced `--direct-io` with `--load-mode dio`; both render as
+  `O_DIRECT`, other load modes as `load:<mode>`.
+- **`o` (raw `ollama ps`) in local mode ignored `-u`.** The CLI reads
+  `$OLLAMA_HOST`; the subprocess now gets the API URL mtop was pointed at, so
+  a second instance on another port lists its own models.
+- **`$http_proxy` hijacked the loopback API call.** urllib proxies every host,
+  including 127.0.0.1, so on a box with a corporate proxy the API came back as
+  a 502 from the proxy. Loopback URLs now bypass env proxies, as Go's
+  `ProxyFromEnvironment` (and therefore Ollama's own client) does.
+- **`rocm-smi` total could come back as the used figure.** The lookup matched
+  key substrings, and `VRAM Total Used Memory (B)` contains both `vram` and
+  `total`, so whichever key the JSON emitted first won. The total lookup now
+  excludes `used`. Separately, the bytes-vs-MiB heuristic is decided per card
+  from the total instead of per value: a used figure under 1 GiB in a
+  bytes-reporting build was misread as MiB (536870912 B became "512 GiB").
+- **Two `ollama serve` processes picked one at random.** The `/proc` scan
+  returned the first directory entry, which is not stable. With several
+  candidates mtop now prefers the one holding the listening socket on the API
+  port (when `/proc/<pid>/fd` is readable), else the oldest — the same answer
+  every cycle.
+- **Monochrome terminals crashed on start** (`start_color()` raises on
+  TERM=dumb / vt100). Colors are skipped when the terminal has none; the
+  locale is set from the environment so box-drawing and block characters
+  survive a `LANG=C` shell; `curs_set` failures are ignored.
+- **Header fields overlapped under ~90 columns.** The status line flowed onto
+  hardcoded columns 32 and 64; it is now a left-to-right flow with a fixed gap,
+  clipped before the right border, and the timestamp is dropped when the
+  fields already reach it.
+
+### Verified
+- Docker mode on a DGX Spark (GB10, Ollama 0.33.2 in `ollama/ollama:latest`,
+  Ubuntu 24.04 aarch64, Python 3.12): unified-memory GPU section, runner
+  discovery through the container init PID on the host `/proc`, blob-to-tag
+  match, raw `ollama ps` toggle, and the header at 70 columns.
+
+### Changed
+- **PROCESSOR column matches `ollama ps` exactly**: `100% GPU`, `100% CPU`,
+  `45%/55% CPU/GPU`, or `Unknown`, computed from `size_vram`/`size` the way
+  `cmd/cmd.go` does. The old `GPU` / `CPU+GPU` / `CPU` heuristic and the dead
+  `details.processor` lookup are gone.
+- Local-mode CPU budget honours the systemd unit's `CPUQuota=` (via
+  `CPUQuotaPerSecUSec`) and the process's CPU affinity
+  (`sched_getaffinity`) instead of the raw host core count.
+- `runners[]` in `--json` gained `engine` (`ollama` | `llama`), `threads` and
+  `multiuser_cache`.
+
+### Added
+- **Test suite** (`tests/`, pytest, stdlib-only fakes): runner argv for three
+  Ollama vintages, blob-to-tag matching, the AMD sysfs provider against a
+  synthetic `/sys/class/drm` tree (dGPU, APU, PCI-slot ordering, hotplug
+  re-probe), rocm-smi 5.x/6.x JSON, nvidia-smi CSV with `[N/A]` and the
+  docker-exec fallback, the GPU registry's backoff and Tegra de-dup, the
+  collector's local-mode rollup and auto-mode upgrade, the renderer through a
+  fake curses window, and the bundler end to end.
+- **CI** (GitHub Actions): ruff + pytest on Python 3.10–3.14, a bundle job
+  that builds and smoke-runs `dist/mtop.py`, and a release job that attaches
+  it to the GitHub release on a `v*` tag — the file the README's curl
+  one-liner has been pointing at.
+- `pip install -e ".[dev]"` pulls pytest and ruff.
+
 ## 0.4.1 — 2026-08-19
 
 ### Fixed

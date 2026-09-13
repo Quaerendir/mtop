@@ -131,7 +131,7 @@ mtop
 ## Display Layout
 
 ```
-─── mtop v0.2.0 — Ollama Model Monitor ───
+─── mtop v0.4.2 — Ollama Model Monitor ───
 host: gpu-rig     container: ● ollama     up: 3d 14h     2026-03-11 15:42:01
 ────────────────────────────────────────────────────────────────────────────────
 CONTAINER RESOURCES
@@ -142,9 +142,9 @@ GPU
      UTIL [████████░░░░░░░░░░░░░░░░░]  32.0%
      VRAM [██████████████████░░░░░░░]  72.4%     17382 / 24000 MiB
 LOADED MODELS
-   MODEL                                VRAM        RAM         CTX       PROCESSOR       EXPIRES
-   ──────────────────────────────────────────────────────────────────────────────────────────────
-   qwen2.5-coder:32b-instruct-q8_0     18.42 G     0.00 G      32768     GPU             4m 32s left
+   MODEL                                VRAM        RAM         CTX       PROCESSOR         EXPIRES
+   ────────────────────────────────────────────────────────────────────────────────────────────────
+   qwen2.5-coder:32b-instruct-q8_0     18.42 G     0.00 G      32768     100% GPU          4m 32s left
 OLLAMA PS (raw)
    NAME                                SIZE       PROCESSOR    UNTIL
    qwen2.5-coder:32b-instruct-q8_0     19.8 GB    100% GPU     4 minutes from now
@@ -194,15 +194,19 @@ PRs welcome. Keep it stdlib-only — the zero-dependency constraint is a feature
 ```bash
 git clone https://github.com/Quaerendir/mtop.git
 cd mtop
-pip install -e .
+pip install -e ".[dev]"      # + pytest, ruff
 # hack on src/mtop/*.py
 mtop
+
+ruff check src tools tests
+pytest                       # stdlib-only fakes: no GPU, docker or Ollama needed
 
 # regenerate the single-file artifact shipped with releases
 python tools/bundle.py       # -> dist/mtop.py
 ```
 
-`dist/mtop.py` is generated — never edit it by hand.
+`dist/mtop.py` is generated — never edit it by hand. CI builds it on every
+push and attaches it to the GitHub release when a `v*` tag is pushed.
 
 ## License
 
