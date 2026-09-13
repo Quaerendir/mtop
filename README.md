@@ -1,6 +1,6 @@
 # mtop
 
-**htop for Ollama** — a curses-based TUI that monitors your models, GPU, and the Ollama server (in Docker *or* bare-metal) in real time. Zero flicker. Zero dependencies beyond Python 3.10+.
+**htop for Ollama** — a curses-based TUI that monitors your models, GPU, and the Ollama server (in Docker, Podman *or* bare-metal) in real time. Zero flicker. Zero dependencies beyond Python 3.10+.
 
 ![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)
 ![License: MIT](https://img.shields.io/badge/license-MIT-green)
@@ -13,7 +13,7 @@
 
 There are web dashboards, Prometheus exporters, and chat TUIs for Ollama. But there's no **terminal monitor** — something you SSH into a box and just run, like `htop` or `nvtop`, to see what models are loaded, how much VRAM they're eating, and whether the container is healthy.
 
-`mtop` fills that gap. One file, one command, pure stdlib Python. It auto-detects whether Ollama runs in a Docker container or as a bare-metal process (systemd or a manual `ollama serve`) and monitors it either way.
+`mtop` fills that gap. One file, one command, pure stdlib Python. It auto-detects whether Ollama runs in a Docker/Podman container or as a bare-metal process (systemd or a manual `ollama serve`) and monitors it either way.
 
 ## Features
 
@@ -31,7 +31,8 @@ There are web dashboards, Prometheus exporters, and chat TUIs for Ollama. But th
 - **API-only mode** — `--no-docker` for monitoring remote Ollama instances without local docker calls
 - **cgroup-aware CPU bar** — normalizes against the container's `--cpus`/quota limit, not the host core count
 - **Docker *and* bare-metal** — auto-detects the source: a Docker container, a systemd `ollama.service`, or a manual `ollama serve`; monitors process CPU/MEM via `/proc` (Linux, no root) or `ps`/`sysctl` (macOS)
-- **Docker-aware** — talks to both the Ollama API and `docker exec ollama ps`
+- **Docker Engine API over the socket** — no `docker` binary needed: mtop talks to `/var/run/docker.sock` (or a rootless / Podman socket, or `$DOCKER_HOST`) with stdlib `http.client`; the `docker`/`podman` CLI is only a fallback. One-shot stats mean no 2 s `docker stats` stall per cycle
+- **Podman** — same code path via the compat API socket or the `podman` CLI
 - **Respects `$OLLAMA_HOST`** — works with remote Ollama instances out of the box
 - **Zero external dependencies** — only Python stdlib (`curses`, `urllib`, `json`, `subprocess`)
 
@@ -74,7 +75,7 @@ PYTHONPATH=src python -m mtop
 ## Usage
 
 ```
-mtop [-c CONTAINER] [-i INTERVAL] [-u URL] [-m MODE] [--no-gpu] [--no-docker] [--json] [-V] [-h]
+mtop [-c CONTAINER] [-i INTERVAL] [-u URL] [-m MODE] [--runtime RT] [--no-gpu] [--json] [-V] [-h]
 
 Options:
   -c, --container NAME   Docker container name (default: ollama)
@@ -84,6 +85,9 @@ Options:
   -i, --interval SECS    Refresh interval in seconds (default: 1.0)
   -u, --api-url URL      Ollama API base URL (default: $OLLAMA_HOST or http://localhost:11434)
                          Scheme-less values (gpu-rig:11434) are accepted, like Ollama itself
+      --runtime RT       How to reach the container runtime: auto|api|cli (default: auto)
+                         api = Engine API on $DOCKER_HOST or a docker/podman socket
+                         cli = docker/podman subprocesses
       --no-gpu           Disable GPU monitoring section
       --no-runners       Hide the RUNNERS section (effective inference config)
       --no-docker        API-only mode: skip all docker calls (remote instances)
@@ -109,6 +113,14 @@ mtop
 
 # Monitor a remote Ollama instance — API only, no local docker/GPU noise
 mtop -u 192.168.1.100:11434 --mode api
+
+# Podman (rootless): the socket is found automatically; or point at it
+DOCKER_HOST=unix://$XDG_RUNTIME_DIR/podman/podman.sock mtop
+
+# mtop inside a container, with only the socket mounted — no docker CLI needed
+docker run --rm -it -v /var/run/docker.sock:/var/run/docker.sock \
+  --network host python:3.12-slim sh -c \
+  "curl -fsSL https://github.com/Quaerendir/mtop/releases/latest/download/mtop.py -o m.py && python m.py"
 
 # One-shot health/state snapshot for scripting
 mtop --json | jq '.models[].name'
@@ -160,6 +172,7 @@ OLLAMA PS (raw)
 | Linux + AMD (amdgpu) | ✅ Full | sysfs — no ROCm install required |
 | AMD APU (780M, Strix) | ✅ Unified memory | GTT pool, not the tiny VRAM carve-out |
 | Linux without GPU | ✅ (no GPU section) | Use `--no-gpu` to hide the section |
+| Ollama in Podman | ✅ Full | compat API on the Podman socket, or the `podman` CLI |
 | Bare-metal Ollama (systemd) | ✅ process stats | `--mode local`; CPU/MEM from `/proc`, no root needed |
 | Manual `ollama serve` | ✅ process stats | auto-detected via `/proc` cmdline scan |
 | macOS | ⚠️ Partial | `--mode local` monitors the process via `ps`/`sysctl`; GPU (Metal) not yet supported |
@@ -168,8 +181,8 @@ OLLAMA PS (raw)
 ## Requirements
 
 - **Python 3.10+** (uses `match`-era type hints like `list[str]`, `X | Y`)
-- **Docker** (for container monitoring)
-- **Ollama** running in a Docker container (or accessible via API)
+- **Docker or Podman** for container monitoring — access to the socket is enough, the CLI is optional
+- **Ollama** in a container, as a bare-metal process, or reachable via API
 - **nvidia-smi** (optional, for GPU stats)
 
 ## Roadmap
@@ -179,6 +192,7 @@ OLLAMA PS (raw)
 - [ ] Apple Silicon GPU stats (via `powermetrics`)
 - [ ] Model pull progress tracking
 - [ ] Multiple container / multi-host support
+- [x] Docker Engine API over the socket, Podman support
 - [x] Configurable layout (raw `ollama ps` toggle; more sections to follow)
 - [ ] Model actions — unload on keypress (`keep_alive: 0`), extend TTL
 - [ ] Sparkline history for CPU/GPU utilization (braille chars, stdlib deque)

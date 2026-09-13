@@ -349,28 +349,30 @@ class RocmSmiProvider(GpuProvider):
         return gpus or None
 
 
-class NvidiaSmiProvider(GpuProvider):
-    """nvidia-smi, on the host or via `docker exec`.
+Runner = Callable[[list[str], int], tuple[bool, str]]
 
-    `prefix_fn` returns the argv prefix to run the binary with, so the docker
-    path stays out of this class. Works unchanged on Windows: nvidia-smi.exe
-    lives in System32 and is on PATH.
+
+class NvidiaSmiProvider(GpuProvider):
+    """nvidia-smi, on the host or inside the container.
+
+    `attempts_fn` returns (label, runner) pairs to try in order — typically
+    the host `run_cmd` and then an exec inside the Ollama container — so
+    neither the docker CLI nor the Engine API leaks into this class. The
+    first label that answers is memoized. Works unchanged on Windows:
+    nvidia-smi.exe lives in System32 and is on PATH.
     """
 
     name = "nvidia-smi"
 
-    def __init__(self, runner: Callable[[list[str], int], tuple[bool, str]],
-                 prefix_fn: Callable[[], list[list[str]]]):
-        self._run = runner
-        self._prefix_fn = prefix_fn
-        self._good_prefix: list[str] | None = None
+    def __init__(self, attempts_fn: Callable[[], list[tuple[str, Runner]]]):
+        self._attempts_fn = attempts_fn
+        self._good: str | None = None
 
-    def _query(self, prefix: list[str]) -> list[dict] | None:
+    def _query(self, run: Runner) -> list[dict] | None:
         query = ("index,name,utilization.gpu,memory.used,memory.total,"
                  "temperature.gpu,power.draw")
-        ok, out = self._run(
-            prefix + ["nvidia-smi", f"--query-gpu={query}",
-                      "--format=csv,noheader,nounits"], 3)
+        ok, out = run(["nvidia-smi", f"--query-gpu={query}",
+                       "--format=csv,noheader,nounits"], 3)
         if not ok or not out:
             return None
         gpus = []
@@ -391,14 +393,15 @@ class NvidiaSmiProvider(GpuProvider):
         return gpus or None
 
     def collect(self) -> list[dict] | None:
-        prefixes = [self._good_prefix] if self._good_prefix is not None \
-            else self._prefix_fn()
-        for prefix in prefixes:
-            gpus = self._query(prefix)
+        attempts = self._attempts_fn()
+        if self._good is not None:
+            attempts = [a for a in attempts if a[0] == self._good] or attempts
+        for label, run in attempts:
+            gpus = self._query(run)
             if gpus:
-                self._good_prefix = prefix
+                self._good = label
                 return gpus
-        self._good_prefix = None
+        self._good = None
         return None
 
 

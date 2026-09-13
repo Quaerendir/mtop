@@ -12,7 +12,7 @@ def _bundle(tmp_path):
     out = tmp_path / "mtop.py"
     r = subprocess.run([sys.executable, str(ROOT / "tools" / "bundle.py"), "-o", str(out)],
                        capture_output=True, text=True, check=True)
-    assert "1 embedded module" in r.stdout
+    assert "2 embedded module" in r.stdout
     return out
 
 

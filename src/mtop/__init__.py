@@ -10,8 +10,8 @@ keys at a fixed 100 ms poll. Slow or hung data sources can no longer
 freeze the UI — stale data is flagged instead.
 
 Usage:
-    mtop [-c CONTAINER] [-i INTERVAL] [-u URL] [--no-gpu] [--no-docker]
-         [--json] [-h]
+    mtop [-c CONTAINER] [-i INTERVAL] [-u URL] [-m MODE] [--runtime RT]
+         [--no-gpu] [--no-runners] [--json] [-h]
 """
 
 import argparse
@@ -30,10 +30,11 @@ import urllib.request
 from datetime import datetime, timezone
 from typing import Any
 
+from .container import ContainerRuntime, detect_runtime
 from .gpu import (AmdSysfsProvider, GpuMonitor, GpuProvider, NvidiaSmiProvider,
                   RocmSmiProvider, TegraUnifiedProvider)
 
-__version__ = "0.4.2"
+__version__ = "0.5.0"
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
 
@@ -751,7 +752,8 @@ class Collector(threading.Thread):
     additional locking.
 
     ``mode`` selects the data source:
-      docker — inspect/stats/exec a container (the v0.2.0 behavior)
+      docker — inspect/stats/exec a container, through the Engine API on a
+               socket when one answers, else the docker/podman CLI
       local  — monitor a bare-metal `ollama serve` process (systemd/proc/ps)
       api    — API only, no host resource stats (former --no-docker)
       auto   — probe docker first, then a local process, else api; the
@@ -760,9 +762,13 @@ class Collector(threading.Thread):
 
     def __init__(self, container: str, api_url: str, interval: float,
                  show_gpu: bool, mode: str = "auto", show_raw_ps: bool = False,
-                 show_runners: bool = True):
+                 show_runners: bool = True, runtime: str = "auto",
+                 container_runtime: ContainerRuntime | None = None):
         super().__init__(daemon=True, name="mtop-collector")
         self.container = container
+        self.runtime_pref = runtime         # auto | api | cli
+        self._runtime: ContainerRuntime | None = container_runtime
+        self._runtime_probed = container_runtime is not None
         self.api_url = api_url
         # Used to pick the right `ollama serve` when several are running, and
         # only meaningful for a loopback URL — a remote API can't be a local pid.
@@ -795,6 +801,15 @@ class Collector(threading.Thread):
         # resets the baseline, and per-pid inside so a runner spawning or
         # exiting does not register as a CPU spike.
         self._cpu_prev: tuple[int, dict[int, int], float] | None = None
+
+    @property
+    def runtime(self) -> ContainerRuntime | None:
+        """The container runtime, resolved on first use; None when the host has
+        neither an Engine API socket nor a docker/podman CLI."""
+        if not self._runtime_probed:
+            self._runtime = detect_runtime(run_cmd, self.runtime_pref)
+            self._runtime_probed = True
+        return self._runtime
 
     @property
     def use_docker(self) -> bool:
@@ -838,10 +853,23 @@ class Collector(threading.Thread):
         return "api"
 
     def _detect_docker(self) -> bool:
-        ok, out = run_cmd(
-            ["docker", "inspect", "--format", "{{.State.Status}}", self.container]
-        )
-        return ok and out.strip() == "running"
+        rt = self.runtime
+        if rt is None:
+            return False
+        info = rt.inspect(self.container)
+        return bool(info) and info["status"] == "running"
+
+    def needs_second_sample(self, snap: dict) -> bool:
+        """True when CPU% in this snapshot is a delta we have no baseline for.
+
+        local mode always; docker mode when the Engine API is in use (one-shot
+        stats carry no precpu). The CLI path samples internally.
+        """
+        if not snap.get("pid"):
+            return False
+        if snap.get("mode") == "local":
+            return True
+        return snap.get("mode") == "docker" and str(snap.get("runtime", "")).endswith("-api")
 
     def _detect_local(self) -> bool:
         if IS_LINUX and systemd_ollama() is not None:
@@ -871,6 +899,8 @@ class Collector(threading.Thread):
             "api_url": self.api_url,
             "mode": mode,
         }
+        if mode == "docker":
+            snap["runtime"] = self.runtime.name if self.runtime else None
 
         if mode == "docker":
             status, uptime, cpu_limit, init_pid = self._inspect_container()
@@ -917,15 +947,15 @@ class Collector(threading.Thread):
             match_runners_to_models(snap["runners"], snap["models"])
 
         if self.show_raw_ps and mode in ("docker", "local"):
-            env = None
-            if mode == "docker":
-                cmd = ["docker", "exec", self.container, "ollama", "ps"]
+            if mode == "docker" and self.runtime is not None:
+                ok2, out2 = self.runtime.exec(self.container, ["ollama", "ps"])
+            elif mode == "docker":
+                ok2, out2 = False, "no container runtime"
             else:
-                cmd = ["ollama", "ps"]
                 # The CLI reads $OLLAMA_HOST; without this a `-u` pointing at
                 # another instance would list the wrong server's models.
-                env = {**os.environ, "OLLAMA_HOST": self.api_url}
-            ok2, out2 = run_cmd(cmd, env=env)
+                ok2, out2 = run_cmd(["ollama", "ps"],
+                                    env={**os.environ, "OLLAMA_HOST": self.api_url})
             snap["raw_ps_ok"] = ok2
             snap["raw_ps"] = out2
 
@@ -1078,7 +1108,7 @@ class Collector(threading.Thread):
         }
 
     def _inspect_container(self) -> tuple[str, str, float | None, int | None]:
-        """(status, uptime, effective_cpu_limit, init_pid) in a single inspect call.
+        """(status, uptime, effective_cpu_limit, init_pid) from one inspect.
 
         CPU limit comes from HostConfig (NanoCpus for --cpus, quota/period
         for --cpu-quota); falls back to host core count. This makes the CPU
@@ -1086,54 +1116,29 @@ class Collector(threading.Thread):
         of the host total (a --cpus=4 container saturating on a 32-core
         host previously showed 12.5%).
         """
-        fmt = ("{{.State.Status}}\t{{.State.StartedAt}}\t"
-               "{{.HostConfig.NanoCpus}}\t{{.HostConfig.CpuQuota}}\t"
-               "{{.HostConfig.CpuPeriod}}\t{{.State.Pid}}")
-        ok, out = run_cmd(["docker", "inspect", "--format", fmt, self.container])
-        if not ok:
+        rt = self.runtime
+        info = rt.inspect(self.container) if rt is not None else None
+        if not info:
             return "not found", "", None, None
-        parts = out.split("\t")
-        status = parts[0].strip()
+        status = info["status"]
         uptime = ""
-        if status == "running" and len(parts) > 1 and parts[1].strip():
-            uptime = relative_time(parts[1].strip()).replace(" ago", "")
+        if status == "running" and info["started_at"]:
+            uptime = relative_time(info["started_at"]).replace(" ago", "")
 
         cpu_limit: float | None = None
-        try:
-            nano = int(parts[2]) if len(parts) > 2 and parts[2].strip() else 0
-            quota = int(parts[3]) if len(parts) > 3 and parts[3].strip() else 0
-            period = int(parts[4]) if len(parts) > 4 and parts[4].strip() else 100000
-            if nano > 0:
-                cpu_limit = nano / 1e9
-            elif quota > 0 and period > 0:
-                cpu_limit = quota / period
-        except (ValueError, IndexError):
-            pass
+        nano, quota = info["nano_cpus"], info["cpu_quota"]
+        period = info["cpu_period"] or 100000
+        if nano > 0:
+            cpu_limit = nano / 1e9
+        elif quota > 0 and period > 0:
+            cpu_limit = quota / period
         if not cpu_limit or cpu_limit <= 0:
             cpu_limit = host_cpu_count()
-        init_pid = None
-        try:
-            if len(parts) > 5 and parts[5].strip():
-                init_pid = int(parts[5]) or None
-        except ValueError:
-            pass
-        return status, uptime, cpu_limit, init_pid
+        return status, uptime, cpu_limit, info["pid"]
 
     def _docker_stats_read(self) -> dict | None:
-        fmt = "{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}"
-        ok, out = run_cmd(
-            ["docker", "stats", "--no-stream", "--format", fmt, self.container]
-        )
-        if not ok or not out:
-            return None
-        parts = out.split("\t")
-        if len(parts) < 3:
-            return None
-        return {
-            "cpu": parts[0].strip(),
-            "mem_usage": parts[1].strip(),
-            "mem_pct": parts[2].strip(),
-        }
+        rt = self.runtime
+        return rt.stats(self.container) if rt is not None else None
 
     def _docker_runners(self, init_pid: int | None) -> list[dict] | None:
         """Runner argv for a containerized Ollama.
@@ -1157,9 +1162,12 @@ class Collector(threading.Thread):
 
         # `head -c` on a glob emits '==> /proc/N/cmdline <==' separators, which
         # is the cheapest way to get every argv out in a single exec.
-        ok, out = run_cmd(
-            ["docker", "exec", self.container, "sh", "-c",
-             "head -c 4096 /proc/[0-9]*/cmdline 2>/dev/null"], timeout=5)
+        rt = self.runtime
+        if rt is None:
+            return runners or None
+        ok, out = rt.exec(self.container,
+                          ["sh", "-c", "head -c 4096 /proc/[0-9]*/cmdline 2>/dev/null"],
+                          timeout=5)
         if not ok or not out:
             return runners or None
         pid_now: int | None = None
@@ -1190,14 +1198,17 @@ class Collector(threading.Thread):
         with an NVIDIA card *and* a Radeon shows both. v0.3.0 memoized a single
         winning strategy and structurally could not.
         """
-        def nvidia_prefixes() -> list[list[str]]:
-            prefixes: list[list[str]] = [[]]          # host first
-            if self.use_docker:
-                prefixes.append(["docker", "exec", self.container])
-            return prefixes
+        def nvidia_attempts() -> list[tuple[str, Any]]:
+            attempts: list[tuple[str, Any]] = [("host", run_cmd)]   # host first
+            rt = self.runtime if self.use_docker else None
+            if rt is not None:
+                def in_container(cmd: list[str], timeout: int = 5) -> tuple[bool, str]:
+                    return rt.exec(self.container, cmd, timeout)
+                attempts.append(("container", in_container))
+            return attempts
 
         providers: list[GpuProvider] = [
-            NvidiaSmiProvider(run_cmd, nvidia_prefixes),
+            NvidiaSmiProvider(nvidia_attempts),
         ]
         if IS_LINUX:
             providers += [
@@ -1657,13 +1668,15 @@ def render_runners(win, y: int, snap: dict) -> int:
 
 
 def render_footer(win, interval: float, raw_ps: bool, can_raw_ps: bool,
-                  runners: bool = True):
+                  runners: bool = True, runtime: str | None = None):
     max_y, max_x = win.getmaxyx()
     footer_y = max_y - 1
     parts = ["q: quit", f"+/-: interval ({interval:.1f}s)"]
     if can_raw_ps:
         parts.append(f"o: raw ps [{'on' if raw_ps else 'off'}]")
         parts.append(f"r: runners [{'on' if runners else 'off'}]")
+    if runtime:
+        parts.append(f"via {runtime}")
     parts.append(f"mtop v{__version__}")
     footer = " " + " │ ".join(parts) + " "
     footer = footer[: max_x - 1].ljust(max_x - 1)
@@ -1690,6 +1703,7 @@ def curses_main(stdscr, args):
         show_gpu=not args.no_gpu,
         mode=args.mode,
         show_runners=not args.no_runners,
+        runtime=args.runtime,
     )
     collector.start()
 
@@ -1749,7 +1763,8 @@ def curses_main(stdscr, args):
                     y = render_ollama_ps(stdscr, y, snap)
 
             render_footer(stdscr, collector.interval, collector.show_raw_ps,
-                          mode in ("docker", "local"), collector.show_runners)
+                          mode in ("docker", "local"), collector.show_runners,
+                          snap.get("runtime"))
             stdscr.refresh()
     finally:
         collector.stop()
@@ -1771,13 +1786,14 @@ def json_main(args) -> int:
         show_gpu=not args.no_gpu,
         mode=args.mode,
         show_runners=not args.no_runners,
+        runtime=args.runtime,
     )
     snap = collector.collect(time.monotonic())
-    if snap.get("mode") == "local" and snap.get("pid"):
-        # Process CPU% is a delta between two /proc samples, so a single pass
-        # can only ever say 0.00%. Take a second one; the docker path doesn't
-        # need this (docker stats samples internally) and would pay another
-        # ~2 s for nothing.
+    if collector.needs_second_sample(snap):
+        # CPU% is a delta between two samples (/proc ticks, or one-shot Engine
+        # API stats), so a single pass can only ever say 0.00%. Take a second
+        # one. The docker CLI path samples internally and would pay another
+        # ~2 s for nothing, so it is excluded.
         time.sleep(JSON_CPU_WINDOW)
         collector.force_slow()
         snap = collector.collect(time.monotonic())
@@ -1808,6 +1824,11 @@ def main():
                              "bare-metal ollama process, else api). "
                              "local: monitor a systemd/manual `ollama serve`. "
                              "api: models only, no host resource stats.")
+    parser.add_argument("--runtime", choices=["auto", "api", "cli"], default="auto",
+                        help="How to reach the container runtime (default: auto — "
+                             "Engine API on $DOCKER_HOST or a docker/podman socket, "
+                             "else the docker/podman CLI). api: socket only. "
+                             "cli: subprocesses only.")
     parser.add_argument("--no-gpu", action="store_true",
                         help="Disable GPU stats section")
     parser.add_argument("--no-runners", action="store_true",

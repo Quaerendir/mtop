@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.5.0 — 2026-09-13
+
+### Added
+- **Docker Engine API over a socket** (`mtop.container.DockerApi`, stdlib
+  `http.client` on `AF_UNIX`). mtop no longer needs the `docker` binary: it
+  talks to `/var/run/docker.sock`, a rootless `$XDG_RUNTIME_DIR/docker.sock`,
+  or a Podman socket (`$XDG_RUNTIME_DIR/podman/podman.sock`,
+  `/run/podman/podman.sock`), and honours `DOCKER_HOST` for `unix://` and
+  plain `tcp://` endpoints the way the CLI does. Inspect, stats and exec
+  (`ollama ps`, the in-container cmdline fallback, `nvidia-smi` inside the
+  container) all go through it.
+- **Podman support**, via the compat API on its socket or the `podman` CLI
+  when no socket answers. The runtime in use is reported as `runtime` in
+  `--json` (`docker-api`, `podman-api`, `docker-cli`, `podman-cli`) and in
+  the footer.
+- `--runtime auto|api|cli` to force one path. `auto` prefers a socket and
+  falls back to whichever CLI is on PATH.
+- Container stats use `stats?stream=false&one-shot=true` and compute CPU%
+  from the previous sample, like the local `/proc` path. The `docker stats
+  --no-stream` fork blocked ~2 s per cycle (it waits for two samples), which
+  with a 1 s interval kept the collector one hiccup away from the STALE flag.
+  Measured on a GB10 Spark: `--json` 0.74 s through the API (including the
+  0.5 s second-sample wait) vs 1.20 s through the CLI, with matching memory
+  figures. `--json` takes that second sample in docker-api mode as well.
+- `inspect` now also returns the container's `Config.Env` and image;
+  groundwork for showing the effective `OLLAMA_*` configuration.
+- `workflow_dispatch` on the CI workflow, so a release can be re-run by hand.
+
+### Changed
+- `NvidiaSmiProvider` takes a list of `(label, runner)` attempts instead of
+  argv prefixes, so the in-container probe works through whichever runtime is
+  active rather than assuming a `docker` binary.
+- `docker` mode keeps its name in `--json` (`mode: "docker"`) even when the
+  runtime is Podman; the distinction lives in `runtime`.
+
+### Verified
+- DGX Spark (GB10, Ollama 0.33.2 in docker): API and CLI paths side by side,
+  the raw `ollama ps` toggle through an API exec, and mtop itself running in a
+  `python:3.12-slim` container with only the socket bind-mounted — no docker
+  CLI, no host PID namespace — falling back to the in-container cmdline exec
+  for runner discovery.
+
 ## 0.4.2 — 2026-09-13
 
 ### Fixed

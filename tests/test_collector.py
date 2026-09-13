@@ -90,7 +90,8 @@ def test_json_main_takes_second_cpu_sample_in_local_mode(local_host, monkeypatch
     advance = local_host
     monkeypatch.setattr(mtop.time, "sleep", lambda s: advance())
     args = argparse.Namespace(container="ollama", api_url="http://localhost:11434",
-                              interval=1.0, no_gpu=True, mode="local", no_runners=False)
+                              interval=1.0, no_gpu=True, mode="local", no_runners=False,
+                              runtime="auto")
     rc = mtop.json_main(args)
     out = json.loads(capsys.readouterr().out)
     assert rc == 0
@@ -102,7 +103,8 @@ def test_json_main_takes_second_cpu_sample_in_local_mode(local_host, monkeypatch
 def test_json_main_exit_code_when_api_down(local_host, monkeypatch, capsys):
     monkeypatch.setattr(mtop, "http_get_json", lambda url, timeout=5: (False, "refused"))
     args = argparse.Namespace(container="ollama", api_url="http://localhost:11434",
-                              interval=1.0, no_gpu=True, mode="local", no_runners=False)
+                              interval=1.0, no_gpu=True, mode="local", no_runners=False,
+                              runtime="auto")
     assert mtop.json_main(args) == 1
     out = json.loads(capsys.readouterr().out)
     assert out["models_ok"] is False and out["models_err"] == "refused"
@@ -220,3 +222,100 @@ def test_draw_table_truncates_and_sizes_rule(win):
     assert win.line(2).startswith("averyve…")
     assert set(win.line(1)) == {"─"}
     assert len(win.line(1)) == len(win.line(2))
+
+
+# ── docker mode through an injected runtime ──────────────────────────────────
+
+class FakeRuntime:
+    name = "docker-api"
+
+    def __init__(self, status="running", pid=SERVER_PID):
+        self.status, self.pid = status, pid
+        self.execs = []
+        self.stats_calls = 0
+
+    def inspect(self, name):
+        if name != "ollama":
+            return None
+        return {"status": self.status, "started_at": "2026-09-13T00:00:00Z", "pid": self.pid,
+                "nano_cpus": 4_000_000_000, "cpu_quota": 0, "cpu_period": 100000,
+                "env": [], "image": "ollama/ollama:latest"}
+
+    def stats(self, name):
+        self.stats_calls += 1
+        return {"cpu": "12.50%", "mem_usage": "1.5GiB / 121GiB", "mem_pct": "1.24%",
+                "cpu_pct": 12.5, "mem_used_bytes": 3 * GIB // 2, "mem_limit_bytes": 121 * GIB}
+
+    def exec(self, name, cmd, timeout=5):
+        self.execs.append(cmd)
+        if cmd[:1] == ["ollama"]:
+            return True, "NAME  ID  SIZE\nbielik  b669  14 GB"
+        if cmd[:1] == ["sh"]:
+            argv = "\0".join(OLLAMA_ENGINE_ARGV)
+            return True, f"==> /proc/77/cmdline <==\n{argv}\n==> /proc/1/cmdline <==\nollama\0serve"
+        return False, "no"
+
+
+@pytest.fixture
+def docker_host(monkeypatch):
+    monkeypatch.setattr(mtop, "IS_LINUX", True)
+    monkeypatch.setattr(mtop, "http_get_json", lambda url, timeout=5: (True, API_PS))
+    # host /proc walk finds nothing for the container init pid -> exec fallback
+    monkeypatch.setattr(mtop, "process_tree", lambda root, children=None: [root])
+    monkeypatch.setattr(mtop, "read_proc_cmdline", lambda pid: None)
+    return FakeRuntime()
+
+
+def test_docker_mode_via_injected_runtime(docker_host):
+    rt = docker_host
+    c = _collector(mode="docker", container_runtime=rt, show_raw_ps=True)
+    snap = c.collect(100.0)
+    assert snap["mode"] == "docker" and snap["runtime"] == "docker-api"
+    assert snap["status"] == "running" and snap["pid"] == SERVER_PID
+    assert snap["cpu_limit"] == 4.0                      # NanoCpus honoured
+    assert snap["res_stats"]["cpu"] == "12.50%"
+    assert snap["raw_ps_ok"] and "bielik" in snap["raw_ps"]
+    assert ["ollama", "ps"] in rt.execs
+    r = snap["runners"][0]
+    assert r["pid"] == 77 and r["rss"] is None           # exec fallback: no RSS
+    assert r["model_name"] == "qwen2.5-coder:32b"
+
+
+def test_docker_mode_auto_detects_and_locks(docker_host, monkeypatch):
+    rt = docker_host
+    c = _collector(mode="auto", container_runtime=rt)
+    assert c.collect(100.0)["mode"] == "docker"
+    rt.status = "exited"
+    snap = c.collect(103.0)
+    assert snap["mode"] == "docker" and snap["status"] == "exited"
+    assert "res_stats" not in snap                        # short-circuits when down
+
+
+def test_docker_mode_without_runtime_is_not_found(monkeypatch):
+    monkeypatch.setattr(mtop, "detect_runtime", lambda runner, prefer: None)
+    monkeypatch.setattr(mtop, "http_get_json", lambda url, timeout=5: (True, {"models": []}))
+    c = _collector(mode="docker")
+    snap = c.collect(0.0)
+    assert snap["status"] == "not found" and snap["runtime"] is None
+
+
+def test_needs_second_sample(docker_host):
+    c = _collector(mode="docker", container_runtime=docker_host)
+    snap = c.collect(100.0)
+    assert c.needs_second_sample(snap) is True
+    docker_host.name = "docker-cli"
+    c2 = _collector(mode="docker", container_runtime=docker_host)
+    assert c2.needs_second_sample(c2.collect(100.0)) is False
+    assert c.needs_second_sample({"mode": "local", "pid": 1}) is True
+    assert c.needs_second_sample({"mode": "api", "pid": None}) is False
+
+
+def test_nvidia_attempts_include_container_exec(docker_host):
+    c = _collector(mode="docker", container_runtime=docker_host, show_gpu=True)
+    c.collect(100.0)
+    providers = c._build_gpu_providers()
+    nv = providers[0]
+    labels = [label for label, _ in nv._attempts_fn()]
+    assert labels == ["host", "container"]
+    ok, out = nv._attempts_fn()[1][1](["nvidia-smi", "-L"], 3)
+    assert docker_host.execs[-1] == ["nvidia-smi", "-L"]

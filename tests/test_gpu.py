@@ -205,33 +205,35 @@ NVSMI_TEGRA = "0, Orin (nvgpu), 3, [N/A], [N/A], 45, [N/A]\n"
 
 class TestNvidiaSmi:
     def _provider(self, table):
+        """table: label -> (ok, out); every call is logged as (label, argv)."""
         calls = []
 
-        def run(cmd, timeout):
-            calls.append(cmd)
-            key = tuple(cmd[:cmd.index("nvidia-smi")])
-            ok, out = table.get(key, (False, "command not found: nvidia-smi"))
-            return ok, out
+        def runner_for(label):
+            def run(cmd, timeout):
+                calls.append((label, cmd))
+                return table.get(label, (False, "command not found: nvidia-smi"))
+            return run
 
-        prefixes = lambda: [[], ["docker", "exec", "ollama"]]  # noqa: E731
-        return gpu.NvidiaSmiProvider(run, prefixes), calls
+        attempts = [("host", runner_for("host")), ("container", runner_for("container"))]
+        return gpu.NvidiaSmiProvider(lambda: attempts), calls
 
     def test_parses_two_cards_and_power(self):
-        p, _ = self._provider({(): (True, NVSMI_TWO)})
+        p, _ = self._provider({"host": (True, NVSMI_TWO)})
         out = p.collect()
         assert [g["index"] for g in out] == [0, 1]
         assert out[0]["power"] == "285.10"
         assert "power" not in out[1]
         assert out[1]["mem_used"] == "512"
 
-    def test_docker_prefix_fallback_is_memoized(self):
-        p, calls = self._provider({("docker", "exec", "ollama"): (True, NVSMI_TWO)})
+    def test_container_fallback_is_memoized(self):
+        p, calls = self._provider({"container": (True, NVSMI_TWO)})
         assert len(p.collect()) == 2
         first = len(calls)
-        assert first == 2                     # host failed, then docker
+        assert first == 2                     # host failed, then container
         p.collect()
-        assert len(calls) == first + 1        # straight to the good prefix
-        assert calls[-1][:3] == ["docker", "exec", "ollama"]
+        assert len(calls) == first + 1        # straight to the good attempt
+        assert calls[-1][0] == "container"
+        assert calls[-1][1][0] == "nvidia-smi"
 
     def test_none_when_nothing_answers(self):
         p, _ = self._provider({})
