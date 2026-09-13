@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.10.0 — 2026-09-13
+
+### Added
+- **Intel GPU provider** (`IntelSysfsProvider`, Linux): i915/xe cards from
+  `/sys/class/drm` (vendor 0x8086), name from pci.ids, discrete VRAM total
+  from xe's `tile0/physical_vram_size_bytes`, integrated parts as unified
+  memory, hwmon temperature, power from the `energy1_input` delta when the
+  driver exposes no power reading, and the current GT frequency in the
+  card's header line. sysfs does not expose utilization or used VRAM to an
+  unprivileged user (that is what `intel_gpu_top` needs CAP_PERFMON for),
+  so those read N/A and the screen says so.
+- **Apple Silicon provider** (`AppleGpuProvider`, macOS): `ioreg -a -r -c
+  IOAccelerator` parsed with `plistlib` — "Device Utilization %" and "In use
+  system memory" from the AGX PerformanceStatistics, chip name from
+  `machdep.cpu.brand_string`, unified memory total from `hw.memsize`. No
+  root, no `powermetrics`; temperature and power are not available without
+  root and read N/A.
+
+### Caveat
+- Neither provider has been run on real hardware — no Arc, Xe or Apple
+  Silicon was available. Both are built from the kernel sysfs ABI docs and
+  the IOAccelerator keys other monitors read, and are covered by tests on
+  synthetic trees / plists. `MTOP_SYSFS_DRM` points the Intel provider at a
+  copy of a real tree; reports welcome.
+
 ## 0.9.0 — 2026-09-13
 
 ### Added

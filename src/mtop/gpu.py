@@ -31,8 +31,10 @@ import ctypes
 import glob
 import json
 import os
+import plistlib
 import re
 import sys
+import time
 from typing import Any
 from collections.abc import Callable
 
@@ -408,6 +410,237 @@ class NvidiaSmiProvider(GpuProvider):
                 return gpus
         self._good = None
         return None
+
+
+# ── Intel (i915 / xe) via sysfs ───────────────────────────────────────────────
+#
+# UNVERIFIED ON HARDWARE. Written from the kernel's sysfs ABI documentation
+# (Documentation/ABI/testing/sysfs-driver-intel-i915-hwmon, sysfs-driver-intel-xe-hwmon,
+# and the xe tile attributes) — no Arc or Xe was available to run it against.
+# Point MTOP_SYSFS_DRM at a copy of a real tree to test; bug reports welcome.
+#
+# What sysfs gives an unprivileged user, and what it does not:
+#   * memory total: xe exposes tile0/physical_vram_size_bytes for discrete
+#     parts; i915 has no unprivileged equivalent. A card with no known total
+#     is treated as an integrated GPU sharing system RAM (unified).
+#   * memory used: not exposed. Per-process figures live in
+#     /proc/<pid>/fdinfo (drm-total-vram0) for the caller's own processes
+#     only, which is not the Ollama server on a normal install.
+#   * utilization: not in sysfs; intel_gpu_top needs CAP_PERFMON. Reported
+#     as N/A. The current GT frequency is shown instead as a rough activity
+#     signal — it is not a percentage and is not drawn as one.
+#   * power: i915 hwmon exposes energy1_input (µJ), not power; watts are the
+#     delta between two samples. xe hwmon may expose power1_input directly.
+
+class IntelSysfsProvider(GpuProvider):
+    name = "intel-sysfs"
+
+    def __init__(self, clock: Callable[[], float] = time.monotonic,
+                 meminfo: Callable[[], tuple[int, int] | None] = meminfo_mib):
+        self._clock = clock
+        self._meminfo = meminfo
+        self._cards: list[str] | None = None
+        self._energy: dict[str, tuple[int, float]] = {}   # dev -> (µJ, t)
+
+    def _discover(self) -> list[str]:
+        cards: list[tuple[str, str]] = []
+        for entry in sorted(os.listdir(SYSFS_DRM)) if os.path.isdir(SYSFS_DRM) else []:
+            if not _CARD_RE.match(entry):
+                continue
+            dev = os.path.join(SYSFS_DRM, entry, "device")
+            if (_read(os.path.join(dev, "vendor")) or "").lower() != "0x8086":
+                continue
+            slot = ""
+            for line in (_read(os.path.join(dev, "uevent")) or "").splitlines():
+                if line.startswith("PCI_SLOT_NAME="):
+                    slot = line.split("=", 1)[1]
+            cards.append((slot or entry, dev))
+        cards.sort(key=lambda t: t[0])
+        return [dev for _, dev in cards]
+
+    @staticmethod
+    def _driver(dev: str) -> str:
+        for line in (_read(os.path.join(dev, "uevent")) or "").splitlines():
+            if line.startswith("DRIVER="):
+                return line.split("=", 1)[1].strip()
+        return ""
+
+    def _name_for(self, dev: str) -> str:
+        pci_id = ""
+        for line in (_read(os.path.join(dev, "uevent")) or "").splitlines():
+            if line.startswith("PCI_ID="):
+                pci_id = line.split("=", 1)[1].strip()
+        if pci_id and ":" in pci_id:
+            ven, devid = (x.lower() for x in pci_id.split(":", 1))
+            return pci_device_name(ven, devid) or f"Intel {pci_id}"
+        return "Intel GPU"
+
+    @staticmethod
+    def _vram_total(dev: str) -> int | None:
+        for pat in ("tile*/physical_vram_size_bytes",      # xe
+                    "lmem_total_bytes"):                   # defensive: not a known i915 attr
+            for path in sorted(glob.glob(os.path.join(dev, pat))):
+                v = _read_int(path)
+                if v:
+                    return v
+        return None
+
+    @staticmethod
+    def _freq_mhz(card_dir: str, dev: str) -> int | None:
+        for path in (os.path.join(card_dir, "gt", "gt0", "rps_cur_freq_mhz"),   # i915 >= 5.x
+                     os.path.join(card_dir, "gt_cur_freq_mhz"),                  # i915 legacy
+                     os.path.join(dev, "tile0", "gt0", "freq0", "cur_freq")):    # xe
+            v = _read_int(path)
+            if v is not None:
+                return v
+        return None
+
+    def _hwmon(self, dev: str) -> tuple[str, str | None]:
+        temp, power = "N/A", None
+        now = self._clock()
+        for hw in sorted(glob.glob(os.path.join(dev, "hwmon", "hwmon*"))):
+            for path in sorted(glob.glob(os.path.join(hw, "temp*_input"))):
+                mdeg = _read_int(path)
+                if mdeg is not None:
+                    temp = f"{mdeg / 1000:.0f}"
+                    break
+            uw = _read_int(os.path.join(hw, "power1_input"))
+            if uw is None:
+                uw = _read_int(os.path.join(hw, "power1_average"))
+            if uw is not None:
+                power = f"{uw / 1_000_000:.0f}"
+            else:
+                uj = _read_int(os.path.join(hw, "energy1_input"))
+                if uj is not None:
+                    prev = self._energy.get(hw)
+                    self._energy[hw] = (uj, now)
+                    if prev and now > prev[1] and uj >= prev[0]:
+                        power = f"{(uj - prev[0]) / 1e6 / (now - prev[1]):.0f}"
+            if temp != "N/A" or power is not None:
+                break
+        return temp, power
+
+    def collect(self) -> list[dict] | None:
+        if self._cards is None:
+            self._cards = self._discover()
+        if not self._cards:
+            self._cards = None
+            return None
+        out: list[dict] = []
+        for idx, dev in enumerate(self._cards):
+            card_dir = os.path.dirname(dev)
+            total = self._vram_total(dev)
+            temp, power = self._hwmon(dev)
+            gpu: dict = {
+                "vendor": "intel",
+                "index": idx,
+                "name": self._name_for(dev),
+                "util": "N/A",
+                "temp": temp,
+                "driver": self._driver(dev),
+                "sysfs": dev,
+            }
+            if total:
+                gpu["mem_used"] = "N/A"                 # not exposed unprivileged
+                gpu["mem_total"] = f"{total / (1 << 20):.0f}"
+            else:
+                mem = self._meminfo()
+                if mem:
+                    gpu["mem_used"], gpu["mem_total"] = str(mem[0]), str(mem[1])
+                else:
+                    gpu["mem_used"] = gpu["mem_total"] = "N/A"
+                gpu["unified"] = True
+            freq = self._freq_mhz(card_dir, dev)
+            if freq is not None:
+                gpu["freq_mhz"] = freq
+            if power is not None:
+                gpu["power"] = power
+            out.append(gpu)
+        return out or None
+
+
+# ── Apple Silicon via ioreg ───────────────────────────────────────────────────
+#
+# UNVERIFIED ON HARDWARE. Built from the IOAccelerator PerformanceStatistics
+# keys the AGX driver publishes (as read by tools like asitop and macmon):
+# "Device Utilization %", "Renderer Utilization %", "In use system memory".
+# `ioreg -a` prints an XML plist, which plistlib parses — no root, no
+# powermetrics. Temperature and power are not available without root and are
+# reported N/A; the GPU shares system RAM, so the memory total is hw.memsize.
+
+class AppleGpuProvider(GpuProvider):
+    name = "apple-ioreg"
+
+    def __init__(self, runner: Callable[..., tuple[bool, str]]):
+        self._run = runner
+        self._name: str | None = None
+        self._total_mib: int | None = None
+
+    def _chip_name(self) -> str:
+        if self._name is None:
+            ok, out = self._run(["sysctl", "-n", "machdep.cpu.brand_string"], 2)
+            self._name = out.strip() if ok and out.strip() else "Apple GPU"
+        return self._name
+
+    def _total(self) -> int | None:
+        if self._total_mib is None:
+            ok, out = self._run(["sysctl", "-n", "hw.memsize"], 2)
+            v = _to_float(out) if ok else None
+            self._total_mib = int(v / (1 << 20)) if v else 0
+        return self._total_mib or None
+
+    @staticmethod
+    def parse_ioreg(xml: bytes | str) -> list[dict]:
+        """IOAccelerator entries from `ioreg -a -r -c IOAccelerator -d 1`."""
+        data = xml.encode() if isinstance(xml, str) else xml
+        try:
+            root = plistlib.loads(data)
+        except Exception:
+            return []
+        entries = root if isinstance(root, list) else [root]
+        out = []
+        for e in entries:
+            if not isinstance(e, dict):
+                continue
+            stats = e.get("PerformanceStatistics")
+            if not isinstance(stats, dict):
+                continue
+            cls = str(e.get("IOClass", ""))
+            if not cls.startswith("AGX"):          # Apple silicon accelerators only
+                continue
+            out.append({
+                "class": cls,
+                "util": stats.get("Device Utilization %", stats.get("Renderer Utilization %")),
+                "in_use": stats.get("In use system memory"),
+                "cores": e.get("gpu-core-count"),
+            })
+        return out
+
+    def collect(self) -> list[dict] | None:
+        ok, out = self._run(["ioreg", "-a", "-r", "-c", "IOAccelerator", "-d", "1"], 3)
+        if not ok or not out:
+            return None
+        entries = self.parse_ioreg(out)
+        if not entries:
+            return None
+        total = self._total()
+        gpus = []
+        for idx, e in enumerate(entries):
+            name = self._chip_name()
+            if e.get("cores"):
+                name += f" ({e['cores']} cores)"
+            used = e.get("in_use")
+            gpus.append({
+                "vendor": "apple",
+                "index": idx,
+                "name": name,
+                "util": str(int(e["util"])) if e.get("util") is not None else "N/A",
+                "mem_used": f"{used / (1 << 20):.0f}" if used is not None else "N/A",
+                "mem_total": str(total) if total else "N/A",
+                "temp": "N/A",
+                "unified": True,
+            })
+        return gpus
 
 
 # ── NVML via ctypes ───────────────────────────────────────────────────────────

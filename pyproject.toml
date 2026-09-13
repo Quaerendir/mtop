@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ollama-mtop"
-version = "0.9.0"
+version = "0.10.0"
 description = "htop for Ollama — curses-based TUI monitor for models, GPU, and Docker containers"
 readme = "README.md"
 license = {text = "MIT"}
@@ -17,7 +17,7 @@ maintainers = [
 ]
 keywords = [
     "ollama", "monitor", "tui", "curses", "docker", "podman",
-    "gpu", "nvidia", "nvml", "amd", "rocm", "jetson", "prometheus", "llm", "inference",
+    "gpu", "nvidia", "nvml", "amd", "rocm", "intel", "arc", "apple", "metal", "jetson", "prometheus", "llm", "inference",
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -26,6 +26,7 @@ classifiers = [
     "Intended Audience :: System Administrators",
     "License :: OSI Approved :: MIT License",
     "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",

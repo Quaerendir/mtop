@@ -430,3 +430,130 @@ class TestNvml:
         # when NVML is absent, nvidia-smi still answers
         mon2 = gpu.GpuMonitor([gpu.NvmlProvider(loader=lambda: None), smi], lambda: 0.0)
         assert [g["name"] for g in mon2.collect()] == ["smi-card"]
+
+
+# ── Intel via a fake sysfs tree (no hardware available: ABI-doc driven) ──────
+
+def make_intel_card(root, name, *, slot, pci_id="8086:56A0", driver="xe",
+                    vram_total=None, freq=None, temp=None, energy=None, power=None):
+    dev = os.path.join(root, name, "device")
+    _write(f"{dev}/vendor", "0x8086\n")
+    _write(f"{dev}/uevent", f"DRIVER={driver}\nPCI_ID={pci_id}\nPCI_SLOT_NAME={slot}\n")
+    if vram_total is not None:
+        _write(f"{dev}/tile0/physical_vram_size_bytes", str(vram_total))
+    if freq is not None:
+        if driver == "xe":
+            _write(f"{dev}/tile0/gt0/freq0/cur_freq", str(freq))
+        else:
+            _write(f"{root}/{name}/gt/gt0/rps_cur_freq_mhz", str(freq))
+    hw = f"{dev}/hwmon/hwmon2"
+    if temp is not None:
+        _write(f"{hw}/temp1_input", str(temp))
+    if energy is not None:
+        _write(f"{hw}/energy1_input", str(energy))
+    if power is not None:
+        _write(f"{hw}/power1_input", str(power))
+    return dev
+
+
+@pytest.fixture
+def intel_pci_ids(tmp_path, monkeypatch):
+    p = tmp_path / "pci.ids"
+    p.write_text("8086  Intel Corporation\n\t56a0  DG2 [Arc A770]\n"
+                 "\ta7a0  Raptor Lake-P [Iris Xe Graphics]\n")
+    monkeypatch.setattr(gpu, "_PCI_IDS_PATHS", (str(p),))
+    monkeypatch.setattr(gpu, "_pci_ids_missing", False)
+    gpu._pci_name_cache.clear()
+
+
+class TestIntelSysfs:
+    def test_discrete_xe_card(self, sysfs, intel_pci_ids):
+        make_intel_card(sysfs, "card1", slot="0000:03:00.0", vram_total=16 << 30, freq=2100,
+                        temp=52000, power=95_000_000)
+        make_amd_card(sysfs, "card0", slot="0000:01:00.0", vram_total=1, vram_used=0,
+                      gtt_total=1, gtt_used=0)                      # other vendor: skipped
+        clock = [10.0]
+        g = gpu.IntelSysfsProvider(clock=lambda: clock[0]).collect()
+        assert len(g) == 1
+        g = g[0]
+        assert g["vendor"] == "intel" and g["name"] == "DG2 [Arc A770]"
+        assert g["driver"] == "xe" and g["mem_total"] == str(16 * 1024) and g["mem_used"] == "N/A"
+        assert "unified" not in g and g["util"] == "N/A"
+        assert g["freq_mhz"] == 2100 and g["temp"] == "52" and g["power"] == "95"
+
+    def test_igpu_is_unified_and_energy_becomes_power(self, sysfs, intel_pci_ids):
+        dev = make_intel_card(sysfs, "card0", slot="0000:00:02.0", pci_id="8086:A7A0",
+                              driver="i915", freq=900, energy=1_000_000_000)
+        clock = [100.0]
+        p = gpu.IntelSysfsProvider(clock=lambda: clock[0], meminfo=lambda: (4000, 32000))
+        g = p.collect()[0]
+        assert g["name"] == "Raptor Lake-P [Iris Xe Graphics]" and g["unified"] is True
+        assert g["mem_used"] == "4000" and g["mem_total"] == "32000"
+        assert g["freq_mhz"] == 900 and "power" not in g            # no delta yet
+        _write(f"{dev}/hwmon/hwmon2/energy1_input", str(1_000_000_000 + 15_000_000 * 2))
+        clock[0] = 102.0
+        assert p.collect()[0]["power"] == "15"                      # 30 J over 2 s
+
+    def test_no_intel_cards(self, sysfs):
+        assert gpu.IntelSysfsProvider().collect() is None
+
+    def test_unknown_device_id_falls_back_to_pci_id(self, sysfs, intel_pci_ids):
+        make_intel_card(sysfs, "card0", slot="0000:03:00.0", pci_id="8086:FFFF", vram_total=1 << 30)
+        assert gpu.IntelSysfsProvider().collect()[0]["name"] == "Intel 8086:FFFF"
+
+
+# ── Apple via canned ioreg plist (no hardware available) ─────────────────────
+
+IOREG_PLIST = """<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<array>
+  <dict>
+    <key>IOClass</key><string>AGXAcceleratorG14X</string>
+    <key>gpu-core-count</key><integer>38</integer>
+    <key>PerformanceStatistics</key>
+    <dict>
+      <key>Device Utilization %</key><integer>37</integer>
+      <key>Renderer Utilization %</key><integer>35</integer>
+      <key>In use system memory</key><integer>7516192768</integer>
+      <key>Alloc system memory</key><integer>8000000000</integer>
+    </dict>
+  </dict>
+  <dict>
+    <key>IOClass</key><string>IOAcceleratorSomethingElse</string>
+    <key>PerformanceStatistics</key><dict><key>Device Utilization %</key><integer>1</integer></dict>
+  </dict>
+</array>
+</plist>
+"""
+
+
+class TestAppleIoreg:
+    def _runner(self, table):
+        def run(cmd, timeout):
+            return table.get(cmd[0] if cmd[0] != "sysctl" else cmd[-1], (False, ""))
+        return run
+
+    def test_parse_and_collect(self):
+        run = self._runner({"ioreg": (True, IOREG_PLIST),
+                            "machdep.cpu.brand_string": (True, "Apple M2 Max\n"),
+                            "hw.memsize": (True, str(64 << 30))})
+        out = gpu.AppleGpuProvider(run).collect()
+        assert len(out) == 1
+        g = out[0]
+        assert g["vendor"] == "apple" and g["name"] == "Apple M2 Max (38 cores)"
+        assert g["util"] == "37" and g["unified"] is True
+        assert g["mem_used"] == "7168" and g["mem_total"] == str(64 * 1024)
+        assert g["temp"] == "N/A"
+
+    def test_no_agx_entries_or_ioreg_failure(self):
+        assert gpu.AppleGpuProvider(self._runner({})).collect() is None
+        plist = IOREG_PLIST.replace("AGXAcceleratorG14X", "IntelAccelerator")
+        run = self._runner({"ioreg": (True, plist)})
+        assert gpu.AppleGpuProvider(run).collect() is None
+        assert gpu.AppleGpuProvider.parse_ioreg("not a plist") == []
+
+    def test_missing_sysctl_values(self):
+        run = self._runner({"ioreg": (True, IOREG_PLIST)})
+        g = gpu.AppleGpuProvider(run).collect()[0]
+        assert g["name"] == "Apple GPU (38 cores)" and g["mem_total"] == "N/A"

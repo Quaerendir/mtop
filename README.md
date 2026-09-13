@@ -24,7 +24,7 @@ There are web dashboards, Prometheus exporters, and chat TUIs for Ollama. But th
 - **Which model on which card** — NVIDIA per-process VRAM via NVML (ctypes, no `nvidia-smi` fork) joined to the runner PIDs: a `GPU` column in RUNNERS and a `procs:` line under each card
 - **Loaded models** — name, VRAM/RAM split, context length, processor type, TTL countdown
 - **Container health** — status indicator (●/✗/○), uptime, CPU & memory with progress bars
-- **Multi-vendor GPU monitoring** — NVIDIA via NVML (`nvidia-smi` as fallback) *and* AMD via sysfs, side by side on the same host; utilization, VRAM/GTT, temperature, power draw
+- **Multi-vendor GPU monitoring** — NVIDIA via NVML (`nvidia-smi` as fallback), AMD and Intel via sysfs, Apple Silicon via `ioreg`; side by side on the same host; utilization, VRAM/GTT, temperature, power draw
 - **AMD without ROCm** — telemetry comes from `/sys/class/drm/card*/device`, so a bare `amdgpu` driver is enough; `rocm-smi` is only a fallback
 - **Jetson / Tegra / NVIDIA Spark** — automatic fallback to unified memory via `/proc/meminfo`
 - **Non-blocking UI** — all I/O (docker, nvidia-smi, HTTP) runs in a background collector thread; the interface stays responsive at 100 ms even when the API hangs, and stale data is flagged
@@ -209,11 +209,12 @@ OLLAMA PS (raw)
 | NVIDIA GB10 Spark | ✅ Unified memory | Tegra-based, same fallback |
 | Linux + AMD (amdgpu) | ✅ Full | sysfs — no ROCm install required |
 | AMD APU (780M, Strix) | ✅ Unified memory | GTT pool, not the tiny VRAM carve-out |
+| Linux + Intel (Arc / Xe / iGPU) | ⚠️ Partial, untested | sysfs: name, VRAM total (xe), temperature, power, frequency; no utilization without root |
 | Linux without GPU | ✅ (no GPU section) | Use `--no-gpu` to hide the section |
 | Ollama in Podman | ✅ Full | compat API on the Podman socket, or the `podman` CLI |
 | Bare-metal Ollama (systemd) | ✅ process stats | `--mode local`; CPU/MEM from `/proc`, no root needed |
 | Manual `ollama serve` | ✅ process stats | auto-detected via `/proc` cmdline scan |
-| macOS | ⚠️ Partial | `--mode local` monitors the process via `ps`/`sysctl`; GPU (Metal) not yet supported |
+| macOS (Apple Silicon) | ⚠️ Partial, untested | `--mode local` process stats via `ps`/`sysctl`; GPU utilization and in-use memory via `ioreg` (no root); no temperature/power without root |
 | WSL2 | ⚠️ Partial | Works if Docker + nvidia-container-toolkit configured |
 
 ## Requirements
@@ -227,7 +228,8 @@ OLLAMA PS (raw)
 
 - [ ] Record terminal sessions with `asciinema` for README gif
 - [x] AMD GPU support (sysfs first, `rocm-smi` fallback)
-- [ ] Apple Silicon GPU stats (via `powermetrics`)
+- [x] Apple Silicon GPU stats (via `ioreg`, no root — `powermetrics` needs sudo)
+- [x] Intel GPU stats via sysfs (partial: no utilization without CAP_PERFMON)
 - [ ] Model pull progress tracking
 - [x] Multi-host support (repeatable `-u`, per-endpoint model tables)
 - [x] Docker Engine API over the socket, Podman support

@@ -38,11 +38,12 @@ from typing import Any
 
 from .container import ContainerRuntime, detect_runtime
 from .export import parse_iso, parse_size, prometheus_text
-from .gpu import (AmdSysfsProvider, GpuMonitor, GpuProvider, NvidiaSmiProvider,
-                  NvmlProvider, RocmSmiProvider, TegraUnifiedProvider)
+from .gpu import (AmdSysfsProvider, AppleGpuProvider, GpuMonitor, GpuProvider,
+                  IntelSysfsProvider, NvidiaSmiProvider, NvmlProvider, RocmSmiProvider,
+                  TegraUnifiedProvider)
 from .logs import ContainerLogs, JournalLogs, LogSource, line_level, request_stats
 
-__version__ = "0.9.0"
+__version__ = "0.10.0"
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
 
@@ -71,6 +72,7 @@ C_ACCENT = 6
 C_TABLE_HDR = 7
 C_GPU = 8
 C_AMD = 9
+C_INTEL = 10
 
 
 def init_colors():
@@ -96,6 +98,7 @@ def init_colors():
     curses.init_pair(C_TABLE_HDR, curses.COLOR_WHITE, -1)
     curses.init_pair(C_GPU, curses.COLOR_GREEN, -1)
     curses.init_pair(C_AMD, curses.COLOR_RED, -1)
+    curses.init_pair(C_INTEL, curses.COLOR_BLUE, -1)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -1556,8 +1559,11 @@ class Collector(threading.Thread):
             providers += [
                 AmdSysfsProvider(),
                 RocmSmiProvider(run_cmd),
+                IntelSysfsProvider(),
                 TegraUnifiedProvider(read_unified_memory),
             ]
+        if IS_DARWIN:
+            providers.append(AppleGpuProvider(run_cmd))
         return providers
 
     def _gpu_read(self) -> list[dict] | None:
@@ -1881,7 +1887,7 @@ def render_gpu_stats(win, y: int, snap: dict) -> int:
 
     for i, gpu in enumerate(gpus):
         vendor = gpu.get("vendor", "nvidia")
-        color = C_AMD if vendor == "amd" else C_GPU
+        color = {"amd": C_AMD, "intel": C_INTEL}.get(vendor, C_GPU)
         # Index is the provider's own (nvidia-smi index / PCI order), which is
         # not the position in this list once two vendors are present.
         prefix = f"[{vendor}:{gpu.get('index', i)}] {gpu['name']}"
@@ -1889,6 +1895,8 @@ def render_gpu_stats(win, y: int, snap: dict) -> int:
         temp_str = f"  {gpu['temp']}°C" if temp_val is not None else ""
         if gpu.get("power") and to_float(gpu["power"]) is not None:
             temp_str += f"  {to_float(gpu['power']):.0f}W"
+        if gpu.get("freq_mhz") is not None:
+            temp_str += f"  {gpu['freq_mhz']} MHz"
         if gpu.get("unified"):
             temp_str += "  (unified memory)"
         y = safe_addstr(win, y, 3, prefix + temp_str, curses.color_pair(color))
@@ -1904,6 +1912,10 @@ def render_gpu_stats(win, y: int, snap: dict) -> int:
         # VRAM bar
         mem_used = to_float(gpu["mem_used"])
         mem_total = to_float(gpu["mem_total"])
+        if mem_used is None and mem_total:
+            # Intel discrete via sysfs: the total is known, usage is not.
+            y = safe_addstr(win, y, 5, f"VRAM  {mem_total:.0f} MiB total (usage not exposed)",
+                            curses.color_pair(C_DIM))
         if mem_used is not None and mem_total and mem_total > 0:
             mem_pct = mem_used / mem_total * 100
             label = "MEM  " if gpu.get("unified") else "VRAM "
