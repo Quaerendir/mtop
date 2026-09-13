@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.9.0 — 2026-09-13
+
+### Added
+- **LOGS section** (`l` to toggle, `--logs` to start with it, `--log-lines N`):
+  the tail of the server log from the container (Engine API
+  `/containers/{id}/logs` or `docker logs`) or from `journalctl -u
+  ollama.service` for the systemd unit. A manual `ollama serve` logs to its
+  own terminal and says so. Error lines and 4xx/5xx GIN lines are colored.
+- **Request stats from the GIN access log**, in the section title and in
+  `--json` (`logs.requests`) and `--prometheus` (`mtop_log_requests{
+  status_class}`, `mtop_log_request_latency_seconds{quantile}`): requests
+  in the last 60 s by status class, top paths, p50 and max latency.
+  Monitoring paths (`/api/ps`, `/api/version`, `/api/tags`, `/`) are
+  counted separately so mtop's own polling does not read as traffic. Line
+  timestamps come from the transport (docker `--timestamps`, journal
+  `short-iso`), which carry a zone; the GIN field does not. Tokens/s is not
+  in the log and stays out of scope — Ollama returns it to the caller only.
+- **Sparklines** next to the CPU, MEM, GPU UTIL and VRAM bars: one sample
+  per slow cycle (≥ 2 s), 240 kept, drawn with block characters between the
+  bar and the right-aligned detail so they are the first thing dropped on
+  a narrow terminal. Screen-only; not part of `--json`.
+- `mtop.logs` module; `logs()` on both container runtimes; `run_cmd(...,
+  merge_stderr=True)` because `docker logs` replays the container's stderr
+  — where Ollama logs — on our stderr.
+
 ## 0.8.0 — 2026-09-13
 
 ### Added

@@ -29,6 +29,8 @@ There are web dashboards, Prometheus exporters, and chat TUIs for Ollama. But th
 - **Jetson / Tegra / NVIDIA Spark** — automatic fallback to unified memory via `/proc/meminfo`
 - **Non-blocking UI** — all I/O (docker, nvidia-smi, HTTP) runs in a background collector thread; the interface stays responsive at 100 ms even when the API hangs, and stale data is flagged
 - **Interactive** — `q` to quit, `+`/`-` to adjust refresh interval, `o` to toggle raw `ollama ps`
+- **Log panel with request stats** — tail of the container log or `journalctl`, with requests/minute, status classes and p50 latency parsed from Ollama's GIN access log (`l` to toggle, `--logs`)
+- **Sparklines** — CPU, MEM, GPU utilization and VRAM history next to each bar, block characters, stdlib `deque`
 - **Scriptable** — `--json` one-shot mode for cron or Ansible facts (exit code 1 on unhealthy); `--json --watch` streams NDJSON
 - **Prometheus exporter without a port** — `--prometheus` prints text exposition format; `--prometheus --watch -o …/textfile/mtop.prom` keeps a node_exporter textfile fresh with atomic writes, no cron needed
 - **API-only mode** — `--no-docker` for monitoring remote Ollama instances without local docker calls
@@ -104,6 +106,9 @@ Options:
       --no-gpu           Disable GPU monitoring section
       --no-runners       Hide the RUNNERS section (effective inference config)
       --no-env           Hide the SERVER CONFIG section (OLLAMA_* environment)
+      --logs             Show the LOGS section from the start (toggle with l); adds
+                         `logs` with request stats to --json / --prometheus
+      --log-lines N      Log lines to show (default: 8)
       --no-docker        API-only mode: skip all docker calls (remote instances)
       --json             Print one snapshot as JSON and exit (exit 1 on unhealthy)
       --prometheus       Print one snapshot in Prometheus text exposition format and exit
@@ -171,6 +176,7 @@ mtop
 | `o` | Toggle raw `ollama ps` section |
 | `r` | Toggle the `RUNNERS` section |
 | `e` | Toggle the `SERVER CONFIG` section |
+| `l` | Toggle the `LOGS` section (container logs / journalctl, request stats) |
 
 ## Display Layout
 
@@ -227,12 +233,12 @@ OLLAMA PS (raw)
 - [x] Docker Engine API over the socket, Podman support
 - [x] Configurable layout (raw `ollama ps` toggle; more sections to follow)
 - [ ] Model actions — unload on keypress (`keep_alive: 0`), extend TTL
-- [ ] Sparkline history for CPU/GPU utilization (braille chars, stdlib deque)
+- [x] Sparkline history for CPU/GPU utilization (block chars, stdlib deque)
 - [x] systemd/bare-metal Ollama support (process stats via `/proc`, no Docker required)
-- [ ] Log panel (tail Ollama container logs)
+- [x] Log panel (container logs / journalctl) with request stats from the GIN log
 - [x] Effective inference config per runner (context, flash attention, KV dtype)
 - [x] Prometheus text exposition (`--prometheus`) and NDJSON streaming (`--watch`)
-- [ ] Request rate / tokens-per-second from Ollama API
+- [x] Request rate from the access log (tokens/s is per-response data Ollama returns only to the caller — not observable from outside)
 - [x] Effective server environment (`OLLAMA_*`) per source
 - [x] Runner → GPU mapping via NVML per-process memory
 

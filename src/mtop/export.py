@@ -220,6 +220,24 @@ def prometheus_text(snap: dict, version: str, now: float | None = None) -> str:
             if r.get("gpu_mem_mib"):
                 w.sample("mtop_runner_gpu_memory_bytes", lbl, r["gpu_mem_mib"] * (1 << 20))
 
+    # ── request log ──
+    req = (snap.get("logs") or {}).get("requests")
+    if req:
+        win = req.get("window_sec", 60)
+        w.metric("mtop_log_requests", f"API requests seen in the log over the last {int(win)}s, "
+                                      "by HTTP status class")
+        for cls, n in sorted((req.get("by_status") or {}).items()):
+            w.sample("mtop_log_requests", {**base, "status_class": cls}, n)
+        if not req.get("by_status"):
+            w.sample("mtop_log_requests", {**base, "status_class": "none"}, 0)
+        w.metric("mtop_log_request_latency_seconds",
+                 "Request latency from the log over the window (quantile label: p50, max)")
+        if req.get("latency_p50") is not None:
+            w.sample("mtop_log_request_latency_seconds", {**base, "quantile": "p50"},
+                     req["latency_p50"])
+            w.sample("mtop_log_request_latency_seconds", {**base, "quantile": "max"},
+                     req["latency_max"])
+
     # ── gpus ──
     gpus = snap.get("gpus") or []
     if gpus:

@@ -184,7 +184,7 @@ def _args(**kw):
     base = {"container": "ollama", "api_url": "http://localhost:11434", "interval": 1.0,
             "no_gpu": True, "mode": "api", "no_runners": False, "runtime": "auto",
             "no_env": False, "endpoints": None, "json": False, "prometheus": False,
-            "watch": False, "output": None}
+            "watch": False, "output": None, "logs": False, "log_lines": 8}
     base.update(kw)
     return argparse.Namespace(**base)
 

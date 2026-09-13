@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ollama-mtop"
-version = "0.8.0"
+version = "0.9.0"
 description = "htop for Ollama — curses-based TUI monitor for models, GPU, and Docker containers"
 readme = "README.md"
 license = {text = "MIT"}

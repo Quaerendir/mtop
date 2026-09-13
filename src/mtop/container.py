@@ -90,6 +90,10 @@ class ContainerRuntime:
     def exec(self, container: str, cmd: list[str], timeout: int = 5) -> tuple[bool, str]:
         raise NotImplementedError
 
+    def logs(self, container: str, tail: int = 100) -> tuple[bool, str]:
+        """Last `tail` lines of stdout+stderr, each prefixed with an RFC3339 stamp."""
+        raise NotImplementedError
+
 
 # ── Engine API over unix / tcp socket ─────────────────────────────────────────
 
@@ -277,6 +281,21 @@ class DockerApi(ContainerRuntime):
             "mem_limit_bytes": int(m_limit),
         }
 
+    def logs(self, container: str, tail: int = 100) -> tuple[bool, str]:
+        try:
+            status, raw = self.request(
+                "GET", f"/containers/{urllib.parse.quote(container)}/logs"
+                       f"?stdout=1&stderr=1&timestamps=1&tail={int(tail)}", timeout=5)
+        except (OSError, http.client.HTTPException) as e:
+            return False, str(e) or e.__class__.__name__
+        if status != 200:
+            return False, f"logs failed: HTTP {status}"
+        out, err = demux_stream(raw)
+        # Ollama logs to stderr; merge both streams in arrival order is not
+        # possible after demux, so stderr (the log) comes last — the tail
+        # ordering is what matters and each stream is internally ordered.
+        return True, (out + err).decode("utf-8", "replace")
+
     def exec(self, container: str, cmd: list[str], timeout: int = 5) -> tuple[bool, str]:
         """Create + start an exec, demux its output, read the exit code."""
         try:
@@ -361,6 +380,12 @@ class DockerCli(ContainerRuntime):
 
     def exec(self, container: str, cmd: list[str], timeout: int = 5) -> tuple[bool, str]:
         return self._run([self.binary, "exec", container, *cmd], timeout=timeout)
+
+    def logs(self, container: str, tail: int = 100) -> tuple[bool, str]:
+        # The container's stderr (where Ollama logs) comes out on *our*
+        # stderr, so the runner must merge the two streams.
+        return self._run([self.binary, "logs", "--timestamps", "--tail", str(int(tail)),
+                          container], timeout=5, merge_stderr=True)
 
 
 # ── discovery ─────────────────────────────────────────────────────────────────

@@ -31,6 +31,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import deque
 from collections.abc import Iterable
 from datetime import datetime, timezone
 from typing import Any
@@ -39,8 +40,9 @@ from .container import ContainerRuntime, detect_runtime
 from .export import parse_iso, parse_size, prometheus_text
 from .gpu import (AmdSysfsProvider, GpuMonitor, GpuProvider, NvidiaSmiProvider,
                   NvmlProvider, RocmSmiProvider, TegraUnifiedProvider)
+from .logs import ContainerLogs, JournalLogs, LogSource, line_level, request_stats
 
-__version__ = "0.8.0"
+__version__ = "0.9.0"
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
 
@@ -54,6 +56,9 @@ SLOW_FLOOR = 2.0          # minimum cadence for docker stats / nvidia-smi
 STALE_FACTOR = 3.0        # snapshot older than interval*factor => flagged stale
 JSON_CPU_WINDOW = 0.5     # --json: seconds between the two /proc CPU samples
 FOREVER_AFTER_SEC = 10 * 365 * 86400   # expires_at this far out == keep_alive -1
+HISTORY_LEN = 240         # sparkline samples kept (one per slow cycle, >= 2 s each)
+LOG_FETCH = 200           # log lines fetched per slow cycle (request stats window)
+DEFAULT_LOG_LINES = 8     # log lines shown on screen
 
 # ── Color pairs (initialized in curses_main) ─────────────────────────────────
 
@@ -108,14 +113,20 @@ def normalize_api_url(url: str) -> str:
 
 
 def run_cmd(cmd: list[str], timeout: int = 5,
-            env: dict[str, str] | None = None) -> tuple[bool, str]:
-    """Run a command, return (success, stdout_or_stderr)."""
+            env: dict[str, str] | None = None,
+            merge_stderr: bool = False) -> tuple[bool, str]:
+    """Run a command, return (success, stdout_or_stderr).
+
+    merge_stderr: interleave stderr into the returned text (docker logs
+    replays the container's stderr — where Ollama logs — on our stderr).
+    """
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
-                           env=env)
+        r = subprocess.run(cmd, text=True, timeout=timeout, env=env,
+                           stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT if merge_stderr else subprocess.PIPE)
         if r.returncode == 0:
             return True, r.stdout.strip()
-        return False, r.stderr.strip() or r.stdout.strip()
+        return False, (r.stderr or "").strip() or r.stdout.strip()
     except subprocess.TimeoutExpired:
         return False, "timeout"
     except FileNotFoundError:
@@ -941,9 +952,18 @@ class Collector(threading.Thread):
                  show_gpu: bool, mode: str = "auto", show_raw_ps: bool = False,
                  show_runners: bool = True, runtime: str = "auto",
                  container_runtime: ContainerRuntime | None = None,
-                 show_env: bool = True, endpoints: list[Endpoint] | None = None):
+                 show_env: bool = True, endpoints: list[Endpoint] | None = None,
+                 show_logs: bool = False, log_lines: int = DEFAULT_LOG_LINES):
         super().__init__(daemon=True, name="mtop-collector")
         self.show_env = show_env
+        self.show_logs = show_logs
+        self.log_lines = log_lines
+        self._log_source: LogSource | None = None
+        self._log_mode: str | None = None       # mode the source was built for
+        self._logs: dict | None = None
+        # Sparkline history, one sample per slow cycle. Keys: "cpu", "mem",
+        # and "gpu:<vendor>:<index>:<util|mem>".
+        self._history: dict[str, deque] = {}
         self.container = container
         self.runtime_pref = runtime         # auto | api | cli
         self._runtime: ContainerRuntime | None = container_runtime
@@ -1125,6 +1145,7 @@ class Collector(threading.Thread):
             if self.show_gpu:
                 self._gpu_cache = self._gpu_read()
             self._server = self._server_info(mode, snap.get("pid"))
+            self._logs = self._read_logs(mode) if self.show_logs else None
             self._slow_ts = now
 
         if slow_due and mode == "docker":
@@ -1135,6 +1156,11 @@ class Collector(threading.Thread):
                            else (self._res_stats or {}).get("runners"))
         snap["gpus"] = self._gpu_cache if self.show_gpu else None
         snap["server"] = self._server
+        if slow_due:
+            self._record_history(snap)
+        snap["history"] = {k: list(v) for k, v in self._history.items()}
+        if self.show_logs:
+            snap["logs"] = self._logs
 
         results = self._fetch_models()
         primary = results[0]
@@ -1185,6 +1211,55 @@ class Collector(threading.Thread):
         pairs = (self._pool.map(one, self.endpoints) if self._pool is not None
                  else [one(self.endpoints[0])])
         self._versions.update(dict(pairs))
+
+    def _record_history(self, snap: dict) -> None:
+        def push(key: str, value: float | None) -> None:
+            if value is None:
+                return
+            self._history.setdefault(key, deque(maxlen=HISTORY_LEN)).append(round(value, 1))
+
+        stats = snap.get("res_stats") or {}
+        if stats:
+            cpu_raw = stats.get("cpu_pct")
+            if cpu_raw is None:
+                cpu_raw = to_float(str(stats.get("cpu", "")).rstrip("%"))
+            ncpu = snap.get("cpu_limit") or host_cpu_count()
+            push("cpu", min(cpu_raw / ncpu, 100.0) if cpu_raw is not None else None)
+            push("mem", to_float(str(stats.get("mem_pct", "")).rstrip("%")))
+        for g in snap.get("gpus") or []:
+            key = f"gpu:{g.get('vendor')}:{g.get('index')}"
+            push(key + ":util", to_float(g.get("util")))
+            used, total = to_float(g.get("mem_used")), to_float(g.get("mem_total"))
+            push(key + ":mem", used / total * 100.0 if used is not None and total else None)
+
+    def _build_log_source(self, mode: str) -> LogSource | None:
+        if mode == "docker" and self.runtime is not None:
+            return ContainerLogs(self.runtime, self.container)
+        if mode == "local" and IS_LINUX and systemd_ollama() is not None:
+            return JournalLogs(run_cmd)
+        return None
+
+    def _read_logs(self, mode: str) -> dict:
+        """Tail the server log; request stats over the fetched lines."""
+        if self._log_source is None or self._log_mode != mode:
+            self._log_source = self._build_log_source(mode)
+            self._log_mode = mode
+        src = self._log_source
+        if src is None:
+            why = ("a manual `ollama serve` logs to its own terminal" if mode == "local"
+                   else "no log source in api mode")
+            return {"source": None, "ok": False, "error": why, "lines": [], "requests": None}
+        ok, res = src.tail(max(LOG_FETCH, self.log_lines))
+        if not ok:
+            return {"source": src.name, "ok": False, "error": str(res), "lines": [],
+                    "requests": None}
+        lines = res
+        return {
+            "source": src.name, "ok": True, "error": "",
+            "lines": [{"ts": ts, "text": text, "level": line_level(text)}
+                      for ts, text in lines[-self.log_lines:]],
+            "requests": request_stats(lines),
+        }
 
     def _server_info(self, mode: str, pid: int | None) -> dict:
         """Ollama version + the inference-relevant environment it was started with."""
@@ -1608,6 +1683,34 @@ def draw_bar(win, y: int, x: int, label: str, value: float, width: int = 20,
     return y + 1
 
 
+SPARK_CHARS = "▁▂▃▄▅▆▇█"
+
+
+def sparkline(values: list[float], width: int, vmax: float = 100.0) -> str:
+    """Last `width` values as block characters, 8 levels, 0..vmax."""
+    vals = list(values)[-width:]
+    out = []
+    for v in vals:
+        level = 0 if v <= 0 else min(7, int(v / vmax * 8))
+        out.append(SPARK_CHARS[level])
+    return "".join(out)
+
+
+def draw_spark(win, y: int, x: int, right: int, values: list[float] | None,
+               attr=0, min_width: int = 8) -> None:
+    """Sparkline between x and `right` (exclusive), or nothing if too narrow.
+
+    Sits between the bar and the right-aligned detail text, so on a narrow
+    terminal it is the first thing to go — the bar and the number stay.
+    """
+    if not values:
+        return
+    width = right - x
+    if width < min_width:
+        return
+    safe_addstr(win, y, x, sparkline(values, width), attr)
+
+
 def bar_end_x(x: int, label: str, width: int) -> int:
     """Rightmost column a draw_bar() occupies (bracket + ' 100.0%')."""
     return x + len(label) + width + 2 + 7
@@ -1738,9 +1841,13 @@ def render_resources(win, y: int, snap: dict) -> int:
         cpu_detail = f"{cpu_raw:.0f}% / {int(ncpu)} cores"
     else:
         cpu_detail = f"{cpu_raw:.0f}% / {ncpu:.1f} cores"
+    hist = snap.get("history") or {}
+    _, max_x = win.getmaxyx()
     y = draw_bar(win, y, 3, "CPU  ", cpu_normalized, 30, C_ACCENT)
     draw_detail_right(win, y - 1, bar_end_x(3, "CPU  ", 30), cpu_detail,
                       curses.color_pair(C_DIM))
+    draw_spark(win, y - 1, bar_end_x(3, "CPU  ", 30) + 2,
+               max_x - len(cpu_detail) - 4, hist.get("cpu"), curses.color_pair(C_ACCENT))
 
     mem_val = to_float(str(stats["mem_pct"]).rstrip("%")) or 0.0
     y = draw_bar(win, y, 3, "MEM  ", mem_val, 30, C_OK)
@@ -1752,6 +1859,8 @@ def render_resources(win, y: int, snap: dict) -> int:
         mem_detail += f" ({kind})"
     draw_detail_right(win, y - 1, bar_end_x(3, "MEM  ", 30), mem_detail,
                       curses.color_pair(C_DIM))
+    draw_spark(win, y - 1, bar_end_x(3, "MEM  ", 30) + 2,
+               max_x - len(mem_detail) - 4, hist.get("mem"), curses.color_pair(C_OK))
 
     y += 1
     return y
@@ -1760,6 +1869,8 @@ def render_resources(win, y: int, snap: dict) -> int:
 def render_gpu_stats(win, y: int, snap: dict) -> int:
     """Render GPU info section."""
     gpus = snap.get("gpus")
+    hist = snap.get("history") or {}
+    _, max_x = win.getmaxyx()
     y = section_header(win, y, " GPU ")
 
     if gpus is None:
@@ -1782,10 +1893,13 @@ def render_gpu_stats(win, y: int, snap: dict) -> int:
             temp_str += "  (unified memory)"
         y = safe_addstr(win, y, 3, prefix + temp_str, curses.color_pair(color))
 
+        hkey = f"gpu:{vendor}:{gpu.get('index', i)}"
         # GPU utilization bar
         util_val = to_float(gpu["util"])
         if util_val is not None:
             y = draw_bar(win, y, 5, "UTIL ", util_val, 25, color)
+            draw_spark(win, y - 1, bar_end_x(5, "UTIL ", 25) + 2, max_x - 2,
+                       hist.get(hkey + ":util"), curses.color_pair(color))
 
         # VRAM bar
         mem_used = to_float(gpu["mem_used"])
@@ -1797,6 +1911,9 @@ def render_gpu_stats(win, y: int, snap: dict) -> int:
             vram_str = f"{mem_used:.0f} / {mem_total:.0f} MiB"
             draw_detail_right(win, y - 1, bar_end_x(5, label, 25), vram_str,
                               curses.color_pair(C_DIM))
+            draw_spark(win, y - 1, bar_end_x(5, label, 25) + 2,
+                       max_x - len(vram_str) - 4, hist.get(hkey + ":mem"),
+                       curses.color_pair(color))
 
         # Compute processes on the card (NVML): runner names when we know them.
         procs = gpu.get("procs") or []
@@ -2006,9 +2123,51 @@ def render_server_config(win, y: int, snap: dict) -> int:
     return y + 1
 
 
+def format_request_stats(req: dict | None) -> str:
+    """'12 req/60s · 11×2xx 1×5xx · p50 1.2s' — or '' when nothing to say."""
+    if not req:
+        return ""
+    if not req.get("total"):
+        return f"no requests in last {int(req.get('window_sec', 60))}s"
+    parts = [f"{req['total']} req/{int(req.get('window_sec', 60))}s"]
+    classes = " ".join(f"{n}×{cls}" for cls, n in sorted(req.get("by_status", {}).items()))
+    if classes:
+        parts.append(classes)
+    if req.get("latency_p50") is not None:
+        parts.append(f"p50 {req['latency_p50']:.2g}s")
+    return " · ".join(parts)
+
+
+def render_logs(win, y: int, snap: dict) -> int:
+    """Tail of the server log with request stats in the section title (toggle: 'l')."""
+    logs = snap.get("logs")
+    if logs is None:
+        return y
+    src = logs.get("source")
+    stats = format_request_stats(logs.get("requests"))
+    title = " LOGS" + (f" · {src}" if src else "") + (f" · {stats}" if stats else "") + " "
+    y = section_header(win, y, title)
+    if not logs.get("ok"):
+        y = safe_addstr(win, y, 3, f"logs unavailable: {logs.get('error', '?')}",
+                        curses.color_pair(C_DIM) | curses.A_DIM)
+        return y + 1
+    lines = logs.get("lines") or []
+    if not lines:
+        y = safe_addstr(win, y, 3, "(empty)", curses.color_pair(C_DIM) | curses.A_DIM)
+        return y + 1
+    attrs = {"error": curses.color_pair(C_ERR), "warn": curses.color_pair(C_WARN)}
+    for ln in lines:
+        ts = ln.get("ts")
+        stamp = datetime.fromtimestamp(ts).strftime("%H:%M:%S ") if ts else ""
+        safe_addstr(win, y, 3, stamp, curses.color_pair(C_DIM))
+        y = safe_addstr(win, y, 3 + len(stamp), ln.get("text", ""),
+                        attrs.get(ln.get("level"), curses.color_pair(C_DIM)))
+    return y + 1
+
+
 def render_footer(win, interval: float, raw_ps: bool, can_raw_ps: bool,
                   runners: bool = True, runtime: str | None = None,
-                  env: bool = True):
+                  env: bool = True, logs: bool = False):
     max_y, max_x = win.getmaxyx()
     footer_y = max_y - 1
     parts = ["q: quit", f"+/-: interval ({interval:.1f}s)"]
@@ -2016,6 +2175,7 @@ def render_footer(win, interval: float, raw_ps: bool, can_raw_ps: bool,
         parts.append(f"o: raw ps [{'on' if raw_ps else 'off'}]")
         parts.append(f"r: runners [{'on' if runners else 'off'}]")
         parts.append(f"e: env [{'on' if env else 'off'}]")
+        parts.append(f"l: logs [{'on' if logs else 'off'}]")
     if runtime:
         parts.append(f"via {runtime}")
     parts.append(f"mtop v{__version__}")
@@ -2047,6 +2207,8 @@ def curses_main(stdscr, args):
         runtime=args.runtime,
         show_env=not args.no_env,
         endpoints=args.endpoints,
+        show_logs=args.logs,
+        log_lines=args.log_lines,
     )
     collector.start()
 
@@ -2066,6 +2228,9 @@ def curses_main(stdscr, args):
                     collector.show_runners = not collector.show_runners
                 elif key == ord("e"):
                     collector.show_env = not collector.show_env
+                elif key == ord("l"):
+                    collector.show_logs = not collector.show_logs
+                    collector.force_slow()      # fetch on the next cycle, not in 2 s
                 elif key == curses.KEY_RESIZE:
                     stdscr.erase()
             except curses.error:
@@ -2108,10 +2273,12 @@ def curses_main(stdscr, args):
                     y = render_server_config(stdscr, y, snap)
                 if collector.show_raw_ps and "raw_ps" in snap:
                     y = render_ollama_ps(stdscr, y, snap)
+                if collector.show_logs and "logs" in snap:
+                    y = render_logs(stdscr, y, snap)
 
             render_footer(stdscr, collector.interval, collector.show_raw_ps,
                           mode in ("docker", "local"), collector.show_runners,
-                          snap.get("runtime"), collector.show_env)
+                          snap.get("runtime"), collector.show_env, collector.show_logs)
             stdscr.refresh()
     finally:
         collector.stop()
@@ -2167,6 +2334,8 @@ def headless_main(args) -> int:
         runtime=args.runtime,
         show_env=not args.no_env,
         endpoints=args.endpoints,
+        show_logs=args.logs,
+        log_lines=args.log_lines,
     )
     fmt = "prometheus" if args.prometheus else "json"
     watch = bool(args.watch)
@@ -2174,6 +2343,7 @@ def headless_main(args) -> int:
     def render(snap: dict) -> str:
         snap = dict(snap)
         snap.pop("ts", None)  # monotonic value is meaningless outside the process
+        snap.pop("history", None)  # screen-only ring buffer
         if fmt == "prometheus":
             return prometheus_text(snap, __version__)
         if watch:
@@ -2212,7 +2382,8 @@ def headless_main(args) -> int:
 
 def json_main(args) -> int:
     """Kept for callers of the pre-0.8 name."""
-    for attr, default in (("prometheus", False), ("watch", False), ("output", None)):
+    for attr, default in (("prometheus", False), ("watch", False), ("output", None),
+                          ("logs", False), ("log_lines", DEFAULT_LOG_LINES)):
         if not hasattr(args, attr):
             setattr(args, attr, default)
     return headless_main(args)
@@ -2223,7 +2394,7 @@ def main():
         description="mtop — Ollama model monitor for Docker containers",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Keys: q=quit, +=faster, -=slower, o=toggle raw ollama ps, "
-               "r=toggle runners, e=toggle server config\n\n"
+               "r=toggle runners, e=toggle server config, l=toggle logs\n\n"
                "https://github.com/Quaerendir/mtop",
     )
     parser.add_argument("-c", "--container", default=DEFAULT_CONTAINER,
@@ -2262,6 +2433,12 @@ def main():
     parser.add_argument("--no-env", action="store_true",
                         help="Hide the SERVER CONFIG section (OLLAMA_* environment "
                              "the server was started with)")
+    parser.add_argument("--logs", action="store_true",
+                        help="Show the LOGS section from the start (container logs or "
+                             "journalctl), with request counts parsed from the GIN lines. "
+                             "Toggle at runtime with 'l'. Also adds `logs` to --json")
+    parser.add_argument("--log-lines", type=int, default=DEFAULT_LOG_LINES, metavar="N",
+                        help=f"Log lines to show (default: {DEFAULT_LOG_LINES})")
     parser.add_argument("--no-docker", action="store_true",
                         help="Alias for --mode api (kept for compatibility)")
     parser.add_argument("--json", action="store_true",
