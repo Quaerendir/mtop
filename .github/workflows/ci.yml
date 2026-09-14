@@ -87,6 +87,7 @@ jobs:
       - run: twine check dist/*
       - name: tag must match the package version
         run: |
-          v=$(python -c "import re;print(re.search(r'\"([^\"]+)\"', open('src/mtop/_version.py').read()).group(1))")
+          v=$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' src/mtop/_version.py)
+          test -n "$v" || { echo "no __version__ in src/mtop/_version.py"; exit 1; }
           test "refs/tags/v$v" = "${{ github.ref }}" || { echo "tag ${{ github.ref }} != v$v"; exit 1; }
       - uses: pypa/gh-action-pypi-publish@release/v1
