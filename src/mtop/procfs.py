@@ -190,6 +190,50 @@ def find_ollama_pid(port: int | None = None) -> int | None:
     return min(pids, key=proc_starttime_ticks)
 
 
+def find_llama_swap_pids() -> list[int]:
+    """Every `llama-swap` PID visible in /proc (Linux only), unordered.
+
+    Unlike Ollama, llama-swap is a single self-contained binary with no
+    `serve` subcommand to disambiguate from a client — any process whose
+    argv[0] basename is 'llama-swap' is the server itself.
+    """
+    pids: list[int] = []
+    if not os.path.isdir("/proc"):
+        return pids
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        args = read_proc_cmdline(int(entry))
+        if not args:
+            continue
+        if os.path.basename(args[0]) == "llama-swap":
+            pids.append(int(entry))
+    return pids
+
+
+def find_llama_swap_pid(port: int | None = None) -> int | None:
+    """Find the llama-swap proxy PID. See `find_ollama_pid` for the tie-break
+    rule when several are running (socket ownership, else oldest)."""
+    if IS_DARWIN:
+        ok, out = run_cmd(["pgrep", "-x", "llama-swap"], timeout=2)
+        if ok and out.strip():
+            first = out.split()[0]
+            return int(first) if first.isdigit() else None
+        return None
+
+    pids = find_llama_swap_pids()
+    if not pids:
+        return None
+    if len(pids) == 1:
+        return pids[0]
+    if port:
+        inodes = listening_inodes(port)
+        for pid in sorted(pids):
+            if pid_owns_socket(pid, inodes):
+                return pid
+    return min(pids, key=proc_starttime_ticks)
+
+
 def parse_systemd_show(out: str) -> tuple[str, int, float | None] | None:
     """Normalize `systemctl show` output to (status, main_pid, cpu_limit).
 
@@ -227,6 +271,23 @@ def systemd_ollama() -> tuple[str, int, float | None] | None:
     """
     ok, out = run_cmd(
         ["systemctl", "show", "ollama.service",
+         "--property=ActiveState,SubState,MainPID,CPUQuotaPerSecUSec"],
+        timeout=3,
+    )
+    if not ok:
+        return None
+    return parse_systemd_show(out)
+
+
+def systemd_llama_swap() -> tuple[str, int, float | None] | None:
+    """Query the llama-swap systemd **user** unit (see systemd_ollama).
+
+    llama-swap is set up as `systemctl --user`, not a system unit — it runs
+    as the invoking user with no need for root, so this queries the user
+    manager (`systemctl --user`) rather than the system one.
+    """
+    ok, out = run_cmd(
+        ["systemctl", "--user", "show", "llama-swap.service",
          "--property=ActiveState,SubState,MainPID,CPUQuotaPerSecUSec"],
         timeout=3,
     )
@@ -379,8 +440,9 @@ def parse_systemd_environment(line: str) -> list[str]:
         return val.split()
 
 
-def systemd_environment(unit: str = "ollama.service") -> list[str] | None:
-    ok, out = run_cmd(["systemctl", "show", unit, "--property=Environment"], timeout=3)
+def systemd_environment(unit: str = "ollama.service", user: bool = False) -> list[str] | None:
+    cmd = ["systemctl"] + (["--user"] if user else []) + ["show", unit, "--property=Environment"]
+    ok, out = run_cmd(cmd, timeout=3)
     if not ok:
         return None
     for line in out.splitlines():

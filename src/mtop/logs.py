@@ -187,12 +187,14 @@ class JournalLogs(LogSource):
 
     name = "journalctl"
 
-    def __init__(self, runner: Runner, unit: str = "ollama.service"):
+    def __init__(self, runner: Runner, unit: str = "ollama.service", user: bool = False):
         self._run = runner
         self.unit = unit
+        self.user = user   # llama-swap is a `systemctl --user` unit, not a system one
 
     def tail(self, n: int):
-        ok, out = self._run(["journalctl", "-u", self.unit, "-n", str(n), "-o", "short-iso",
+        unit_flag = ["--user", "--user-unit", self.unit] if self.user else ["-u", self.unit]
+        ok, out = self._run(["journalctl", *unit_flag, "-n", str(n), "-o", "short-iso",
                              "--no-pager", "-q"], timeout=4)
         if not ok:
             return False, out or "journalctl failed"

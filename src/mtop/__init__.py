@@ -27,14 +27,16 @@ from .cli import (API_KEY_ENV, DEFAULT_API_BASE, DEFAULT_CONTAINER, DEFAULT_INTE
                   write_output)
 from .collector import (DEFAULT_LOG_LINES, HISTORY_LEN, JSON_CPU_WINDOW, LOG_FETCH, SLOW_FLOOR,
                         STALE_FACTOR, Collector)
-from .procfs import (find_ollama_pid, find_ollama_pids, host_cpu_count, listening_inodes,
+from .procfs import (find_llama_swap_pid, find_llama_swap_pids, find_ollama_pid,
+                     find_ollama_pids, host_cpu_count, listening_inodes,
                      parse_systemd_cpu_quota, parse_systemd_environment, parse_systemd_show,
                      pid_owns_socket, proc_children_map, proc_starttime_ticks, proc_uptime_sec,
                      process_tree, read_proc_cmdline, read_proc_cpu_ticks, read_proc_environ,
                      read_proc_ppid, read_proc_pss_bytes, read_proc_rss_bytes, read_unified_memory,
-                     systemd_environment, systemd_ollama, total_ram_bytes)
-from .runner import (ENV_PREFIXES, RUNNER_BASENAMES, inference_env, link_runners_to_gpus,
-                     match_runners_to_models, parse_runner_argv, processor_label)
+                     systemd_environment, systemd_llama_swap, systemd_ollama, total_ram_bytes)
+from .runner import (ENV_PREFIXES, RUNNER_BASENAMES, VLLM_BASENAMES, inference_env,
+                     link_runners_to_gpus, match_runners_to_models, match_vllm_runners_to_models,
+                     parse_runner_argv, parse_vllm_argv, processor_label)
 from .util import (CLK_TCK, FOREVER_AFTER_SEC, IS_DARWIN, IS_LINUX, Endpoint, api_port,
                    bytes_to_gib, fmt_duration, http_get_json, is_loopback_url, make_ssl_context,
                    normalize_api_url, parse_endpoint_arg, parse_header_arg, relative_time,
@@ -47,14 +49,16 @@ __all__ = [
     "JSON_SCHEMA_VERSION", "headless_main", "json_main", "snapshot_healthy", "write_output",
     "DEFAULT_LOG_LINES", "HISTORY_LEN", "JSON_CPU_WINDOW", "LOG_FETCH", "SLOW_FLOOR",
     "STALE_FACTOR",
-    "find_ollama_pid", "find_ollama_pids", "host_cpu_count", "listening_inodes",
+    "find_llama_swap_pid", "find_llama_swap_pids", "find_ollama_pid", "find_ollama_pids",
+    "host_cpu_count", "listening_inodes",
     "parse_systemd_cpu_quota", "parse_systemd_environment", "parse_systemd_show",
     "pid_owns_socket", "proc_children_map", "proc_starttime_ticks", "proc_uptime_sec",
     "process_tree", "read_proc_cmdline", "read_proc_cpu_ticks", "read_proc_environ",
     "read_proc_ppid", "read_proc_pss_bytes", "read_proc_rss_bytes", "read_unified_memory",
-    "systemd_environment", "systemd_ollama", "total_ram_bytes",
-    "ENV_PREFIXES", "RUNNER_BASENAMES", "inference_env", "link_runners_to_gpus",
-    "match_runners_to_models", "parse_runner_argv", "processor_label",
+    "systemd_environment", "systemd_llama_swap", "systemd_ollama", "total_ram_bytes",
+    "ENV_PREFIXES", "RUNNER_BASENAMES", "VLLM_BASENAMES", "inference_env",
+    "link_runners_to_gpus", "match_runners_to_models", "match_vllm_runners_to_models",
+    "parse_runner_argv", "parse_vllm_argv", "processor_label",
     "CLK_TCK", "FOREVER_AFTER_SEC", "IS_DARWIN", "IS_LINUX", "api_port", "bytes_to_gib",
     "fmt_duration", "http_get_json", "is_loopback_url", "make_ssl_context",
     "normalize_api_url", "parse_endpoint_arg", "parse_header_arg", "relative_time", "run_cmd",
