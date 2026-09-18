@@ -17,7 +17,8 @@ from typing import Any
 from .util import to_float
 
 ENV_PREFIXES = ("OLLAMA_", "CUDA_VISIBLE_DEVICES", "NVIDIA_VISIBLE_DEVICES",
-                "HIP_", "HSA_", "ROCR_", "GPU_DEVICE_ORDINAL", "GGML_", "LLAMA_")
+                "HIP_", "HSA_", "ROCR_", "GPU_DEVICE_ORDINAL", "GGML_", "LLAMA_",
+                "VLLM_", "TRITON_", "TIKTOKEN_", "HF_", "TORCH_")
 
 
 ENV_SECRET_MARKERS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "PASS")
@@ -195,6 +196,100 @@ def match_runners_to_models(runners: list[dict], models: list[dict]) -> None:
     rest = [r for r in runners if not r.get("model_name")]
     if len(rest) == 1 and len(unclaimed) == 1:
         _claim(rest[0], unclaimed[0])
+
+
+def match_vllm_runners_to_models(runners: list[dict], models: list[dict]) -> None:
+    """Join vLLM runners to llama-swap's model catalog by exact id.
+
+    Unlike Ollama's blob-digest problem, llama-swap already hands out the same
+    id on both sides — the config key is both the `--served-model-name` a
+    runner argv carries and the `name`/`id` the catalog lists — so this is a
+    plain lookup, no context-length heuristic needed.
+    """
+    by_name = {m.get("name"): m for m in models if m.get("name")}
+    for r in runners:
+        m = by_name.get(r.get("model_name"))
+        if m is not None:
+            r["state"] = m.get("state")
+            r["ttl"] = m.get("ttl")
+            r["description"] = m.get("description")
+
+
+# vLLM ships as a console-script, so argv[0] is the interpreter and the
+# script path (or the bare name when run from a PATH lookup) shows up one or
+# two slots later — 'vllm' immediately followed by its 'serve' subcommand is
+# the only reliable signature, same idea as RUNNER_BASENAMES for llama.cpp.
+VLLM_BASENAMES = {"vllm"}
+
+
+# argv flag -> (key, takes_value), for `vllm serve`. Unlike llama.cpp there is
+# no short-flag tradition here; vLLM's CLI is long-flags-only apart from a
+# handful of `-x` aliases for the most common ones.
+_VLLM_FLAGS: dict[str, tuple[str, bool]] = {
+    "--model": ("model", True),
+    "--served-model-name": ("served_model_name", True),
+    "--port": ("port", True),
+    "--host": ("host", True),
+    "--max-model-len": ("ctx", True),
+    "--gpu-memory-utilization": ("gpu_mem_util", True),
+    "--tensor-parallel-size": ("tp", True), "-tp": ("tp", True),
+    "--pipeline-parallel-size": ("pp", True), "-pp": ("pp", True),
+    "--dtype": ("dtype", True),
+    "--quantization": ("quantization", True), "-q": ("quantization", True),
+    "--kv-cache-dtype": ("kv_cache_dtype", True),
+    "--trust-remote-code": ("trust_remote_code", False),
+    "--enforce-eager": ("enforce_eager", False),
+}
+
+
+def _vllm_serve_index(args: list[str]) -> int | None:
+    """Index of the model-or-flags tail right after `vllm serve`, or None.
+
+    Handles both `vllm serve ...` (argv[0] is the script itself, e.g. run
+    through `exec`) and `python .../vllm serve ...` (argv[0] is the
+    interpreter, the script one slot later).
+    """
+    for i in (0, 1):
+        if i + 1 < len(args) and os.path.basename(args[i]) in VLLM_BASENAMES \
+                and args[i + 1] == "serve":
+            return i + 2
+    return None
+
+
+def parse_vllm_argv(args: list[str]) -> dict | None:
+    """Extract the effective inference config from a `vllm serve` argv.
+
+    Mirrors `parse_runner_argv` for the llama.cpp/Ollama runner: this is the
+    only place the negotiated settings (context length, GPU memory budget,
+    quantization, tensor parallel degree) are visible at all — vLLM's own
+    `/v1/models` says nothing beyond the served name.
+    """
+    start = _vllm_serve_index(args)
+    if start is None:
+        return None
+
+    out: dict[str, Any] = {"engine": "vllm"}
+    i = start
+    if i < len(args) and not args[i].startswith("-"):
+        # The positional model id, when not given via --model.
+        out.setdefault("model", args[i])
+        i += 1
+    while i < len(args):
+        spec = _VLLM_FLAGS.get(args[i])
+        if spec is None:
+            i += 1
+            continue
+        key, takes_value = spec
+        if not takes_value:
+            out[key] = True
+            i += 1
+            continue
+        if i + 1 < len(args):
+            out[key] = args[i + 1]
+        i += 2
+
+    out["model_name"] = out.get("served_model_name") or out.get("model", "")
+    return out
 
 
 def processor_label(size: int | float | None, size_vram: int | float | None) -> str:

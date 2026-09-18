@@ -22,11 +22,12 @@ from .gpu import (AmdSysfsProvider, AppleGpuProvider, GpuMonitor, GpuProvider,
                   IntelSysfsProvider, NvidiaSmiProvider, NvmlProvider, RocmSmiProvider,
                   TegraUnifiedProvider)
 from .logs import ContainerLogs, JournalLogs, LogSource, line_level, request_stats
-from .procfs import (find_ollama_pid, host_cpu_count, process_tree, proc_uptime_sec,
-                     read_proc_cmdline, read_proc_cpu_ticks, read_proc_environ,
+from .procfs import (find_llama_swap_pid, find_ollama_pid, host_cpu_count, process_tree,
+                     proc_uptime_sec, read_proc_cmdline, read_proc_cpu_ticks, read_proc_environ,
                      read_proc_pss_bytes, read_proc_rss_bytes, read_unified_memory,
-                     systemd_environment, systemd_ollama, total_ram_bytes)
-from .runner import inference_env, link_runners_to_gpus, match_runners_to_models, parse_runner_argv
+                     systemd_environment, systemd_llama_swap, systemd_ollama, total_ram_bytes)
+from .runner import (inference_env, link_runners_to_gpus, match_runners_to_models,
+                     match_vllm_runners_to_models, parse_runner_argv, parse_vllm_argv)
 from .util import (CLK_TCK, IS_DARWIN, IS_LINUX, Endpoint, api_port, fmt_duration,
                    is_loopback_url, relative_time, run_cmd, to_float)
 
@@ -57,6 +58,17 @@ class Collector(threading.Thread):
       api    — API only, no host resource stats (former --no-docker)
       auto   — probe docker first, then a local process, else api; the
                resolved mode is cached once a concrete source is found
+
+    ``backend`` selects the API dialect and, in ``local`` mode, which process
+    to look for:
+      ollama     — /api/ps + /api/version, systemd unit `ollama.service`,
+                   runner argv parsed as llama.cpp/Ollama flags
+      llama-swap — /v1/models + /running (no /api/version — llama-swap has
+                   none), systemd **user** unit `llama-swap.service`, runner
+                   argv parsed as `vllm serve` flags. Model matching is an
+                   exact id join (llama-swap's config key is the same string
+                   on both the catalog and the runner's --served-model-name),
+                   not Ollama's context-length heuristic.
     """
 
     def __init__(self, container: str, api_url: str, interval: float,
@@ -64,8 +76,10 @@ class Collector(threading.Thread):
                  show_runners: bool = True, runtime: str = "auto",
                  container_runtime: ContainerRuntime | None = None,
                  show_env: bool = True, endpoints: list[Endpoint] | None = None,
-                 show_logs: bool = False, log_lines: int = DEFAULT_LOG_LINES):
+                 show_logs: bool = False, log_lines: int = DEFAULT_LOG_LINES,
+                 backend: str = "ollama"):
         super().__init__(daemon=True, name="mtop-collector")
+        self.backend = backend              # ollama | llama-swap
         self.show_env = show_env
         self.show_logs = show_logs
         self.log_lines = log_lines
@@ -211,7 +225,15 @@ class Collector(threading.Thread):
             return True
         return snap.get("mode") == "docker" and str(snap.get("runtime", "")).endswith("-api")
 
+    def _parse_argv(self, args: list[str]) -> dict | None:
+        """Runner-argv parser for the active backend (see class docstring)."""
+        return parse_vllm_argv(args) if self.backend == "llama-swap" else parse_runner_argv(args)
+
     def _detect_local(self) -> bool:
+        if self.backend == "llama-swap":
+            if IS_LINUX and systemd_llama_swap() is not None:
+                return True
+            return find_llama_swap_pid(self.api_port) is not None
         if IS_LINUX and systemd_ollama() is not None:
             return True
         return find_ollama_pid(self.api_port) is not None
@@ -238,6 +260,7 @@ class Collector(threading.Thread):
             "container": self.container,
             "api_url": self.api_url,
             "mode": mode,
+            "backend": self.backend,
         }
         if mode == "docker":
             snap["runtime"] = self.runtime.name if self.runtime else None
@@ -302,10 +325,13 @@ class Collector(threading.Thread):
         snap["models_err"] = primary["models_err"]
         snap["endpoints"] = results
         if snap.get("runners") and snap["models"]:
-            match_runners_to_models(snap["runners"], snap["models"])
+            if self.backend == "llama-swap":
+                match_vllm_runners_to_models(snap["runners"], snap["models"])
+            else:
+                match_runners_to_models(snap["runners"], snap["models"])
         link_runners_to_gpus(snap.get("runners"), snap.get("gpus"))
 
-        if self.show_raw_ps and mode in ("docker", "local"):
+        if self.show_raw_ps and mode in ("docker", "local") and self.backend == "ollama":
             if mode == "docker" and self.runtime is not None:
                 ok2, out2 = self.runtime.exec(self.container, ["ollama", "ps"])
             elif mode == "docker":
@@ -329,6 +355,51 @@ class Collector(threading.Thread):
             "models_err": "" if ok else str(data),
         }
 
+    def _llama_swap_result(self, ep: Endpoint) -> dict:
+        """The llama-swap catalog, shaped like `_ps_result`'s output.
+
+        llama-swap has no single call equivalent to `/api/ps`: `/v1/models`
+        lists every *configured* model (loaded or not — worth keeping, unlike
+        Ollama where an unloaded model is simply invisible), and `/running`
+        gives the precise starting/ready state plus ttl/port for whichever
+        ones are actually up. Each model's own catalog id is the join key —
+        no digest/context-length heuristics needed, unlike Ollama's runners.
+        """
+        ok, data = ep.get_json("/v1/models")
+        catalog = data.get("data", []) if ok and isinstance(data, dict) else []
+        models: list[dict] = [{
+            "name": m.get("id", ""),
+            "description": m.get("description", ""),
+            "state": (m.get("status") or {}).get("value") or "unknown",
+            "ttl": None,
+            "port": None,
+        } for m in catalog]
+        by_name = {m["name"]: m for m in models}
+
+        ok2, running = ep.get_json("/running")
+        for r in (running.get("running", []) if ok2 and isinstance(running, dict) else []):
+            name = r.get("model", "")
+            m = by_name.get(name)
+            if m is None:
+                m = {"name": name, "description": r.get("description", "")}
+                models.append(m)
+                by_name[name] = m
+            m["state"] = r.get("state") or m.get("state", "unknown")
+            m["ttl"] = r.get("ttl")
+            proxy = str(r.get("proxy", ""))
+            m["port"] = proxy.rsplit(":", 1)[-1] if ":" in proxy else None
+
+        return {
+            **ep.describe(),
+            "models_ok": ok,
+            "models": models,
+            "models_err": "" if ok else str(data),
+        }
+
+    def _fetch_one(self, ep: Endpoint) -> dict:
+        return (self._llama_swap_result(ep) if self.backend == "llama-swap"
+               else self._ps_result(ep))
+
     def _fetch_models(self) -> list[dict]:
         """/api/ps from every endpoint. Order matches self.endpoints.
 
@@ -340,7 +411,7 @@ class Collector(threading.Thread):
         re-submitted until it finishes, so nothing piles up.
         """
         if self._pool is None:
-            res = self._ps_result(self.endpoints[0])
+            res = self._fetch_one(self.endpoints[0])
             res["version"] = self._versions.get(res["label"])
             return [res]
 
@@ -348,7 +419,7 @@ class Collector(threading.Thread):
         for ep in self.endpoints:
             f = self._ps_pending.get(ep.label)
             if f is None or f.done():
-                f = self._pool.submit(self._ps_result, ep)
+                f = self._pool.submit(self._fetch_one, ep)
                 self._ps_pending[ep.label] = f
             futs[ep.label] = f
 
@@ -379,7 +450,12 @@ class Collector(threading.Thread):
 
         Same non-blocking rule as _fetch_models: submit, wait EXTRA_WAIT for
         all, keep whatever answered; the rest is read on a later slow cycle.
+        llama-swap has no equivalent endpoint — skip the network round-trip
+        entirely rather than pay a guaranteed-404 every slow cycle.
         """
+        if self.backend == "llama-swap":
+            return
+
         def one(ep: Endpoint) -> tuple[str, str | None]:
             ok, ver = ep.get_json("/api/version", timeout=3)
             v = str(ver.get("version") or "") if ok and isinstance(ver, dict) else ""
@@ -424,8 +500,12 @@ class Collector(threading.Thread):
     def _build_log_source(self, mode: str) -> LogSource | None:
         if mode == "docker" and self.runtime is not None:
             return ContainerLogs(self.runtime, self.container)
-        if mode == "local" and IS_LINUX and systemd_ollama() is not None:
-            return JournalLogs(run_cmd)
+        if mode == "local" and IS_LINUX:
+            if self.backend == "llama-swap":
+                if systemd_llama_swap() is not None:
+                    return JournalLogs(run_cmd, "llama-swap.service", user=True)
+            elif systemd_ollama() is not None:
+                return JournalLogs(run_cmd)
         return None
 
     def reset_log_source(self) -> None:
@@ -469,7 +549,8 @@ class Collector(threading.Thread):
             if pairs is not None:
                 info["env"], info["env_source"] = inference_env(pairs), "process"
             else:
-                sd = systemd_environment()
+                sd = (systemd_environment("llama-swap.service", user=True)
+                     if self.backend == "llama-swap" else systemd_environment())
                 if sd is not None:
                     info["env"], info["env_source"] = inference_env(sd), "systemd"
         return info
@@ -477,22 +558,24 @@ class Collector(threading.Thread):
     # -- local (bare-metal) process source -------------------------------------
 
     def _local_status(self) -> tuple[str, int | None, str, float | None]:
-        """(status, pid, uptime_str, cpu_limit) for a bare-metal ollama server.
+        """(status, pid, uptime_str, cpu_limit) for a bare-metal ollama/llama-swap server.
 
         Prefers systemd (gives a real activating/failed distinction, the
         MainPID and any CPUQuota=) and falls back to a /proc or pgrep scan for
-        manual `ollama serve` launches.
+        a manual launch.
         """
         pid: int | None = None
         status = "not found"
         cpu_limit: float | None = None
+        is_swap = self.backend == "llama-swap"
         if IS_LINUX:
-            sd = systemd_ollama()
+            sd = systemd_llama_swap() if is_swap else systemd_ollama()
             if sd is not None:
                 status, pid, cpu_limit = sd
                 pid = pid or None
         if pid is None:
-            pid = find_ollama_pid(self.api_port)
+            pid = (find_llama_swap_pid(self.api_port) if is_swap
+                  else find_ollama_pid(self.api_port))
             if pid is not None:
                 status = "running"
         uptime = ""
@@ -544,7 +627,7 @@ class Collector(threading.Thread):
             if p != pid:
                 # cmdline is one extra read on a /proc entry we already opened,
                 # and it is the only source for the effective inference config.
-                info = parse_runner_argv(read_proc_cmdline(p) or [])
+                info = self._parse_argv(read_proc_cmdline(p) or [])
                 if info:
                     info["pid"] = p
                     info["rss"] = r
@@ -611,7 +694,7 @@ class Collector(threading.Thread):
         for p in tree:
             if p == pid:
                 continue
-            info = parse_runner_argv(argv.get(p, []))
+            info = self._parse_argv(argv.get(p, []))
             if info:
                 info["pid"] = p
                 info["rss"] = procs[p][2] if p in procs else None
@@ -688,7 +771,7 @@ class Collector(threading.Thread):
         runners: list[dict] = []
         if init_pid and IS_LINUX:
             for p in process_tree(init_pid):
-                info = parse_runner_argv(read_proc_cmdline(p) or [])
+                info = self._parse_argv(read_proc_cmdline(p) or [])
                 if info:
                     info["pid"] = p
                     info["rss"] = read_proc_rss_bytes(p)
@@ -718,7 +801,7 @@ class Collector(threading.Thread):
             args = [a for a in body.split("\0") if a.strip()]
             if len(args) < 2:
                 args = [a for a in body.split() if a]
-            info = parse_runner_argv(args)
+            info = self._parse_argv(args)
             if info:
                 info["pid"] = pid_now
                 info["rss"] = None

@@ -16,7 +16,7 @@ from ._version import __version__
 from .collector import STALE_FACTOR, Collector
 from .procfs import host_cpu_count
 from .runner import processor_label
-from .util import bytes_to_gib, relative_time, to_float
+from .util import bytes_to_gib, fmt_duration, relative_time, to_float
 
 UI_POLL_MS = 100          # curses getch timeout — UI responsiveness, not data rate
 C_HEADER = 1
@@ -279,7 +279,10 @@ def render_header(win, y: int, snap: dict, stale: bool) -> int:
         # "+2r" = two model runner subprocesses rolled into the stats below.
         procs = (snap.get("res_stats") or {}).get("procs") or 1
         runners = f" +{procs - 1}r" if procs > 1 else ""
-        field("ollama: ", status_icon + (f"serve · pid {pid}{runners}" if pid else "serve"),
+        backend = snap.get("backend", "ollama")
+        label, verb = (("llama-swap: ", "") if backend == "llama-swap" else ("ollama: ", "serve"))
+        field(label, status_icon + (f"{verb} · pid {pid}{runners}".strip(" ·")
+                                    if pid else (verb or "running")),
               status_attr)
     else:
         field("container: ", status_icon + container, status_attr)
@@ -287,7 +290,8 @@ def render_header(win, y: int, snap: dict, stale: bool) -> int:
         field("up: ", uptime, curses.color_pair(C_DIM))
     version = (snap.get("server") or {}).get("version")
     if version:
-        field("ollama ", version, curses.color_pair(C_DIM))
+        vlabel = "llama-swap " if snap.get("backend") == "llama-swap" else "ollama "
+        field(vlabel, version, curses.color_pair(C_DIM))
     extra = len(snap.get("endpoints") or []) - 1
     if extra > 0:
         field("+", f"{extra} endpoint{'s' if extra > 1 else ''}", curses.color_pair(C_DIM))
@@ -433,13 +437,63 @@ def render_gpu_stats(win, y: int, snap: dict) -> int:
 
 
 def render_models(win, y: int, snap: dict) -> int:
-    """Loaded models from /api/ps — one table per endpoint when there are several."""
+    """Models from /api/ps (Ollama) or /v1/models+/running (llama-swap) —
+    one table per endpoint when there are several."""
+    backend = snap.get("backend", "ollama")
+    table = render_llama_swap_models_table if backend == "llama-swap" else render_models_table
+    title = " MODELS " if backend == "llama-swap" else " LOADED MODELS "
     endpoints = snap.get("endpoints") or [snap]
     if len(endpoints) == 1:
-        return render_models_table(win, y, endpoints[0], " LOADED MODELS ")
+        return table(win, y, endpoints[0], title)
     for ep in endpoints:
         ver = f" · ollama {ep['version']}" if ep.get("version") else ""
-        y = render_models_table(win, y, ep, f" LOADED MODELS · {ep.get('label', '?')}{ver} ")
+        y = table(win, y, ep, f"{title}· {ep.get('label', '?')}{ver} ")
+    return y
+
+
+def render_llama_swap_models_table(win, y: int, ep: dict, title: str) -> int:
+    """llama-swap's catalog: every *configured* model, loaded or not — unlike
+    Ollama's /api/ps, which only ever lists what is currently loaded. There is
+    no VRAM/RAM split or context length here; that lives in the runner argv
+    (RUNNERS section) once a model actually starts.
+    """
+    y = section_header(win, y, title)
+
+    if not ep.get("models_ok", False):
+        y = safe_addstr(win, y, 3, f"API error: {ep.get('models_err', '?')}",
+                        curses.color_pair(C_ERR))
+        y += 1
+        return y
+
+    models = ep.get("models", [])
+    if not models:
+        y = safe_addstr(win, y, 3, "No models configured",
+                        curses.color_pair(C_WARN) | curses.A_DIM)
+        y += 1
+        return y
+
+    headers = ["MODEL", "STATE", "PORT", "TTL", "DESCRIPTION"]
+    col_widths = [24, 10, 7, 10, 45]
+    rows = []
+    for m in models:
+        state = m.get("state") or "unknown"
+        ttl = m.get("ttl")
+        ttl_str = "—" if ttl in (None, 0) else fmt_duration(ttl)
+        rows.append([
+            m.get("name", "?"),
+            state,
+            str(m.get("port") or "—"),
+            ttl_str,
+            m.get("description", "") or "",
+        ])
+
+    # draw_table's row_attr is a single style for the whole table (see its
+    # docstring) — no per-row coloring, so "starting" and "ready" share the
+    # same OK color rather than adding that capability for one table.
+    y = draw_table(win, y, 3, headers, rows, col_widths,
+                   hdr_attr=curses.color_pair(C_TABLE_HDR) | curses.A_BOLD,
+                   row_attr=curses.color_pair(C_OK))
+    y += 1
     return y
 
 
@@ -489,6 +543,12 @@ def render_models_table(win, y: int, ep: dict, title: str) -> int:
 def render_ollama_ps(win, y: int, snap: dict) -> int:
     """Show raw ollama ps output from the snapshot (toggle: 'o')."""
     y = section_header(win, y, " OLLAMA PS ")
+
+    if snap.get("backend") != "ollama":
+        y = safe_addstr(win, y, 3, "no `ollama ps` equivalent for this backend",
+                        curses.color_pair(C_WARN) | curses.A_DIM)
+        y += 1
+        return y
 
     if not snap.get("raw_ps_ok", False):
         y = safe_addstr(win, y, 3, f"ollama ps failed: {snap.get('raw_ps', '')[:80]}",
@@ -551,6 +611,17 @@ def render_runners(win, y: int, snap: dict) -> int:
             extras.append("O_DIRECT")
         elif r.get("load_mode"):
             extras.append(f"load:{r['load_mode']}")
+        if r.get("engine") == "vllm":
+            if r.get("gpu_mem_util"):
+                extras.append(f"gpu-util:{r['gpu_mem_util']}")
+            if r.get("quantization"):
+                extras.append(f"quant:{r['quantization']}")
+            if r.get("tp") and r["tp"] != "1":
+                extras.append(f"tp:{r['tp']}")
+            if r.get("trust_remote_code"):
+                extras.append("trust-remote-code")
+            if r.get("state"):
+                extras.append(f"state:{r['state']}")
         # Card indices from the NVML pid join; "—" when nothing linked (AMD,
         # unified parts, or runners seen only through the container exec).
         gpu_col = ",".join(t.split(":", 1)[1] for t in r.get("gpu") or []) or "—"
@@ -699,6 +770,7 @@ def curses_main(stdscr, args):
         endpoints=args.endpoints,
         show_logs=args.logs,
         log_lines=args.log_lines,
+        backend=getattr(args, "backend", "ollama"),
     )
     collector.start()
 
