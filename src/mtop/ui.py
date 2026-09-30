@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import curses
 import os
+import threading
 import time
 from datetime import datetime
 
@@ -19,6 +20,8 @@ from .runner import processor_label
 from .util import bytes_to_gib, fmt_duration, relative_time, to_float
 
 UI_POLL_MS = 100          # curses getch timeout — UI responsiveness, not data rate
+UNLOAD_TIMEOUT = 30       # s — a busy server finishes in-flight requests before unloading
+NOTICE_HOLD = 5.0         # s a model-action result stays in the footer
 C_HEADER = 1
 C_OK = 2
 C_WARN = 3
@@ -107,7 +110,8 @@ def draw_detail_right(win, y: int, min_x: int, text: str, attr=0):
 
 
 def draw_table(win, y: int, x: int, headers: list[str], rows: list[list[str]],
-               col_widths: list[int], hdr_attr=0, row_attr=0) -> int:
+               col_widths: list[int], hdr_attr=0, row_attr=0,
+               selected: int | None = None) -> int:
     """Draw a formatted table. Returns next y position.
 
     The rule under the header is sized to the widest *visible* line rather than
@@ -135,10 +139,11 @@ def draw_table(win, y: int, x: int, headers: list[str], rows: list[list[str]],
 
     y = safe_addstr(win, y, x, header_line, hdr_attr)
     y = safe_addstr(win, y, x, rule, curses.color_pair(C_DIM))
-    for line in body:
+    for i, line in enumerate(body):
         if y >= max_y - 1:
             break
-        y = safe_addstr(win, y, x, line, row_attr)
+        y = safe_addstr(win, y, x, line,
+                        row_attr | curses.A_REVERSE if i == selected else row_attr)
     return y
 
 
@@ -436,18 +441,29 @@ def render_gpu_stats(win, y: int, snap: dict) -> int:
     return y
 
 
-def render_models(win, y: int, snap: dict) -> int:
+def render_models(win, y: int, snap: dict,
+                  selected: tuple[int, str] | None = None) -> int:
     """Models from /api/ps (Ollama) or /v1/models+/running (llama-swap) —
-    one table per endpoint when there are several."""
+    one table per endpoint when there are several.
+
+    `selected` is (endpoint index, model name) of the --control cursor
+    (Ollama only).
+    """
     backend = snap.get("backend", "ollama")
-    table = render_llama_swap_models_table if backend == "llama-swap" else render_models_table
-    title = " MODELS " if backend == "llama-swap" else " LOADED MODELS "
     endpoints = snap.get("endpoints") or [snap]
+
+    def table(y: int, i: int, ep: dict, title: str) -> int:
+        if backend == "llama-swap":
+            return render_llama_swap_models_table(win, y, ep, title)
+        return render_models_table(win, y, ep, title,
+                                   selected[1] if selected and selected[0] == i else None)
+
+    title = " MODELS " if backend == "llama-swap" else " LOADED MODELS "
     if len(endpoints) == 1:
-        return table(win, y, endpoints[0], title)
-    for ep in endpoints:
+        return table(y, 0, endpoints[0], title)
+    for i, ep in enumerate(endpoints):
         ver = f" · ollama {ep['version']}" if ep.get("version") else ""
-        y = table(win, y, ep, f"{title}· {ep.get('label', '?')}{ver} ")
+        y = table(y, i, ep, f"{title}· {ep.get('label', '?')}{ver} ")
     return y
 
 
@@ -497,7 +513,8 @@ def render_llama_swap_models_table(win, y: int, ep: dict, title: str) -> int:
     return y
 
 
-def render_models_table(win, y: int, ep: dict, title: str) -> int:
+def render_models_table(win, y: int, ep: dict, title: str,
+                        selected_name: str | None = None) -> int:
     y = section_header(win, y, title)
 
     if not ep.get("models_ok", False):
@@ -533,9 +550,11 @@ def render_models_table(win, y: int, ep: dict, title: str) -> int:
             expires,
         ])
 
+    names = [m.get("name", "?") for m in models]
     y = draw_table(win, y, 3, headers, rows, col_widths,
                    hdr_attr=curses.color_pair(C_TABLE_HDR) | curses.A_BOLD,
-                   row_attr=curses.color_pair(C_OK))
+                   row_attr=curses.color_pair(C_OK),
+                   selected=names.index(selected_name) if selected_name in names else None)
     y += 1
     return y
 
@@ -730,10 +749,22 @@ def render_logs(win, y: int, snap: dict) -> int:
 
 def render_footer(win, interval: float, raw_ps: bool, can_raw_ps: bool,
                   runners: bool = True, runtime: str | None = None,
-                  env: bool = True, logs: bool = False):
+                  env: bool = True, logs: bool = False, control: bool = False,
+                  notice: tuple[str, int] | None = None):
+    """Key hints, or — while a model action asks or reports — `notice` (text, attr)."""
     max_y, max_x = win.getmaxyx()
     footer_y = max_y - 1
+    if notice:
+        text, attr = notice
+        try:
+            win.addstr(footer_y, 0, (" " + text + " ")[: max_x - 1].ljust(max_x - 1),
+                       attr | curses.A_REVERSE)
+        except curses.error:
+            pass
+        return
     parts = ["q: quit", f"+/-: interval ({interval:.1f}s)"]
+    if control:
+        parts.append("↑/↓: select │ s: stop model")
     if can_raw_ps:
         parts.append(f"o: raw ps [{'on' if raw_ps else 'off'}]")
         parts.append(f"r: runners [{'on' if runners else 'off'}]")
@@ -748,6 +779,90 @@ def render_footer(win, interval: float, raw_ps: bool, can_raw_ps: bool,
         win.addstr(footer_y, 0, footer, curses.color_pair(C_DIM) | curses.A_REVERSE)
     except curses.error:
         pass
+
+
+class ModelControl:
+    """The --control cursor over loaded models and the stop (unload) action.
+
+    The selection is (endpoint index, model name), not a row number: /api/ps
+    order can change between snapshots, and the cursor must stay on the model
+    the user picked instead of sliding onto a neighbour right before `y`.
+    Stop is `POST /api/generate {"model": name, "keep_alive": 0}` — the same
+    request `ollama stop` sends — run on a thread so the UI keeps drawing.
+    """
+
+    def __init__(self, endpoints: list):
+        self.endpoints = endpoints
+        self.selected: tuple[int, str] | None = None
+        self.confirm: tuple[int, str] | None = None
+        self.busy: tuple[int, str] | None = None
+        self._index = 0
+        self._result: tuple[str, bool, float] | None = None   # text, ok, monotonic until
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def rows(snap: dict) -> list[tuple[int, str]]:
+        endpoints = snap.get("endpoints") or [snap]
+        return [(i, m.get("name", "?")) for i, ep in enumerate(endpoints)
+                if ep.get("models_ok") for m in ep.get("models", [])]
+
+    def sync(self, snap: dict) -> None:
+        """Re-anchor the cursor after a new snapshot; a vanished model hands
+        the cursor to whatever now sits at its position."""
+        rows = self.rows(snap)
+        if self.selected in rows:
+            self._index = rows.index(self.selected)
+        elif rows:
+            self._index = min(self._index, len(rows) - 1)
+            self.selected = rows[self._index]
+        else:
+            self.selected = None
+        if self.confirm not in rows:
+            self.confirm = None
+
+    def move(self, delta: int, snap: dict) -> None:
+        rows = self.rows(snap)
+        if not rows:
+            return
+        self._index = max(0, min(len(rows) - 1, self._index + delta))
+        self.selected = rows[self._index]
+
+    def request_stop(self) -> None:
+        if self.selected and not self.busy:
+            self.confirm = self.selected
+
+    def answer(self, yes: bool) -> None:
+        target, self.confirm = self.confirm, None
+        if yes and target and not self.busy:
+            self.busy = target
+            threading.Thread(target=self._stop, args=(target,), daemon=True,
+                             name="mtop-stop").start()
+
+    def _stop(self, target: tuple[int, str]) -> None:
+        i, name = target
+        ok, data = self.endpoints[i].post_json(
+            "/api/generate", {"model": name, "keep_alive": 0}, timeout=UNLOAD_TIMEOUT)
+        text = f"Stopped {name}" if ok else f"Stop {name} failed: {data}"
+        with self._lock:
+            self._result = (text, ok, time.monotonic() + NOTICE_HOLD)
+            self.busy = None
+
+    def label(self, target: tuple[int, str]) -> str:
+        i, name = target
+        return name if len(self.endpoints) == 1 else f"{name} on {self.endpoints[i].label}"
+
+    def notice(self, now: float) -> tuple[str, int] | None:
+        """Footer override: the y/n question, the running action, or its result."""
+        if self.confirm:
+            return (f"Stop {self.label(self.confirm)}? [y/N]",
+                    curses.color_pair(C_WARN) | curses.A_BOLD)
+        if self.busy:
+            return f"Stopping {self.label(self.busy)}…", curses.color_pair(C_ACCENT)
+        with self._lock:
+            result = self._result
+        if result and now < result[2]:
+            return result[0], curses.color_pair(C_OK if result[1] else C_ERR)
+        return None
 
 
 def curses_main(stdscr, args):
@@ -773,12 +888,16 @@ def curses_main(stdscr, args):
         backend=getattr(args, "backend", "ollama"),
     )
     collector.start()
+    control = ModelControl(collector.endpoints) if getattr(args, "control", False) else None
+    snap = collector.snapshot()
 
     try:
         while True:
             try:
                 key = stdscr.getch()
-                if key in (ord("q"), ord("Q"), 27):  # q, Q, ESC
+                if control and control.confirm and key not in (-1, curses.KEY_RESIZE):
+                    control.answer(key in (ord("y"), ord("Y")))   # anything else: no
+                elif key in (ord("q"), ord("Q"), 27):  # q, Q, ESC
                     break
                 elif key == ord("+"):
                     collector.interval = max(0.5, collector.interval - 0.5)
@@ -794,12 +913,20 @@ def curses_main(stdscr, args):
                     collector.show_logs = not collector.show_logs
                     collector.reset_log_source()
                     collector.force_slow()      # fetch on the next cycle, not in 2 s
+                elif control and key == curses.KEY_UP:
+                    control.move(-1, snap)
+                elif control and key == curses.KEY_DOWN:
+                    control.move(1, snap)
+                elif control and key == ord("s"):
+                    control.request_stop()
                 elif key == curses.KEY_RESIZE:
                     stdscr.erase()
             except curses.error:
                 pass
 
             snap = collector.snapshot()
+            if control:
+                control.sync(snap)
             age = time.monotonic() - snap.get("ts", 0.0)
             stale = snap.get("ts", 0.0) > 0 and age > collector.interval * STALE_FACTOR
             mode = snap.get("mode", "")
@@ -829,7 +956,7 @@ def curses_main(stdscr, args):
                 y = render_resources(stdscr, y, snap)
                 if not args.no_gpu:
                     y = render_gpu_stats(stdscr, y, snap)
-                y = render_models(stdscr, y, snap)
+                y = render_models(stdscr, y, snap, control.selected if control else None)
                 if collector.show_runners:
                     y = render_runners(stdscr, y, snap)
                 if collector.show_env:
@@ -841,7 +968,9 @@ def curses_main(stdscr, args):
 
             render_footer(stdscr, collector.interval, collector.show_raw_ps,
                           mode in ("docker", "local"), collector.show_runners,
-                          snap.get("runtime"), collector.show_env, collector.show_logs)
+                          snap.get("runtime"), collector.show_env, collector.show_logs,
+                          control is not None,
+                          control.notice(time.monotonic()) if control else None)
             stdscr.refresh()
     finally:
         collector.stop()

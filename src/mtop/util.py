@@ -97,9 +97,27 @@ def http_get_json(url: str, timeout: int = 5, headers: dict[str, str] | None = N
     `context` a custom TLS setup (--insecure, --cacert). HTTP errors surface
     as "HTTP 401 Unauthorized"-style strings so the screen says *why*.
     """
+    return _http_json(url, None, timeout, headers, context)
+
+
+def http_post_json(url: str, body: Any, timeout: int = 5,
+                   headers: dict[str, str] | None = None,
+                   context: ssl.SSLContext | None = None) -> tuple[bool, Any]:
+    """POST `body` as JSON, same contract as http_get_json.
+
+    Only the model actions (--control) write; everything else is GET.
+    """
+    return _http_json(url, json.dumps(body).encode(), timeout, headers, context)
+
+
+def _http_json(url: str, data: bytes | None, timeout: int,
+               headers: dict[str, str] | None,
+               context: ssl.SSLContext | None) -> tuple[bool, Any]:
     try:
-        req = urllib.request.Request(url, headers={"Accept": "application/json",
-                                                   **(headers or {})})
+        hdrs = {"Accept": "application/json", **(headers or {})}
+        if data is not None:
+            hdrs["Content-Type"] = "application/json"
+        req = urllib.request.Request(url, data=data, headers=hdrs)
         if context is not None:
             opener = urllib.request.build_opener(
                 urllib.request.HTTPSHandler(context=context),
@@ -185,6 +203,10 @@ class Endpoint:
 
     def get_json(self, path: str, timeout: int = 5) -> tuple[bool, Any]:
         return http_get_json(self.url + path, timeout, self.headers or None, self.context)
+
+    def post_json(self, path: str, body: Any, timeout: int = 5) -> tuple[bool, Any]:
+        return http_post_json(self.url + path, body, timeout, self.headers or None,
+                              self.context)
 
     def describe(self) -> dict:
         return {"label": self.label, "url": self.url,

@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- **Stopping models from the TUI (`--control`).** With the flag, the arrow
+  keys move a cursor over the LOADED MODELS tables (across all `-u`
+  endpoints) and `s` asks `Stop <model>? [y/N]`; `y` sends
+  `POST /api/generate {"model": …, "keep_alive": 0}` — what `ollama stop`
+  does — on a background thread, with the result in the footer. The cursor
+  follows the model, not the row, so a reordered `/api/ps` cannot retarget
+  it. Off by default: without `--control` mtop still only reads.
+  `Endpoint.post_json` / `http_post_json` added for it.
+
 ## 0.11.2 — 2026-09-14
 
 ### Added

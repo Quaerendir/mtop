@@ -139,7 +139,8 @@ def main():
                     "(container, systemd or manual), as a TUI or a JSON/Prometheus exporter",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Keys: q=quit, +=faster, -=slower, o=toggle raw ollama ps, "
-               "r=toggle runners, e=toggle server config, l=toggle logs\n\n"
+               "r=toggle runners, e=toggle server config, l=toggle logs; "
+               "with --control: up/down=select model, s=stop (unload) it\n\n"
                "https://github.com/Quaerendir/mtop",
     )
     parser.add_argument("-c", "--container", default=DEFAULT_CONTAINER,
@@ -192,6 +193,10 @@ def main():
                              "Toggle at runtime with 'l'. Also adds `logs` to --json")
     parser.add_argument("--log-lines", type=int, default=DEFAULT_LOG_LINES, metavar="N",
                         help=f"Log lines to show (default: {DEFAULT_LOG_LINES})")
+    parser.add_argument("--control", action="store_true",
+                        help="Allow model actions in the TUI: select a loaded model with "
+                             "the arrow keys, 's' stops (unloads) it after a y/N prompt. "
+                             "Off by default — without it mtop never writes to the API")
     parser.add_argument("--no-docker", action="store_true",
                         help="Alias for --mode api (kept for compatibility)")
     parser.add_argument("--json", action="store_true",
