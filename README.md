@@ -220,10 +220,10 @@ The screenshot above is a real session on a DGX Spark (GB10) with Ollama in Dock
 | Section | Ollama | llama-swap |
 |---------|--------|------------|
 | MODELS | `/api/ps`: loaded models only, VRAM/RAM split, context, processor, expiry | `/v1/models` merged with `/running`: every *configured* model, loaded or not, with STATE (`ready`, `starting`, …), PORT of its upstream, TTL and the config's description |
-| RUNNERS | llama.cpp / `ollama runner` argv | `vllm serve` argv: context (`--max-model-len`), plus `gpu-util`, `quant`, `tp` (when > 1), `trust-remote-code` and the model's state. Runners join models by exact id (`--served-model-name` = llama-swap's config key) |
+| RUNNERS | llama.cpp / `ollama runner` argv | `vllm serve` argv: context (`--max-model-len`), plus `gpu-util`, `quant`, `tp` (when > 1), `trust-remote-code`; or a `llama-server` argv (GGUF models), as for Ollama. Both carry the model's llama-swap state. vLLM runners join the catalog by exact id (`--served-model-name` = llama-swap's config key), `llama-server` by its port (the upstream port in `/running`). GPU memory of vLLM's `EngineCore` child counts toward its runner |
 | Server discovery | container `ollama`, system unit `ollama.service`, or an `ollama serve` process | container `llama-swap`, the **user** unit `llama-swap.service` (`systemctl --user`), or a process named `llama-swap` |
 | SERVER CONFIG | `OLLAMA_*`, GPU selection | the same prefixes plus `VLLM_*`, `HF_*`, `TORCH_*`, `TRITON_*`, read from the container, the process or the user unit |
-| LOGS | container log or `journalctl -u ollama` | container log or `journalctl --user -u llama-swap` |
+| LOGS | container log or `journalctl -u ollama` | container log, `journalctl --user -u llama-swap`, or the file the unit writes to (`StandardOutput=append:/path`). llama-swap's `Request …` lines feed the request stats; its lines carry no time, so from a file the rate counts what arrives while mtop runs |
 | Version in header | `/api/version` | not shown — llama-swap has no version endpoint |
 
 Defaults follow the backend: the API is `http://localhost:8001` and the container name `llama-swap`, so on a box that runs both, `--mode auto` does not lock onto the unrelated `ollama` container. Pass `-u` / `-c` for anything else.

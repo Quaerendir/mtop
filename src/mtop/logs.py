@@ -11,6 +11,13 @@ it works for a container (Engine API / CLI logs), a systemd unit
 (journalctl) and needs nothing from Ollama itself. Tokens/s is *not* in the
 log; that is per-response data the API returns to the caller only.
 
+llama-swap logs its own access line, in a different shape and with no time:
+
+    [INFO] Request 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 1234 "curl/8.5.0" 1.2s
+
+A unit may also send its output to a file (`StandardOutput=append:/path`)
+instead of the journal; FileLogs follows that file.
+
 Line timestamps come from the transport (docker --timestamps, journalctl
 short-iso), not from the GIN field: the transport stamp is RFC3339 with a
 zone, the GIN one is the server's local wall clock with no zone.
@@ -20,8 +27,10 @@ Stdlib only; no imports from the package (bundler embeds this as a module).
 
 from __future__ import annotations
 
+import os
 import re
 import time
+from collections import deque
 from collections.abc import Callable
 from datetime import datetime, timezone
 
@@ -31,6 +40,9 @@ _GIN_RE = re.compile(
     r"\[GIN\]\s+\S+\s+-\s+\S+\s+\|\s*(?P<status>\d{3})\s*\|"
     r"\s*(?P<latency>[^|]+?)\s*\|"
     r"\s*(?P<client>[^|]+?)\s*\|\s*(?P<method>[A-Z]+)\s+\"(?P<path>[^\"]*)\"")
+_SWAP_RE = re.compile(
+    r"\[[A-Z]+\]\s+Request\s+(?P<client>\S+)\s+\"(?P<method>[A-Z]+)\s+(?P<path>\S+)"
+    r"\s+HTTP/[\d.]+\"\s+(?P<status>\d{3})\s+\d+\s+\"[^\"]*\"\s+(?P<latency>\S+)")
 _DUR_RE = re.compile(r"(\d+(?:\.\d+)?)(µs|us|ns|ms|s|m|h)")
 _DUR_UNITS = {"ns": 1e-9, "us": 1e-6, "µs": 1e-6, "ms": 1e-3, "s": 1.0, "m": 60.0, "h": 3600.0}
 _TS_RE = re.compile(
@@ -81,7 +93,8 @@ def split_line(raw: str) -> tuple[float | None, str]:
 
 
 def parse_gin(text: str) -> dict | None:
-    m = _GIN_RE.search(text)
+    """An access-log line — Ollama's GIN or llama-swap's `Request` — as a dict."""
+    m = _GIN_RE.search(text) or _SWAP_RE.search(text)
     if not m:
         return None
     return {
@@ -107,7 +120,8 @@ def line_level(text: str) -> str:
 
 # Paths that monitors (mtop itself, health checks, model listers) hit; they
 # would swamp the inference traffic that the stats are meant to show.
-MONITOR_PATHS = frozenset({"/", "/api/ps", "/api/version", "/api/tags"})
+MONITOR_PATHS = frozenset({"/", "/api/ps", "/api/version", "/api/tags",
+                           "/running", "/v1/models", "/health"})
 
 
 def request_stats(lines: list[tuple[float | None, str]], window: float = 60.0,
@@ -137,7 +151,7 @@ def request_stats(lines: list[tuple[float | None, str]], window: float = 60.0,
             continue
         if now - ts > window:
             continue
-        if g["path"] in ignore_paths:
+        if g["path"].split("?", 1)[0] in ignore_paths:
             monitor += 1
             continue
         last = {**g, "ts": ts}
@@ -207,3 +221,61 @@ class JournalLogs(LogSource):
             rest = re.sub(r"^\S+\s+\S+?\[\d+\]:\s?", "", rest, count=1)
             lines.append((ts, rest))
         return True, lines
+
+
+class FileLogs(LogSource):
+    """Follow a log file (a unit's `StandardOutput=append:/path`).
+
+    The first read takes the last lines from the end of the file — no need
+    to read 100 MB of history — and they stay untimed: llama-swap writes no
+    time, and guessing one would put old requests into the rate window.
+    After that, each read picks up what was appended since and stamps it
+    with the time mtop saw it, so the request rate works from then on.
+    Truncation or rotation (smaller file, new inode) starts over at the end.
+    """
+
+    INITIAL_BYTES = 64 * 1024
+    MAX_READ = 1024 * 1024     # per call; a larger burst keeps only its newest part
+
+    def __init__(self, path: str, keep: int = 500):
+        self.path = path
+        self.name = f"file {os.path.basename(path)}"
+        self._lines: deque[tuple[float | None, str]] = deque(maxlen=keep)
+        self._offset: int | None = None
+        self._inode: int | None = None
+        self._partial = ""
+
+    def tail(self, n: int):
+        try:
+            with open(self.path, "rb") as f:
+                st = os.fstat(f.fileno())
+                fresh = (self._offset is None or st.st_ino != self._inode
+                         or st.st_size < self._offset)
+                if fresh:
+                    self._lines.clear()
+                    self._partial = ""
+                    start, stamp = max(0, st.st_size - self.INITIAL_BYTES), None
+                    gap = start > 0
+                else:
+                    start, stamp = max(self._offset, st.st_size - self.MAX_READ), time.time()
+                    gap = start > self._offset
+                if gap:
+                    # One byte earlier, so the cut below keeps the first line
+                    # when `start` happens to sit right after a newline.
+                    start -= 1
+                f.seek(start)
+                chunk = f.read(st.st_size - start).decode(errors="replace")
+                self._offset, self._inode = st.st_size, st.st_ino
+        except OSError as e:
+            return False, f"{self.path}: {e.strerror or e}"
+        if gap:
+            # Started mid-file: the first line is cut, and a pending partial
+            # line no longer continues into this chunk.
+            chunk = chunk.split("\n", 1)[1] if "\n" in chunk else ""
+            self._partial = ""
+        *complete, self._partial = (self._partial + chunk).split("\n")
+        for ln in complete:
+            if ln.strip():
+                ts, text = split_line(ln)
+                self._lines.append((ts if ts is not None else stamp, text))
+        return True, list(self._lines)[-n:]

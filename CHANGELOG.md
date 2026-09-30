@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- **llama-swap logs from a file.** A unit with `StandardOutput=append:/path`
+  (or `file:` / `truncate:`, read from `systemctl cat`, drop-ins included)
+  leaves only systemd's start/stop lines in the journal; LOGS now follows
+  the file instead — for `ollama.service` too. The first read takes the end
+  of the file (64 KiB, not the whole 85 MB log of the test box); after that
+  new lines are stamped when mtop reads them, because llama-swap writes no
+  time, so the request rate counts from mtop's start. Truncation and
+  rotation start over at the end.
+- **llama-swap request stats.** Its `[INFO] Request <ip> "<METHOD> <path>
+  HTTP/1.1" <status> <bytes> "<agent>" <duration>` lines count like Ollama's
+  GIN lines; `/running`, `/v1/models` and `/health` (mtop's own polling)
+  are monitor traffic. Query strings no longer hide a monitor path.
+- **llama-server runners under llama-swap.** The llama-swap backend parsed
+  only `vllm serve`, so GGUF models run through `llama-server` were missing
+  from RUNNERS. Both argv shapes are recognised now; a `llama-server` joins
+  the catalog by its upstream port (it has no served name), carries the
+  llama-swap state like vLLM runners do, and an unmatched one shows its
+  GGUF file name instead of `—`.
+
 ## 0.12.1 — 2026-09-30
 
 Found testing `--backend llama-swap` live against llama-swap + vLLM

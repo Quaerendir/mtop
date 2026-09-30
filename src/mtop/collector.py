@@ -21,12 +21,12 @@ from .export import parse_iso, parse_size
 from .gpu import (AmdSysfsProvider, AppleGpuProvider, GpuMonitor, GpuProvider,
                   IntelSysfsProvider, NvidiaSmiProvider, NvmlProvider, RocmSmiProvider,
                   TegraUnifiedProvider)
-from .logs import ContainerLogs, JournalLogs, LogSource, line_level, request_stats
+from .logs import ContainerLogs, FileLogs, JournalLogs, LogSource, line_level, request_stats
 from .procfs import (find_llama_swap_pid, find_ollama_pid, host_cpu_count, process_tree,
                      proc_uptime_sec, read_proc_cmdline, read_proc_cpu_ticks, read_proc_environ,
-                     read_proc_ppid,
-                     read_proc_pss_bytes, read_proc_rss_bytes, read_unified_memory,
-                     systemd_environment, systemd_llama_swap, systemd_ollama, total_ram_bytes)
+                     read_proc_ppid, read_proc_pss_bytes, read_proc_rss_bytes, read_unified_memory,
+                     systemd_environment, systemd_llama_swap, systemd_ollama,
+                     systemd_output_file, total_ram_bytes)
 from .runner import (inference_env, link_runners_to_gpus, match_runners_to_models,
                      match_vllm_runners_to_models, parse_runner_argv, parse_vllm_argv)
 from .util import (CLK_TCK, IS_DARWIN, IS_LINUX, Endpoint, api_port, fmt_duration,
@@ -227,8 +227,14 @@ class Collector(threading.Thread):
         return snap.get("mode") == "docker" and str(snap.get("runtime", "")).endswith("-api")
 
     def _parse_argv(self, args: list[str]) -> dict | None:
-        """Runner-argv parser for the active backend (see class docstring)."""
-        return parse_vllm_argv(args) if self.backend == "llama-swap" else parse_runner_argv(args)
+        """Runner-argv parser for the active backend (see class docstring).
+
+        llama-swap runs whatever its config says: `vllm serve`, or a plain
+        `llama-server` (GGUF models), often side by side in one config.
+        """
+        if self.backend == "llama-swap":
+            return parse_vllm_argv(args) or parse_runner_argv(args)
+        return parse_runner_argv(args)
 
     def _detect_local(self) -> bool:
         if self.backend == "llama-swap":
@@ -514,11 +520,16 @@ class Collector(threading.Thread):
         if mode == "docker" and self.runtime is not None:
             return ContainerLogs(self.runtime, self.container)
         if mode == "local" and IS_LINUX:
-            if self.backend == "llama-swap":
-                if systemd_llama_swap() is not None:
-                    return JournalLogs(run_cmd, "llama-swap.service", user=True)
-            elif systemd_ollama() is not None:
-                return JournalLogs(run_cmd)
+            swap = self.backend == "llama-swap"
+            if (systemd_llama_swap() if swap else systemd_ollama()) is None:
+                return None
+            unit = "llama-swap.service" if swap else "ollama.service"
+            # A unit with StandardOutput=append:/file leaves only systemd's
+            # own start/stop lines in the journal; the server log is the file.
+            path = systemd_output_file(unit, user=swap)
+            if path:
+                return FileLogs(path)
+            return JournalLogs(run_cmd, unit, user=swap)
         return None
 
     def reset_log_source(self) -> None:

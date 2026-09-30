@@ -222,16 +222,26 @@ def match_runners_to_models(runners: list[dict], models: list[dict]) -> None:
 
 
 def match_vllm_runners_to_models(runners: list[dict], models: list[dict]) -> None:
-    """Join vLLM runners to llama-swap's model catalog by exact id.
+    """Join llama-swap's runners (vLLM or llama-server) to its catalog.
 
     Unlike Ollama's blob-digest problem, llama-swap already hands out the same
     id on both sides — the config key is both the `--served-model-name` a
     runner argv carries and the `name`/`id` the catalog lists — so this is a
     plain lookup, no context-length heuristic needed.
+
+    A `llama-server` has no served name, only a GGUF path. llama-swap gives
+    each upstream its own port (`--port ${PORT}`, the `proxy` in /running),
+    so the port is the join key there; the runner then takes the catalog
+    name for display.
     """
     by_name = {m.get("name"): m for m in models if m.get("name")}
+    by_port = {str(m["port"]): m for m in models if m.get("port")}
     for r in runners:
         m = by_name.get(r.get("model_name"))
+        if m is None and r.get("port"):
+            m = by_port.get(str(r["port"]))
+            if m is not None:
+                r["model_name"] = m.get("name")
         if m is not None:
             r["state"] = m.get("state")
             r["ttl"] = m.get("ttl")

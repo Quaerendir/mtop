@@ -451,6 +451,31 @@ def systemd_environment(unit: str = "ollama.service", user: bool = False) -> lis
     return []
 
 
+_OUTPUT_FILE_RE = re.compile(r"^\s*StandardOutput\s*=\s*(?:append|file|truncate):(\S.*?)\s*$")
+
+
+def parse_unit_output_file(unit_text: str) -> str | None:
+    """The file a unit writes stdout to (`StandardOutput=append:/path`), or None.
+
+    `systemctl show` reports only the kind ("append"), not the path, so this
+    reads `systemctl cat`: the unit plus drop-ins, where the last assignment
+    wins. A later `StandardOutput=journal` (or anything not a file) resets it.
+    """
+    path = None
+    for line in unit_text.splitlines():
+        if not re.match(r"^\s*StandardOutput\s*=", line):
+            continue
+        m = _OUTPUT_FILE_RE.match(line)
+        path = m.group(1) if m else None
+    return path
+
+
+def systemd_output_file(unit: str = "ollama.service", user: bool = False) -> str | None:
+    cmd = ["systemctl"] + (["--user"] if user else []) + ["cat", unit]
+    ok, out = run_cmd(cmd, timeout=3)
+    return parse_unit_output_file(out) if ok else None
+
+
 def proc_uptime_sec(pid: int) -> float | None:
     """Seconds since a PID started: system uptime minus the process starttime."""
     try:

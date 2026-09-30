@@ -616,7 +616,10 @@ def render_runners(win, y: int, snap: dict) -> int:
         kv = kv_k if kv_k == kv_v else "/".join(x for x in (kv_k, kv_v) if x)
         rss = r.get("rss")
         vram = r.get("vram")
-        name = r.get("model_name") or (r.get("digest", "")[:12] or "—")
+        # Ollama blobs have no name but a digest; a llama-server under
+        # llama-swap that matched nothing still has its GGUF file name.
+        name = (r.get("model_name") or r.get("digest", "")[:12]
+                or os.path.basename(str(r.get("model") or "")) or "—")
         extras = []
         if r.get("engine") == "ollama":
             extras.append("ollama-engine")
@@ -641,8 +644,8 @@ def render_runners(win, y: int, snap: dict) -> int:
                 extras.append(f"tp:{r['tp']}")
             if r.get("trust_remote_code"):
                 extras.append("trust-remote-code")
-            if r.get("state"):
-                extras.append(f"state:{r['state']}")
+        if r.get("state"):                  # llama-swap's view, any engine
+            extras.append(f"state:{r['state']}")
         # Card indices from the NVML pid join; "—" when nothing linked (AMD,
         # unified parts, or runners seen only through the container exec).
         gpu_col = ",".join(t.split(":", 1)[1] for t in r.get("gpu") or []) or "—"
