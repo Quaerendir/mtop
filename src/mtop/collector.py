@@ -102,6 +102,7 @@ class Collector(threading.Thread):
         self.primary = self.endpoints[0]
         self.api_url = self.primary.url
         self._versions: dict[str, str | None] = {}
+        self._no_version: set[str] = set()   # endpoints whose /api/version 404s
         # In-flight /api/ps and /api/version futures per endpoint label, and
         # the last answer each extra endpoint gave. A dead remote must not
         # hold the primary's cycle hostage: extras get EXTRA_WAIT, then the
@@ -469,22 +470,24 @@ class Collector(threading.Thread):
 
         Same non-blocking rule as _fetch_models: submit, wait EXTRA_WAIT for
         all, keep whatever answered; the rest is read on a later slow cycle.
-        llama-swap has no equivalent endpoint — skip the network round-trip
-        entirely rather than pay a guaranteed-404 every slow cycle.
+        llama-swap answers the same path with {"version": "v256", ...} in
+        current builds; an older one that 404s is not asked again.
         """
-        if self.backend == "llama-swap":
-            return
-
         def one(ep: Endpoint) -> tuple[str, str | None]:
             ok, ver = ep.get_json("/api/version", timeout=3)
+            if not ok and str(ver).startswith("HTTP 404"):
+                self._no_version.add(ep.label)
             v = str(ver.get("version") or "") if ok and isinstance(ver, dict) else ""
             return ep.label, (v or None)
 
         if self._pool is None:
-            label, v = one(self.endpoints[0])
-            self._versions[label] = v
+            if self.endpoints[0].label not in self._no_version:
+                label, v = one(self.endpoints[0])
+                self._versions[label] = v
             return
         for ep in self.endpoints:
+            if ep.label in self._no_version:
+                continue
             f = self._ver_pending.get(ep.label)
             if f is None or f.done():
                 if f is not None and f.done() and not f.cancelled():

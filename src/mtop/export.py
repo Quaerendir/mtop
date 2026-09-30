@@ -140,6 +140,8 @@ def prometheus_text(snap: dict, version: str, now: float | None = None) -> str:
     }]
     w.metric("mtop_api_up", "1 when /api/ps answered on this endpoint")
     w.metric("mtop_ollama_info", "Ollama server version per endpoint")
+    w.metric("mtop_llama_swap_info", "llama-swap version per endpoint")
+    info = "mtop_llama_swap_info" if snap.get("backend") == "llama-swap" else "mtop_ollama_info"
     w.metric("mtop_models_loaded", "Models currently loaded on the endpoint")
     w.metric("mtop_model_size_bytes", "Total size of a loaded model")
     w.metric("mtop_model_vram_bytes", "Portion of a loaded model in accelerator memory")
@@ -150,7 +152,7 @@ def prometheus_text(snap: dict, version: str, now: float | None = None) -> str:
         e = {"endpoint": ep.get("label"), "url": ep.get("url")}
         w.sample("mtop_api_up", e, 1 if ep.get("models_ok") else 0)
         if ep.get("version"):
-            w.sample("mtop_ollama_info", {**e, "version": ep["version"]}, 1)
+            w.sample(info, {**e, "version": ep["version"]}, 1)
         # llama-swap lists its whole catalog; only what runs is "loaded".
         # Ollama's /api/ps entries carry no flag and are all loaded.
         models = [m for m in ep.get("models") or [] if m.get("running", True)]

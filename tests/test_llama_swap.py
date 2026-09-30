@@ -419,3 +419,52 @@ def test_endpoint_request_returns_text_and_http_errors(text_server):
     assert ep.request("POST", "/api/models/unload/m") == (True, "OK")
     assert seen[-1] == ("POST", "/api/models/unload/m")
     assert ep.request("POST", "/api/models/unload/nope") == (False, "HTTP 404 Not Found")
+
+
+# ── llama-swap version ───────────────────────────────────────────────────────
+
+def _swap_collector():
+    return mtop.Collector(container="llama-swap", api_url="http://localhost:8001", interval=1.0,
+                          show_gpu=False, mode="api", backend="llama-swap")
+
+
+def test_llama_swap_version_is_read_from_api_version(monkeypatch):
+    monkeypatch.setattr(mtop.util, "http_get_json", lambda url, *a, **k: (
+        True, {"version": "v256", "commit": "6701d0d", "build_date": "2026-09-17T07:09:27Z"}))
+    c = _swap_collector()
+    try:
+        c._fetch_versions()
+        assert c._versions == {"localhost:8001": "v256"}
+    finally:
+        c.close()
+
+
+def test_llama_swap_without_api_version_is_asked_once(monkeypatch):
+    calls = []
+    monkeypatch.setattr(mtop.util, "http_get_json",
+                        lambda url, *a, **k: (calls.append(url), (False, "HTTP 404 Not Found"))[1])
+    c = _swap_collector()
+    try:
+        c._fetch_versions()
+        c._fetch_versions()
+        assert calls == ["http://localhost:8001/api/version"]
+        assert c._versions.get("localhost:8001") is None
+    finally:
+        c.close()
+
+
+def test_llama_swap_version_on_screen_and_in_prometheus():
+    w = FakeWin(rows=4, cols=160)
+    mtop.render_header(w, 0, {"status": "running", "mode": "local", "backend": "llama-swap",
+                              "uptime": "", "server": {"version": "v256"}}, stale=False)
+    assert "llama-swap v256" in w.line(1)
+    snap = {"status": "running", "models_ok": True, "mode": "api", "backend": "llama-swap",
+            "endpoints": [{"label": "a", "url": "u", "models_ok": True, "models": [],
+                           "version": "v256"},
+                          {"label": "b", "url": "v", "models_ok": True, "models": []}]}
+    w = FakeWin(rows=12, cols=160)
+    mtop.render_models(w, 0, snap)
+    assert "MODELS · a · llama-swap v256" in w.text()
+    text = export.prometheus_text(snap, "9.9.9", now=0.0)
+    assert 'mtop_llama_swap_info{endpoint="a",url="u",version="v256"} 1' in text
+    assert "mtop_ollama_info{" not in text

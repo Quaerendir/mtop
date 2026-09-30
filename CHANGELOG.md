@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.13.2 — 2026-09-30
 
 ### Added
 - **`--control` with `--backend llama-swap`.** Previously refused. The
@@ -14,6 +14,11 @@
   config) explain themselves in the footer instead of doing nothing.
   Verified with llama-swap v256 on the Spark: load, swap warning, n/y,
   stop. `Endpoint.request` / `http_request` added for its text replies.
+- **llama-swap version.** Current llama-swap (v256 tested) answers
+  `/api/version` like Ollama does, so the header, per-endpoint titles and
+  `server.version` in `--json` show it; Prometheus gets
+  `mtop_llama_swap_info{version=…}` (not `mtop_ollama_info`). A llama-swap
+  that 404s there is not asked again.
 
 ## 0.13.1 — 2026-09-30
 

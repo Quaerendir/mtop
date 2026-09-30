@@ -226,7 +226,7 @@ The screenshot above is a real session on a DGX Spark (GB10) with Ollama in Dock
 | Server discovery | container `ollama`, system unit `ollama.service`, or an `ollama serve` process | container `llama-swap`, the **user** unit `llama-swap.service` (`systemctl --user`), or a process named `llama-swap` |
 | SERVER CONFIG | `OLLAMA_*`, GPU selection | the same prefixes plus `VLLM_*`, `HF_*`, `TORCH_*`, `TRITON_*`, read from the container, the process or the user unit |
 | LOGS | container log or `journalctl -u ollama` | container log, `journalctl --user -u llama-swap`, or the file the unit writes to (`StandardOutput=append:/path`). llama-swap's `Request …` lines feed the request stats; its lines carry no time, so from a file the rate counts what arrives while mtop runs |
-| Version in header | `/api/version` | not shown — llama-swap has no version endpoint |
+| Version in header | `/api/version` | `/api/version` (`llama-swap v256`); an older llama-swap without it is asked once and shows none |
 
 Defaults follow the backend: the API is `http://localhost:8001` and the container name `llama-swap`, so on a box that runs both, `--mode auto` does not lock onto the unrelated `ollama` container. Pass `-u` / `-c` for anything else.
 

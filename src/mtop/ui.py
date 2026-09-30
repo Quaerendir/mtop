@@ -466,7 +466,7 @@ def render_models(win, y: int, snap: dict,
     if len(endpoints) == 1:
         return table(y, 0, endpoints[0], title)
     for i, ep in enumerate(endpoints):
-        ver = f" · ollama {ep['version']}" if ep.get("version") else ""
+        ver = f" · {backend} {ep['version']}" if ep.get("version") else ""
         y = table(y, i, ep, f"{title}· {ep.get('label', '?')}{ver} ")
     return y
 
