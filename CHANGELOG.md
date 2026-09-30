@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.13.0 — 2026-09-30
 
 ### Added
 - **llama-swap logs from a file.** A unit with `StandardOutput=append:/path`
