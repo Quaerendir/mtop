@@ -182,7 +182,7 @@ mtop
 | `l` | Toggle the `LOGS` section (container logs / journalctl, request stats) |
 | `↑` / `↓` | Select a loaded model (`--control` only) |
 | `s` | Stop (unload) the selected model after a `y/N` prompt (`--control` only) |
-| `L` | Pick a model from `/api/tags` and load it; `Tab` switches endpoint (`--control` only) |
+| `L` | Pick a model from `/api/tags` and load it; `Tab` switches endpoint. Asks first when the server is at `OLLAMA_MAX_LOADED_MODELS` (`--control` only) |
 
 ## What you see
 

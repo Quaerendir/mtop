@@ -279,3 +279,72 @@ def test_one_action_at_a_time(api, monkeypatch):
     assert c.confirm is None
     gate.set()
     _wait_idle(c)
+
+
+# ── eviction warning ─────────────────────────────────────────────────────────
+
+def _full_snap(env, loaded=("bielik:11b", "coder:32b"), gpus=1, source="container"):
+    snap = _snap(("local", list(loaded)))
+    snap["server"] = {"env": env, "env_source": source}
+    snap["gpus"] = [{}] * gpus
+    return snap
+
+
+@pytest.mark.parametrize("env,gpus,source,expected", [
+    ({"OLLAMA_MAX_LOADED_MODELS": "2"}, 1, "container", (2, "OLLAMA_MAX_LOADED_MODELS")),
+    ({}, 2, "process", (6, "Ollama default")),
+    ({"OLLAMA_MAX_LOADED_MODELS": "0"}, 0, "systemd", (3, "Ollama default")),
+    ({"OLLAMA_MAX_LOADED_MODELS": "x"}, 1, "container", (3, "Ollama default")),
+    ({"OLLAMA_MAX_LOADED_MODELS": "2"}, 1, None, None),        # env not readable
+])
+def test_max_loaded_models(env, gpus, source, expected):
+    assert mtop.max_loaded_models(_full_snap(env, gpus=gpus, source=source)) == expected
+
+
+def _pick(c, name):
+    c.open_picker()
+    _wait_items(c)
+    c.picker["index"] = [m["name"] for m in c.picker["items"]].index(name)
+    c.picker_key(10)
+
+
+def test_load_at_the_limit_asks_and_names_the_candidates(api):
+    c = mtop.ModelControl([mtop.Endpoint("localhost:1")])
+    c.sync(_full_snap({"OLLAMA_MAX_LOADED_MODELS": "2"}))
+    c.open_picker()
+    assert "2/2 loaded: a new model evicts one" in c.notice(time.monotonic())[0]
+    c.picker = None
+
+    _pick(c, "qwen3.6:35b")
+    assert not api and c.asking
+    assert c.notice(time.monotonic())[0] == (
+        "Load qwen3.6:35b? [y/N] — 2/2 loaded (OLLAMA_MAX_LOADED_MODELS), "
+        "Ollama will unload one of: bielik:11b, coder:32b")
+    c.answer(False)
+    assert not api and not c.asking
+
+    _pick(c, "qwen3.6:35b")
+    c.answer(True)
+    _wait_idle(c)
+    assert api[-1][1] == {"model": "qwen3.6:35b"}
+
+
+def test_no_question_below_the_limit_or_for_a_resident_model(api):
+    c = mtop.ModelControl([mtop.Endpoint("localhost:1")])
+    c.sync(_full_snap({"OLLAMA_MAX_LOADED_MODELS": "3"}))
+    _pick(c, "qwen3.6:35b")
+    assert not c.asking
+    _wait_idle(c)
+    c.sync(_full_snap({"OLLAMA_MAX_LOADED_MODELS": "2"}))
+    _pick(c, "coder:32b")                             # already loaded: nothing evicted
+    assert not c.asking
+    _wait_idle(c)
+    assert [b["model"] for _, b, _ in api] == ["qwen3.6:35b", "coder:32b"]
+
+
+def test_no_question_when_the_limit_is_unknown(api):
+    c = mtop.ModelControl([mtop.Endpoint("localhost:1")])
+    c.sync(_full_snap({"OLLAMA_MAX_LOADED_MODELS": "2"}, source=None))
+    _pick(c, "qwen3.6:35b")
+    assert not c.asking
+    _wait_idle(c)

@@ -16,6 +16,12 @@
   loaded ones marked `●`) on the selected model's endpoint — `Tab` cycles
   endpoints. `Enter` loads the model with the server's own keep-alive; the
   footer counts the seconds until it is in memory (timeout 15 min).
+  When the primary server is already at its model-count limit
+  (`OLLAMA_MAX_LOADED_MODELS`, or Ollama's default of 3 per GPU when unset)
+  the picker says so, and `Enter` on a model that is not resident asks
+  `Load <model>? [y/N]` and names the models Ollama may unload for it.
+  Only the primary's limit is known (its environment is what mtop reads),
+  so other endpoints load without the question.
 
 ## 0.11.2 — 2026-09-14
 

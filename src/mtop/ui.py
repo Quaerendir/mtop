@@ -782,6 +782,26 @@ def render_footer(win, interval: float, raw_ps: bool, can_raw_ps: bool,
         pass
 
 
+def max_loaded_models(snap: dict) -> tuple[int, str] | None:
+    """How many models the primary server keeps resident, and where that
+    number comes from — None when its environment is not readable (api mode,
+    a local server owned by another user): then there is nothing to warn with.
+
+    Unset or 0 means Ollama's default, 3 per GPU (3 on CPU).
+    """
+    server = snap.get("server") or {}
+    if not server.get("env_source"):
+        return None
+    raw = (server.get("env") or {}).get("OLLAMA_MAX_LOADED_MODELS", "")
+    try:
+        n = int(raw)
+    except ValueError:
+        n = 0
+    if n > 0:
+        return n, "OLLAMA_MAX_LOADED_MODELS"
+    return 3 * max(1, len(snap.get("gpus") or [])), "Ollama default"
+
+
 class ModelControl:
     """The --control cursor over loaded models, stop (unload) and load.
 
@@ -800,6 +820,9 @@ class ModelControl:
         self.confirm: tuple[int, str] | None = None
         self.busy: tuple[str, int, str, float] | None = None  # verb, ep, name, started
         self.picker: dict | None = None
+        # (endpoint, model, models that may be evicted, limit, limit source)
+        self.load_confirm: tuple[int, str, list[str], int, str] | None = None
+        self._snap: dict = {}
         self._index = 0
         self._result: tuple[str, bool, float] | None = None   # text, ok, monotonic until
         self._lock = threading.Lock()
@@ -813,6 +836,7 @@ class ModelControl:
     def sync(self, snap: dict) -> None:
         """Re-anchor the cursor after a new snapshot; a vanished model hands
         the cursor to whatever now sits at its position."""
+        self._snap = snap
         rows = self.rows(snap)
         if self.selected in rows:
             self._index = rows.index(self.selected)
@@ -836,9 +860,33 @@ class ModelControl:
             self.confirm = self.selected
 
     def answer(self, yes: bool) -> None:
+        """y/N for whichever question is open: stop, or a load that evicts."""
         target, self.confirm = self.confirm, None
+        load, self.load_confirm = self.load_confirm, None
         if yes and target:
             self._start("Stopping", target, {"keep_alive": 0}, UNLOAD_TIMEOUT)
+        elif yes and load:
+            self._start("Loading", load[:2], {}, LOAD_TIMEOUT)
+
+    @property
+    def asking(self) -> bool:
+        return bool(self.confirm or self.load_confirm)
+
+    def evictions(self, ep: int) -> tuple[list[str], int, str] | None:
+        """Resident models on `ep` when it is at its model-count limit.
+
+        Only the primary's limit is known (its environment is what mtop
+        reads). Which model Ollama drops is its scheduler's choice, so the
+        warning names the candidates, not a victim.
+        """
+        if ep != 0:
+            return None
+        limit = max_loaded_models(self._snap)
+        if limit is None:
+            return None
+        endpoints = self._snap.get("endpoints") or [self._snap]
+        loaded = [m.get("name", "?") for m in (endpoints[0].get("models") or [])]
+        return (loaded, *limit) if len(loaded) >= limit[0] else None
 
     # ── load picker ──────────────────────────────────────────────────────────
 
@@ -887,7 +935,11 @@ class ModelControl:
         elif key in (10, 13, curses.KEY_ENTER):
             name = items[pk["index"]].get("name", "?")
             self.picker = None
-            self._start("Loading", (pk["ep"], name), {}, LOAD_TIMEOUT)
+            full = self.evictions(pk["ep"])
+            if full and name not in full[0]:      # reloading a resident model evicts nothing
+                self.load_confirm = (pk["ep"], name, *full)
+            else:
+                self._start("Loading", (pk["ep"], name), {}, LOAD_TIMEOUT)
 
     # ── actions ──────────────────────────────────────────────────────────────
 
@@ -917,8 +969,19 @@ class ModelControl:
         action, or its result."""
         if self.picker:
             tab = " │ Tab: next endpoint" if len(self.endpoints) > 1 else ""
+            full = self.evictions(self.picker["ep"])
+            if full:
+                return (f"↑/↓ PgUp/PgDn: choose │ Enter: load │ Esc: cancel{tab} │ "
+                        f"{len(full[0])}/{full[1]} loaded: a new model evicts one",
+                        curses.color_pair(C_WARN))
             return (f"↑/↓ PgUp/PgDn: choose │ Enter: load │ Esc: cancel{tab}",
                     curses.color_pair(C_ACCENT))
+        if self.load_confirm:
+            ep, name, loaded, limit, source = self.load_confirm
+            # The question first: long model names get cut at the right edge.
+            return (f"Load {self.label((ep, name))}? [y/N] — {len(loaded)}/{limit} loaded "
+                    f"({source}), Ollama will unload one of: {', '.join(loaded)}",
+                    curses.color_pair(C_WARN) | curses.A_BOLD)
         if self.confirm:
             return (f"Stop {self.label(self.confirm)}? [y/N]",
                     curses.color_pair(C_WARN) | curses.A_BOLD)
@@ -1033,7 +1096,7 @@ def curses_main(stdscr, args):
                 key = stdscr.getch()
                 if control and control.picker and key not in (-1, curses.KEY_RESIZE):
                     control.picker_key(key)
-                elif control and control.confirm and key not in (-1, curses.KEY_RESIZE):
+                elif control and control.asking and key not in (-1, curses.KEY_RESIZE):
                     control.answer(key in (ord("y"), ord("Y")))   # anything else: no
                 elif key in (ord("q"), ord("Q"), 27):  # q, Q, ESC
                     break
