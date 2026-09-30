@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.13.1 — 2026-09-30
 
 ### Added
 - **Keep a model loaded longer (`--control`, `t`).** Asks for 30m / 2h /
