@@ -252,6 +252,10 @@ def main():
     if args.no_docker and args.mode == "auto":
         args.mode = "api"
 
+    if args.control and args.backend != "ollama":
+        # Stop and load are Ollama's /api/generate and /api/tags; llama-swap
+        # has neither.
+        parser.error("--control works with --backend ollama only")
     if args.watch and not (args.json or args.prometheus):
         parser.error("--watch needs --json or --prometheus")
     if args.json and args.prometheus:

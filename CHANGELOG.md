@@ -1,8 +1,15 @@
 # Changelog
 
-## Unreleased
+## 0.12.0 — 2026-09-30
 
 ### Added
+- **llama-swap + vLLM backend (`--backend llama-swap`).** Models from
+  `/v1/models` + `/running` — the whole configured catalog with
+  STATE / PORT / TTL, loaded or not — the user-level `llama-swap.service`,
+  and `vllm serve` runner flags (gpu-util, quantization, tp) in RUNNERS.
+  Defaults follow the backend: `http://localhost:8001` and a container named
+  `llama-swap`, so `--mode auto` no longer locks onto an unrelated `ollama`
+  container on a box that runs both. Ollama behaviour is unchanged.
 - **Stopping models from the TUI (`--control`).** With the flag, the arrow
   keys move a cursor over the LOADED MODELS tables (across all `-u`
   endpoints) and `s` asks `Stop <model>? [y/N]`; `y` sends
@@ -21,7 +28,8 @@
   the picker says so, and `Enter` on a model that is not resident asks
   `Load <model>? [y/N]` and names the models Ollama may unload for it.
   Only the primary's limit is known (its environment is what mtop reads),
-  so other endpoints load without the question.
+  so other endpoints load without the question. `--control` is Ollama-only
+  and refused with `--backend llama-swap`.
 
 ## 0.11.2 — 2026-09-14
 

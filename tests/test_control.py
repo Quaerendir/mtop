@@ -348,3 +348,11 @@ def test_no_question_when_the_limit_is_unknown(api):
     _pick(c, "qwen3.6:35b")
     assert not c.asking
     _wait_idle(c)
+
+
+def test_control_refuses_the_llama_swap_backend(monkeypatch, capsys):
+    monkeypatch.setattr("sys.argv", ["mtop", "--control", "--backend", "llama-swap"])
+    with pytest.raises(SystemExit) as e:
+        mtop.main()
+    assert e.value.code == 2
+    assert "--control works with --backend ollama only" in capsys.readouterr().err
