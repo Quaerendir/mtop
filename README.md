@@ -14,6 +14,8 @@ There are web dashboards, Prometheus exporters, and chat TUIs for Ollama. But th
 
 `mtop` fills that gap. One file, one command, pure stdlib Python. It auto-detects whether Ollama runs in a Docker/Podman container or as a bare-metal process (systemd or a manual `ollama serve`) and monitors it either way.
 
+It also watches [llama-swap](https://github.com/mostlygeek/llama-swap) fronting vLLM (`--backend llama-swap`), with the same host, GPU and runner views. See [llama-swap + vLLM](#llama-swap--vllm).
+
 ## Features
 
 - **Zero-flicker display** — curses double-buffered rendering, no `clear` + print loops
@@ -40,6 +42,7 @@ There are web dashboards, Prometheus exporters, and chat TUIs for Ollama. But th
 - **Respects `$OLLAMA_HOST`** — works with remote Ollama instances out of the box
 - **Several instances at once** — repeat `-u`; each remote gets its own LOADED MODELS table. Two Ollama instances on a mixed CUDA + ROCm host, or a fleet of remote boxes, on one screen
 - **Behind a reverse proxy** — `-H 'Authorization: Bearer …'`, `$OLLAMA_API_KEY`, basic auth in the URL, `--insecure` / `--cacert` for private certificates
+- **llama-swap + vLLM** — `--backend llama-swap`: the whole model catalog with state, port and TTL, the `vllm serve` flags of each running model, the user-level systemd unit and its journal
 - **Zero external dependencies** — only Python stdlib (`curses`, `urllib`, `json`, `subprocess`)
 
 ## Quick Start
@@ -81,11 +84,13 @@ PYTHONPATH=src python -m mtop
 ## Usage
 
 ```
-mtop [-c CONTAINER] [-i INTERVAL] [-u URL ...] [-H HEADER] [--insecure] [--cacert FILE]
-     [-m MODE] [--runtime RT] [--no-gpu] [--json | --prometheus] [--watch] [-o FILE] [-V] [-h]
+mtop [-c CONTAINER] [-i INTERVAL] [-u URL ...] [--backend B] [-H HEADER] [--insecure]
+     [--cacert FILE] [-m MODE] [--runtime RT] [--no-gpu] [--control]
+     [--json | --prometheus] [--watch] [-o FILE] [-V] [-h]
 
 Options:
-  -c, --container NAME   Docker container name (default: ollama)
+  -c, --container NAME   Docker container name (default: ollama, or llama-swap for
+                         --backend llama-swap)
   -m, --mode MODE        Data source: auto|docker|local|api (default: auto)
                          local = bare-metal `ollama serve` (systemd/proc/ps)
                          api   = models only, no host resource stats
@@ -95,6 +100,9 @@ Options:
                          Repeatable: the first is the primary (host stats, runners), the
                          rest are API-only. Optional label: -u rig=http://gpu-rig:11434.
                          Credentials in the URL (https://user:pw@host) become basic auth.
+                         With --backend llama-swap the default is http://localhost:8001
+                         and $OLLAMA_HOST is ignored.
+      --backend B        Server to monitor: ollama|llama-swap (default: ollama)
   -H, --header 'N: v'    Extra HTTP header for every API request (repeatable);
                          $OLLAMA_API_KEY is sent as 'Authorization: Bearer …' automatically
       --insecure         Skip TLS certificate verification for https:// endpoints
@@ -164,6 +172,12 @@ mtop --json --watch -i 1 | jq -c '{t: .wallclock, models: [.models[].name]}'
 # Prometheus, no port: keep a node_exporter textfile fresh (atomic writes)
 mtop --prometheus --watch -i 15 -o /var/lib/node_exporter/textfile_collector/mtop.prom
 
+# llama-swap + vLLM (user-level systemd unit, API on :8001)
+mtop --backend llama-swap
+
+# llama-swap on another port or host
+mtop --backend llama-swap -u http://gpu-box:9292
+
 # Using OLLAMA_HOST environment variable
 export OLLAMA_HOST=http://gpu-rig:11434
 mtop
@@ -199,6 +213,23 @@ The screenshot above is a real session on a DGX Spark (GB10) with Ollama in Dock
 
 `o` adds the raw `ollama ps` table. Refresh the screenshot with `tools/screenshot.py` (see its docstring).
 
+## llama-swap + vLLM
+
+`mtop --backend llama-swap` monitors [llama-swap](https://github.com/mostlygeek/llama-swap), the proxy that starts and stops model servers on demand, here with vLLM behind it. The layout is the same; what feeds each section changes:
+
+| Section | Ollama | llama-swap |
+|---------|--------|------------|
+| MODELS | `/api/ps`: loaded models only, VRAM/RAM split, context, processor, expiry | `/v1/models` merged with `/running`: every *configured* model, loaded or not, with STATE (`ready`, `starting`, …), PORT of its upstream, TTL and the config's description |
+| RUNNERS | llama.cpp / `ollama runner` argv | `vllm serve` argv: context (`--max-model-len`), plus `gpu-util`, `quant`, `tp` (when > 1), `trust-remote-code` and the model's state. Runners join models by exact id (`--served-model-name` = llama-swap's config key) |
+| Server discovery | container `ollama`, system unit `ollama.service`, or an `ollama serve` process | container `llama-swap`, the **user** unit `llama-swap.service` (`systemctl --user`), or a process named `llama-swap` |
+| SERVER CONFIG | `OLLAMA_*`, GPU selection | the same prefixes plus `VLLM_*`, `HF_*`, `TORCH_*`, `TRITON_*`, read from the container, the process or the user unit |
+| LOGS | container log or `journalctl -u ollama` | container log or `journalctl --user -u llama-swap` |
+| Version in header | `/api/version` | not shown — llama-swap has no version endpoint |
+
+Defaults follow the backend: the API is `http://localhost:8001` and the container name `llama-swap`, so on a box that runs both, `--mode auto` does not lock onto the unrelated `ollama` container. Pass `-u` / `-c` for anything else.
+
+Not available with this backend: the raw `ollama ps` table (`o`) and `--control` (stop/load use Ollama's `/api/generate` and `/api/tags`; mtop refuses the combination). Verified against llama-swap + vLLM on an NVIDIA GB10.
+
 ## Supported Platforms
 
 | Platform | GPU Monitoring | Notes |
@@ -220,7 +251,7 @@ The screenshot above is a real session on a DGX Spark (GB10) with Ollama in Dock
 
 - **Python 3.10+** (uses `match`-era type hints like `list[str]`, `X | Y`)
 - **Docker or Podman** for container monitoring — access to the socket is enough, the CLI is optional
-- **Ollama** in a container, as a bare-metal process, or reachable via API
+- **Ollama** in a container, as a bare-metal process, or reachable via API — or **llama-swap** (`--backend llama-swap`)
 - **NVIDIA driver** (optional, for GPU stats — `libnvidia-ml.so.1`, or `nvidia-smi` as fallback)
 
 ## Roadmap
