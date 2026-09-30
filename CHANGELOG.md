@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.12.1 — 2026-09-30
+
+Found testing `--backend llama-swap` live against llama-swap + vLLM
+(Qwen3.8-27B) on a DGX Spark.
+
+### Fixed
+- **vLLM's GPU memory was not attributed to its model.** vLLM holds the CUDA
+  context in a `VLLM::EngineCore` child of `vllm serve`, so NVML listed that
+  child and the PID join with the runner found nothing: RUNNERS showed no
+  card, `procs:` showed a bare PID with 70 GB, and `--json` /
+  `--prometheus` had no `gpu` / `gpu_mem_mib` for the runner. A GPU process
+  that is not a runner is now credited to the nearest runner among its
+  ancestors (host `/proc`, at most 4 hops). Skipped for runners found
+  through the in-container exec fallback, whose PIDs are not host PIDs
+  (those runners now carry `pid_ns: "container"`).
+- **`mtop_models_loaded` counted llama-swap's whole catalog** (7 on the
+  test box, with one model running). Only models in `/running` count now;
+  llama-swap models in `--json` gain `running: true|false` (from
+  `/running`, or the catalog status when that call fails).
+- **Ollama wording with llama-swap.** The header says "llama-swap Model
+  Monitor", and an empty SERVER CONFIG no longer claims "no OLLAMA_*
+  variables" — it says the VLLM_* / HF_* variables usually come from the
+  per-model launcher, not from llama-swap's own environment.
+
+### Changed
+- `mtop_info` has a `backend` label (`ollama` or `llama-swap`). Existing
+  series gain the label, so a query that matches on the exact label set
+  needs updating.
+
 ## 0.12.0 — 2026-09-30
 
 ### Added

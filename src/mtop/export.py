@@ -127,7 +127,8 @@ def prometheus_text(snap: dict, version: str, now: float | None = None) -> str:
     w.sample("mtop_up", {}, 1 if healthy else 0)
     w.metric("mtop_info", "mtop build and data source")
     w.sample("mtop_info", {**base, "version": version, "runtime": snap.get("runtime"),
-                           "api_url": snap.get("api_url")}, 1)
+                           "api_url": snap.get("api_url"),
+                           "backend": snap.get("backend") or "ollama"}, 1)
     w.metric("mtop_snapshot_timestamp_seconds", "Unix time the snapshot was taken")
     w.sample("mtop_snapshot_timestamp_seconds", {}, now)
 
@@ -150,7 +151,9 @@ def prometheus_text(snap: dict, version: str, now: float | None = None) -> str:
         w.sample("mtop_api_up", e, 1 if ep.get("models_ok") else 0)
         if ep.get("version"):
             w.sample("mtop_ollama_info", {**e, "version": ep["version"]}, 1)
-        models = ep.get("models") or []
+        # llama-swap lists its whole catalog; only what runs is "loaded".
+        # Ollama's /api/ps entries carry no flag and are all loaded.
+        models = [m for m in ep.get("models") or [] if m.get("running", True)]
         if ep.get("models_ok"):
             w.sample("mtop_models_loaded", e, len(models))
         for m in models:

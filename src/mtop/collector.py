@@ -24,6 +24,7 @@ from .gpu import (AmdSysfsProvider, AppleGpuProvider, GpuMonitor, GpuProvider,
 from .logs import ContainerLogs, JournalLogs, LogSource, line_level, request_stats
 from .procfs import (find_llama_swap_pid, find_ollama_pid, host_cpu_count, process_tree,
                      proc_uptime_sec, read_proc_cmdline, read_proc_cpu_ticks, read_proc_environ,
+                     read_proc_ppid,
                      read_proc_pss_bytes, read_proc_rss_bytes, read_unified_memory,
                      systemd_environment, systemd_llama_swap, systemd_ollama, total_ram_bytes)
 from .runner import (inference_env, link_runners_to_gpus, match_runners_to_models,
@@ -329,7 +330,12 @@ class Collector(threading.Thread):
                 match_vllm_runners_to_models(snap["runners"], snap["models"])
             else:
                 match_runners_to_models(snap["runners"], snap["models"])
-        link_runners_to_gpus(snap.get("runners"), snap.get("gpus"))
+        # Ancestry walks read the host /proc, so they only make sense when
+        # the runner PIDs are host PIDs too (not the in-container exec path).
+        host_pids = IS_LINUX and not any(r.get("pid_ns") == "container"
+                                         for r in snap.get("runners") or [])
+        link_runners_to_gpus(snap.get("runners"), snap.get("gpus"),
+                             read_proc_ppid if host_pids else None)
 
         if self.show_raw_ps and mode in ("docker", "local") and self.backend == "ollama":
             if mode == "docker" and self.runtime is not None:
@@ -373,10 +379,16 @@ class Collector(threading.Thread):
             "state": (m.get("status") or {}).get("value") or "unknown",
             "ttl": None,
             "port": None,
+            "running": False,
         } for m in catalog]
         by_name = {m["name"]: m for m in models}
 
+        # `running` is what counts as loaded (Prometheus, --json): membership
+        # in /running, or — when that call fails — the catalog's own status.
         ok2, running = ep.get_json("/running")
+        if not ok2:
+            for m in models:
+                m["running"] = m["state"] not in ("unloaded", "unknown")
         for r in (running.get("running", []) if ok2 and isinstance(running, dict) else []):
             name = r.get("model", "")
             m = by_name.get(name)
@@ -385,6 +397,7 @@ class Collector(threading.Thread):
                 models.append(m)
                 by_name[name] = m
             m["state"] = r.get("state") or m.get("state", "unknown")
+            m["running"] = True
             m["ttl"] = r.get("ttl")
             proxy = str(r.get("proxy", ""))
             m["port"] = proxy.rsplit(":", 1)[-1] if ":" in proxy else None
@@ -805,6 +818,7 @@ class Collector(threading.Thread):
             if info:
                 info["pid"] = pid_now
                 info["rss"] = None
+                info["pid_ns"] = "container"    # not host PIDs: no NVML join
                 runners.append(info)
         return runners or None
 

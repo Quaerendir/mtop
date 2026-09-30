@@ -241,7 +241,8 @@ def render_header(win, y: int, snap: dict, stale: bool) -> int:
     pid = snap.get("pid")
 
     # Top border: ╔═══ mtop v0.2.0 — Ollama Model Monitor ═══╗
-    title = f" mtop v{__version__} — Ollama Model Monitor "
+    server = "llama-swap" if snap.get("backend") == "llama-swap" else "Ollama"
+    title = f" mtop v{__version__} — {server} Model Monitor "
     pad_total = max(0, fill - len(title))
     pad_left = pad_total // 2
     pad_right = pad_total - pad_left
@@ -687,7 +688,14 @@ def render_server_config(win, y: int, snap: dict) -> int:
         y = safe_addstr(win, y, 3, msg, curses.color_pair(C_DIM) | curses.A_DIM)
         return y + 1
     if not env:
-        y = safe_addstr(win, y, 3, f"no OLLAMA_* variables set — defaults ({source})",
+        if snap.get("backend") == "llama-swap":
+            # The model servers' VLLM_* / HF_* usually come from the launcher
+            # script in the llama-swap config, not from llama-swap itself.
+            msg = (f"no VLLM_* / HF_* / CUDA_* variables in llama-swap's environment "
+                   f"({source}) — per-model launchers may set their own")
+        else:
+            msg = f"no OLLAMA_* variables set — defaults ({source})"
+        y = safe_addstr(win, y, 3, msg,
                         curses.color_pair(C_DIM))
         return y + 1
     _, max_x = win.getmaxyx()

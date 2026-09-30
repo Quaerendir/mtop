@@ -11,7 +11,7 @@ API and the GPU drivers know.
 from __future__ import annotations
 
 import os
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from typing import Any
 
 from .util import to_float
@@ -39,8 +39,18 @@ def inference_env(pairs: Iterable[str]) -> dict[str, str]:
     return dict(sorted(out.items()))
 
 
-def link_runners_to_gpus(runners: list[dict] | None, gpus: list[dict] | None) -> None:
+RUNNER_ANCESTRY_DEPTH = 4   # GPU process -> runner hops; EngineCore is one
+
+
+def link_runners_to_gpus(runners: list[dict] | None, gpus: list[dict] | None,
+                         parent_of: Callable[[int], int | None] | None = None) -> None:
     """Join runner processes to cards by PID, both ways, in place.
+
+    A runner need not hold the memory itself: vLLM's `vllm serve` spawns a
+    `VLLM::EngineCore` child that owns the CUDA context, so NVML lists that
+    child, not the runner. With `parent_of` (ppid lookup, host /proc), a GPU
+    process that is not a runner is credited to the nearest runner among its
+    ancestors.
 
     Each runner gains ``gpu`` (["nvidia:0", ...]) and ``gpu_mem_mib``; each
     GPU's ``procs`` entries gain ``model`` when the PID is a known runner.
@@ -54,15 +64,28 @@ def link_runners_to_gpus(runners: list[dict] | None, gpus: list[dict] | None) ->
     for r in by_pid.values():
         r.pop("gpu", None)
         r.pop("gpu_mem_mib", None)
+
+    def owner(pid: int | None) -> dict | None:
+        for _ in range(RUNNER_ANCESTRY_DEPTH + 1):
+            if pid is None or pid <= 1:
+                return None
+            if pid in by_pid:
+                return by_pid[pid]
+            if parent_of is None:
+                return None
+            pid = parent_of(pid)
+        return None
+
     for g in gpus:
         for proc in g.get("procs") or []:
-            r = by_pid.get(proc.get("pid"))
+            r = owner(proc.get("pid"))
             if r is None:
                 proc.pop("model", None)
                 continue
             proc["model"] = r.get("model_name") or r.get("digest", "")[:12]
             tag = f"{g.get('vendor', '?')}:{g.get('index', '?')}"
-            r.setdefault("gpu", []).append(tag)
+            if tag not in r.get("gpu", []):
+                r.setdefault("gpu", []).append(tag)
             if proc.get("mem_mib"):
                 r["gpu_mem_mib"] = r.get("gpu_mem_mib", 0) + proc["mem_mib"]
 

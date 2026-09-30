@@ -93,7 +93,7 @@ def test_prometheus_text_full_snapshot():
     assert s["mtop_up"] == [("", "1")]
     assert s["mtop_snapshot_timestamp_seconds"] == [("", "1700000000")]
     assert ('{mode="docker",container="ollama",version="9.9.9",runtime="docker-api",'
-            'api_url="http://localhost:11434"}', "1") in s["mtop_info"]
+            'api_url="http://localhost:11434",backend="ollama"}', "1") in s["mtop_info"]
     # endpoints
     assert ('{endpoint="localhost:11434",url="http://localhost:11434"}', "1") in s["mtop_api_up"]
     assert ('{endpoint="dead",url="http://10.0.0.9:11434"}', "0") in s["mtop_api_up"]
