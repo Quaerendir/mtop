@@ -140,7 +140,8 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Keys: q=quit, +=faster, -=slower, o=toggle raw ollama ps, "
                "r=toggle runners, e=toggle server config, l=toggle logs; "
-               "with --control: up/down=select model, s=stop (unload) it\n\n"
+               "with --control: up/down=select model, s=stop (unload) it, "
+               "L=load one from /api/tags\n\n"
                "https://github.com/Quaerendir/mtop",
     )
     parser.add_argument("-c", "--container", default=DEFAULT_CONTAINER,
@@ -195,7 +196,8 @@ def main():
                         help=f"Log lines to show (default: {DEFAULT_LOG_LINES})")
     parser.add_argument("--control", action="store_true",
                         help="Allow model actions in the TUI: select a loaded model with "
-                             "the arrow keys, 's' stops (unloads) it after a y/N prompt. "
+                             "the arrow keys, 's' stops (unloads) it after a y/N prompt, "
+                             "'L' picks a model from /api/tags and loads it. "
                              "Off by default — without it mtop never writes to the API")
     parser.add_argument("--no-docker", action="store_true",
                         help="Alias for --mode api (kept for compatibility)")

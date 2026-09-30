@@ -21,6 +21,7 @@ from .util import bytes_to_gib, fmt_duration, relative_time, to_float
 
 UI_POLL_MS = 100          # curses getch timeout — UI responsiveness, not data rate
 UNLOAD_TIMEOUT = 30       # s — a busy server finishes in-flight requests before unloading
+LOAD_TIMEOUT = 900        # s — a 100B+ model from a cold disk takes minutes
 NOTICE_HOLD = 5.0         # s a model-action result stays in the footer
 C_HEADER = 1
 C_OK = 2
@@ -764,7 +765,7 @@ def render_footer(win, interval: float, raw_ps: bool, can_raw_ps: bool,
         return
     parts = ["q: quit", f"+/-: interval ({interval:.1f}s)"]
     if control:
-        parts.append("↑/↓: select │ s: stop model")
+        parts.append("↑/↓: select │ s: stop │ L: load model")
     if can_raw_ps:
         parts.append(f"o: raw ps [{'on' if raw_ps else 'off'}]")
         parts.append(f"r: runners [{'on' if runners else 'off'}]")
@@ -782,20 +783,23 @@ def render_footer(win, interval: float, raw_ps: bool, can_raw_ps: bool,
 
 
 class ModelControl:
-    """The --control cursor over loaded models and the stop (unload) action.
+    """The --control cursor over loaded models, stop (unload) and load.
 
     The selection is (endpoint index, model name), not a row number: /api/ps
     order can change between snapshots, and the cursor must stay on the model
     the user picked instead of sliding onto a neighbour right before `y`.
     Stop is `POST /api/generate {"model": name, "keep_alive": 0}` — the same
-    request `ollama stop` sends — run on a thread so the UI keeps drawing.
+    request `ollama stop` sends. Load is the same call without `keep_alive`
+    (the server's OLLAMA_KEEP_ALIVE applies), picked from `/api/tags` in an
+    overlay. Both run on a thread so the UI keeps drawing; one at a time.
     """
 
     def __init__(self, endpoints: list):
         self.endpoints = endpoints
         self.selected: tuple[int, str] | None = None
         self.confirm: tuple[int, str] | None = None
-        self.busy: tuple[int, str] | None = None
+        self.busy: tuple[str, int, str, float] | None = None  # verb, ep, name, started
+        self.picker: dict | None = None
         self._index = 0
         self._result: tuple[str, bool, float] | None = None   # text, ok, monotonic until
         self._lock = threading.Lock()
@@ -833,16 +837,73 @@ class ModelControl:
 
     def answer(self, yes: bool) -> None:
         target, self.confirm = self.confirm, None
-        if yes and target and not self.busy:
-            self.busy = target
-            threading.Thread(target=self._stop, args=(target,), daemon=True,
-                             name="mtop-stop").start()
+        if yes and target:
+            self._start("Stopping", target, {"keep_alive": 0}, UNLOAD_TIMEOUT)
 
-    def _stop(self, target: tuple[int, str]) -> None:
+    # ── load picker ──────────────────────────────────────────────────────────
+
+    def open_picker(self, ep: int | None = None) -> None:
+        """Overlay listing /api/tags of the selected model's endpoint (or the
+        primary). The list is fetched on a thread; `items` is None until then."""
+        if self.busy:
+            return
+        if ep is None:
+            ep = self.selected[0] if self.selected else 0
+        picker = {"ep": ep, "items": None, "err": "", "index": 0, "top": 0}
+        self.picker = picker
+        threading.Thread(target=self._fetch_tags, args=(picker,), daemon=True,
+                         name="mtop-tags").start()
+
+    def _fetch_tags(self, picker: dict) -> None:
+        ok, data = self.endpoints[picker["ep"]].get_json("/api/tags")
+        models = data.get("models") if ok and isinstance(data, dict) else None
+        with self._lock:
+            if isinstance(models, list):
+                picker["items"] = sorted(models, key=lambda m: m.get("name", "").casefold())
+            else:
+                picker["items"] = []
+                picker["err"] = str(data) if not ok else "unexpected /api/tags reply"
+
+    def picker_key(self, key: int, page: int = 10) -> None:
+        """Keys while the overlay is open; everything else is swallowed."""
+        pk = self.picker
+        if pk is None:
+            return
+        if key in (27, ord("q"), ord("L")):
+            self.picker = None
+            return
+        if key == 9 and len(self.endpoints) > 1:                  # Tab: next endpoint
+            self.open_picker((pk["ep"] + 1) % len(self.endpoints))
+            return
+        with self._lock:
+            items = pk["items"] or []
+        if not items:
+            return
+        delta = {curses.KEY_UP: -1, curses.KEY_DOWN: 1, curses.KEY_PPAGE: -page,
+                 curses.KEY_NPAGE: page, curses.KEY_HOME: -len(items),
+                 curses.KEY_END: len(items)}.get(key)
+        if delta is not None:
+            pk["index"] = max(0, min(len(items) - 1, pk["index"] + delta))
+        elif key in (10, 13, curses.KEY_ENTER):
+            name = items[pk["index"]].get("name", "?")
+            self.picker = None
+            self._start("Loading", (pk["ep"], name), {}, LOAD_TIMEOUT)
+
+    # ── actions ──────────────────────────────────────────────────────────────
+
+    def _start(self, verb: str, target: tuple[int, str], extra: dict, timeout: int) -> None:
+        if self.busy:
+            return
+        self.busy = (verb, target[0], target[1], time.monotonic())
+        threading.Thread(target=self._run, args=(verb, target, extra, timeout),
+                         daemon=True, name="mtop-action").start()
+
+    def _run(self, verb: str, target: tuple[int, str], extra: dict, timeout: int) -> None:
         i, name = target
         ok, data = self.endpoints[i].post_json(
-            "/api/generate", {"model": name, "keep_alive": 0}, timeout=UNLOAD_TIMEOUT)
-        text = f"Stopped {name}" if ok else f"Stop {name} failed: {data}"
+            "/api/generate", {"model": name, **extra}, timeout=timeout)
+        done, what = ("Stopped", "Stop") if verb == "Stopping" else ("Loaded", "Load")
+        text = f"{done} {self.label(target)}" if ok else f"{what} {name} failed: {data}"
         with self._lock:
             self._result = (text, ok, time.monotonic() + NOTICE_HOLD)
             self.busy = None
@@ -852,17 +913,92 @@ class ModelControl:
         return name if len(self.endpoints) == 1 else f"{name} on {self.endpoints[i].label}"
 
     def notice(self, now: float) -> tuple[str, int] | None:
-        """Footer override: the y/n question, the running action, or its result."""
+        """Footer override: the picker keys, the y/n question, the running
+        action, or its result."""
+        if self.picker:
+            tab = " │ Tab: next endpoint" if len(self.endpoints) > 1 else ""
+            return (f"↑/↓ PgUp/PgDn: choose │ Enter: load │ Esc: cancel{tab}",
+                    curses.color_pair(C_ACCENT))
         if self.confirm:
             return (f"Stop {self.label(self.confirm)}? [y/N]",
                     curses.color_pair(C_WARN) | curses.A_BOLD)
-        if self.busy:
-            return f"Stopping {self.label(self.busy)}…", curses.color_pair(C_ACCENT)
+        busy = self.busy
+        if busy:
+            verb, i, name, started = busy
+            return (f"{verb} {self.label((i, name))}… {now - started:.0f}s",
+                    curses.color_pair(C_ACCENT))
         with self._lock:
             result = self._result
         if result and now < result[2]:
             return result[0], curses.color_pair(C_OK if result[1] else C_ERR)
         return None
+
+
+def render_picker(win, control: ModelControl, snap: dict) -> None:
+    """The load overlay: a framed, scrolling list of /api/tags, centred.
+
+    Models already in /api/ps of that endpoint are marked, so loading one
+    (which only resets its keep-alive) is not a surprise.
+    """
+    pk = control.picker
+    if pk is None:
+        return
+    max_y, max_x = win.getmaxyx()
+    with control._lock:
+        items = list(pk["items"]) if pk["items"] is not None else None
+        err = pk["err"]
+    width = min(max_x - 4, 96)
+    # Shrink to the list, never past the footer; 2 rows of frame.
+    height = max(3, min(len(items or [None]) + 2, max_y - 5))
+    if width < 30:
+        return
+    x0, y0 = (max_x - width) // 2, 3             # below the header frame
+    endpoints = snap.get("endpoints") or [snap]
+    ep_snap = endpoints[pk["ep"]] if pk["ep"] < len(endpoints) else {}
+    loaded = {m.get("name") for m in ep_snap.get("models", [])}
+    title = " LOAD MODEL "
+    if len(control.endpoints) > 1:
+        title = f" LOAD MODEL · {control.endpoints[pk['ep']].label} "
+
+    if items is None:
+        lines, attrs = ["Fetching /api/tags…"], [curses.color_pair(C_DIM)]
+    elif err:
+        lines, attrs = [f"/api/tags failed: {err}"], [curses.color_pair(C_ERR)]
+    elif not items:
+        lines, attrs = ["No models on this server"], [curses.color_pair(C_WARN)]
+    else:
+        body = height - 2
+        idx = pk["index"]
+        if idx < pk["top"]:
+            pk["top"] = idx
+        elif idx >= pk["top"] + body:
+            pk["top"] = idx - body + 1
+        name_w = width - 2 - 2 - 30
+        lines, attrs = [], []
+        for n, m in enumerate(items[pk["top"]:pk["top"] + body], start=pk["top"]):
+            det = m.get("details") or {}
+            name = m.get("name", "?")
+            if len(name) > name_w:
+                name = name[: name_w - 1] + "…"
+            mark = "●" if m.get("name") in loaded else " "
+            size = bytes_to_gib(m.get("size") or 0) + " G"
+            lines.append(f"{mark} {name.ljust(name_w)} {size:>9}  "
+                         f"{str(det.get('parameter_size', '')):>7}  "
+                         f"{str(det.get('quantization_level', ''))[:8]:<8}")
+            attr = curses.color_pair(C_OK)
+            attrs.append(attr | curses.A_REVERSE if n == idx else attr)
+
+    frame = curses.color_pair(C_ACCENT)
+    inner = width - 2
+    safe_addstr(win, y0, x0, "┌" + title.center(inner, "─")[:inner] + "┐", frame)
+    for r in range(height - 2):
+        safe_addstr(win, y0 + 1 + r, x0, "│", frame)
+        text = lines[r] if r < len(lines) else ""
+        safe_addstr(win, y0 + 1 + r, x0 + 1, (" " + text)[:inner].ljust(inner),
+                    attrs[r] if r < len(attrs) else 0)
+        safe_addstr(win, y0 + 1 + r, x0 + width - 1, "│", frame)
+    count = f" {pk['index'] + 1}/{len(items)} " if items else ""
+    safe_addstr(win, y0 + height - 1, x0, "└" + count.rjust(inner, "─") + "┘", frame)
 
 
 def curses_main(stdscr, args):
@@ -895,7 +1031,9 @@ def curses_main(stdscr, args):
         while True:
             try:
                 key = stdscr.getch()
-                if control and control.confirm and key not in (-1, curses.KEY_RESIZE):
+                if control and control.picker and key not in (-1, curses.KEY_RESIZE):
+                    control.picker_key(key)
+                elif control and control.confirm and key not in (-1, curses.KEY_RESIZE):
                     control.answer(key in (ord("y"), ord("Y")))   # anything else: no
                 elif key in (ord("q"), ord("Q"), 27):  # q, Q, ESC
                     break
@@ -919,6 +1057,8 @@ def curses_main(stdscr, args):
                     control.move(1, snap)
                 elif control and key == ord("s"):
                     control.request_stop()
+                elif control and key == ord("L"):
+                    control.open_picker()
                 elif key == curses.KEY_RESIZE:
                     stdscr.erase()
             except curses.error:
@@ -966,6 +1106,8 @@ def curses_main(stdscr, args):
                 if collector.show_logs and "logs" in snap:
                     y = render_logs(stdscr, y, snap)
 
+            if control and control.picker:
+                render_picker(stdscr, control, snap)
             render_footer(stdscr, collector.interval, collector.show_raw_ps,
                           mode in ("docker", "local"), collector.show_runners,
                           snap.get("runtime"), collector.show_env, collector.show_logs,

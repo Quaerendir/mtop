@@ -109,8 +109,8 @@ Options:
                          `logs` with request stats to --json / --prometheus
       --log-lines N      Log lines to show (default: 8)
       --control          Allow model actions: arrow keys select a loaded model, s stops
-                         (unloads) it after a y/N prompt. Off by default — without it
-                         mtop never writes to the API
+                         (unloads) it after a y/N prompt, L loads one from /api/tags.
+                         Off by default — without it mtop never writes to the API
       --no-docker        API-only mode: skip all docker calls (remote instances)
       --json             Print one snapshot as JSON and exit (exit 1 on unhealthy)
       --prometheus       Print one snapshot in Prometheus text exposition format and exit
@@ -182,6 +182,7 @@ mtop
 | `l` | Toggle the `LOGS` section (container logs / journalctl, request stats) |
 | `↑` / `↓` | Select a loaded model (`--control` only) |
 | `s` | Stop (unload) the selected model after a `y/N` prompt (`--control` only) |
+| `L` | Pick a model from `/api/tags` and load it; `Tab` switches endpoint (`--control` only) |
 
 ## What you see
 
@@ -232,8 +233,8 @@ The screenshot above is a real session on a DGX Spark (GB10) with Ollama in Dock
 - [x] Multi-host support (repeatable `-u`, per-endpoint model tables)
 - [x] Docker Engine API over the socket, Podman support
 - [x] Configurable layout (raw `ollama ps` toggle; more sections to follow)
-- [x] Model actions — unload on keypress (`--control`, `keep_alive: 0`)
-- [ ] Model actions — load from `/api/tags`, extend TTL
+- [x] Model actions — unload on keypress and load from `/api/tags` (`--control`)
+- [ ] Model actions — extend TTL
 - [x] Sparkline history for CPU/GPU utilization (block chars, stdlib deque)
 - [x] systemd/bare-metal Ollama support (process stats via `/proc`, no Docker required)
 - [x] Log panel (container logs / journalctl) with request stats from the GIN log

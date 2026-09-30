@@ -11,6 +11,11 @@
   follows the model, not the row, so a reordered `/api/ps` cannot retarget
   it. Off by default: without `--control` mtop still only reads.
   `Endpoint.post_json` / `http_post_json` added for it.
+- **Loading models from the TUI (`--control`).** `L` opens a list of the
+  server's models from `/api/tags` (size, parameters, quantization; already
+  loaded ones marked `●`) on the selected model's endpoint — `Tab` cycles
+  endpoints. `Enter` loads the model with the server's own keep-alive; the
+  footer counts the seconds until it is in memory (timeout 15 min).
 
 ## 0.11.2 — 2026-09-14
 
