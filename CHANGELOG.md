@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- **Keep a model loaded longer (`--control`, `t`).** Asks for 30m / 2h /
+  24h / forever (`1`–`4`, any other key cancels) and sends
+  `POST /api/generate` with that `keep_alive` and the model's current
+  `options.num_ctx` from `/api/ps`. The context matters: a keep-alive-only
+  request counts as asking for default options, and Ollama 0.34 reloaded a
+  model started with `num_ctx` 8192 at the Modelfile's 65536 — new runner,
+  seconds of downtime. With `num_ctx` the runner stays and only the expiry
+  moves (verified on the Spark: same runner PID, 8192 kept, 2h then forever).
+
 ## 0.13.0 — 2026-09-30
 
 ### Added

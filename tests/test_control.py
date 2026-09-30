@@ -147,7 +147,7 @@ def test_selected_row_is_drawn_reversed(win):
 def test_footer_shows_control_keys_or_the_notice():
     w = FakeWin(rows=3, cols=160)
     mtop.render_footer(w, 1.0, False, False, control=True)
-    assert "s: stop │ L: load model" in w.line(2)
+    assert "s: stop │ t: keep loaded │ L: load model" in w.line(2)
     w = FakeWin(rows=3, cols=160)
     mtop.render_footer(w, 1.0, False, False, control=True, notice=("Stop a? [y/N]", 0))
     assert w.line(2).strip() == "Stop a? [y/N]"
@@ -356,3 +356,68 @@ def test_control_refuses_the_llama_swap_backend(monkeypatch, capsys):
         mtop.main()
     assert e.value.code == 2
     assert "--control works with --backend ollama only" in capsys.readouterr().err
+
+
+# ── keep loaded (TTL) ────────────────────────────────────────────────────────
+
+def _ttl_snap(ctx=8192):
+    snap = _snap(("a", ["x"]), ("b", ["y"]))
+    snap["endpoints"][1]["models"][0]["context_length"] = ctx
+    return snap
+
+
+@pytest.mark.parametrize("key,value,text", [
+    ("1", "30m", "Keeping y on b loaded for 30m"),
+    ("3", "24h", "Keeping y on b loaded for 24h"),
+    ("4", -1, "Keeping y on b loaded until unloaded"),
+])
+def test_keep_loaded_sends_keep_alive_with_the_current_context(api, key, value, text):
+    c = mtop.ModelControl([mtop.Endpoint("a=localhost:1"), mtop.Endpoint("b=localhost:2")])
+    snap = _ttl_snap()
+    c.sync(snap)
+    c.move(1, snap)
+    c.request_ttl()
+    assert c.notice(time.monotonic())[0].startswith("Keep y on b loaded for — 1: 30m │ 2: 2h")
+    c.ttl_key(ord(key))
+    assert c.ttl_target is None
+    _wait_idle(c)
+    url, body, timeout = api[-1]
+    assert url == "http://localhost:2/api/generate"
+    # Without num_ctx Ollama reloads the model with its default context.
+    assert body == {"model": "y", "keep_alive": value, "options": {"num_ctx": 8192}}
+    assert c.notice(time.monotonic())[0] == text
+
+
+def test_keep_loaded_without_a_known_context_sends_no_options(api):
+    c = mtop.ModelControl([mtop.Endpoint("localhost:1")])
+    snap = _snap(("local", ["x"]))
+    del snap["endpoints"][0]["models"][0]["context_length"]   # older Ollama
+    c.sync(snap)
+    c.request_ttl()
+    c.ttl_key(ord("2"))
+    _wait_idle(c)
+    assert api[-1][1] == {"model": "x", "keep_alive": "2h"}
+
+
+def test_keep_loaded_other_keys_cancel_and_vanished_model_drops_the_question(api):
+    c = mtop.ModelControl([mtop.Endpoint("localhost:1")])
+    c.sync(_snap(("local", ["x"])))
+    c.request_ttl()
+    c.ttl_key(ord("9"))
+    assert c.ttl_target is None and not api
+    c.request_ttl()
+    c.ttl_key(27)
+    assert not api
+    c.request_ttl()
+    c.sync(_snap(("local", [])))
+    assert c.ttl_target is None
+
+
+def test_keep_loaded_failure_is_reported(monkeypatch):
+    monkeypatch.setattr(mtop.util, "http_post_json", lambda *a, **k: (False, "HTTP 404 Not Found"))
+    c = mtop.ModelControl([mtop.Endpoint("localhost:1")])
+    c.sync(_snap(("local", ["x"])))
+    c.request_ttl()
+    c.ttl_key(ord("1"))
+    _wait_idle(c)
+    assert c.notice(time.monotonic())[0] == "Keep-alive of x failed: HTTP 404 Not Found"

@@ -141,7 +141,7 @@ def main():
         epilog="Keys: q=quit, +=faster, -=slower, o=toggle raw ollama ps, "
                "r=toggle runners, e=toggle server config, l=toggle logs; "
                "with --control: up/down=select model, s=stop (unload) it, "
-               "L=load one from /api/tags\n\n"
+               "t=keep it loaded longer, L=load one from /api/tags\n\n"
                "https://github.com/Quaerendir/mtop",
     )
     parser.add_argument("-c", "--container", default=DEFAULT_CONTAINER,
@@ -197,6 +197,7 @@ def main():
     parser.add_argument("--control", action="store_true",
                         help="Allow model actions in the TUI: select a loaded model with "
                              "the arrow keys, 's' stops (unloads) it after a y/N prompt, "
+                             "'t' keeps it loaded for 30m/2h/24h/forever, "
                              "'L' picks a model from /api/tags and loads it. "
                              "Off by default — without it mtop never writes to the API")
     parser.add_argument("--no-docker", action="store_true",

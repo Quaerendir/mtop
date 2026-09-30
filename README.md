@@ -117,7 +117,8 @@ Options:
                          `logs` with request stats to --json / --prometheus
       --log-lines N      Log lines to show (default: 8)
       --control          Allow model actions: arrow keys select a loaded model, s stops
-                         (unloads) it after a y/N prompt, L loads one from /api/tags.
+                         (unloads) it after a y/N prompt, t keeps it loaded longer,
+                         L loads one from /api/tags.
                          Off by default — without it mtop never writes to the API
       --no-docker        API-only mode: skip all docker calls (remote instances)
       --json             Print one snapshot as JSON and exit (exit 1 on unhealthy)
@@ -196,6 +197,7 @@ mtop
 | `l` | Toggle the `LOGS` section (container logs / journalctl, request stats) |
 | `↑` / `↓` | Select a loaded model (`--control` only) |
 | `s` | Stop (unload) the selected model after a `y/N` prompt (`--control` only) |
+| `t` | Keep the selected model loaded for 30m / 2h / 24h / forever (`1`–`4`), keeping its context size (`--control` only) |
 | `L` | Pick a model from `/api/tags` and load it; `Tab` switches endpoint. Asks first when the server is at `OLLAMA_MAX_LOADED_MODELS` (`--control` only) |
 
 ## What you see
@@ -264,8 +266,7 @@ Not available with this backend: the raw `ollama ps` table (`o`) and `--control`
 - [x] Multi-host support (repeatable `-u`, per-endpoint model tables)
 - [x] Docker Engine API over the socket, Podman support
 - [x] Configurable layout (raw `ollama ps` toggle; more sections to follow)
-- [x] Model actions — unload on keypress and load from `/api/tags` (`--control`)
-- [ ] Model actions — extend TTL
+- [x] Model actions — unload, load from `/api/tags`, extend TTL (`--control`)
 - [x] Sparkline history for CPU/GPU utilization (block chars, stdlib deque)
 - [x] systemd/bare-metal Ollama support (process stats via `/proc`, no Docker required)
 - [x] Log panel (container logs / journalctl) with request stats from the GIN log

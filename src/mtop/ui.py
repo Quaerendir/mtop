@@ -22,6 +22,8 @@ from .util import bytes_to_gib, fmt_duration, relative_time, to_float
 UI_POLL_MS = 100          # curses getch timeout — UI responsiveness, not data rate
 UNLOAD_TIMEOUT = 30       # s — a busy server finishes in-flight requests before unloading
 LOAD_TIMEOUT = 900        # s — a 100B+ model from a cold disk takes minutes
+# `t` on a loaded model: key -> (label, keep_alive value Ollama accepts)
+TTL_CHOICES = (("30m", "30m"), ("2h", "2h"), ("24h", "24h"), ("forever", -1))
 NOTICE_HOLD = 5.0         # s a model-action result stays in the footer
 C_HEADER = 1
 C_OK = 2
@@ -776,7 +778,7 @@ def render_footer(win, interval: float, raw_ps: bool, can_raw_ps: bool,
         return
     parts = ["q: quit", f"+/-: interval ({interval:.1f}s)"]
     if control:
-        parts.append("↑/↓: select │ s: stop │ L: load model")
+        parts.append("↑/↓: select │ s: stop │ t: keep loaded │ L: load model")
     if can_raw_ps:
         parts.append(f"o: raw ps [{'on' if raw_ps else 'off'}]")
         parts.append(f"r: runners [{'on' if runners else 'off'}]")
@@ -822,7 +824,11 @@ class ModelControl:
     Stop is `POST /api/generate {"model": name, "keep_alive": 0}` — the same
     request `ollama stop` sends. Load is the same call without `keep_alive`
     (the server's OLLAMA_KEEP_ALIVE applies), picked from `/api/tags` in an
-    overlay. Both run on a thread so the UI keeps drawing; one at a time.
+    overlay. Keep-loaded (`t`) sends the same call with a new `keep_alive`
+    *and* the model's current `num_ctx`: without it Ollama treats the
+    request as asking for default options and reloads the model with the
+    Modelfile's context (seen on 0.34: 8192 -> 65536, new runner). All run
+    on a thread so the UI keeps drawing; one at a time.
     """
 
     def __init__(self, endpoints: list):
@@ -833,6 +839,7 @@ class ModelControl:
         self.picker: dict | None = None
         # (endpoint, model, models that may be evicted, limit, limit source)
         self.load_confirm: tuple[int, str, list[str], int, str] | None = None
+        self.ttl_target: tuple[int, str] | None = None
         self._snap: dict = {}
         self._index = 0
         self._result: tuple[str, bool, float] | None = None   # text, ok, monotonic until
@@ -858,6 +865,8 @@ class ModelControl:
             self.selected = None
         if self.confirm not in rows:
             self.confirm = None
+        if self.ttl_target not in rows:
+            self.ttl_target = None
 
     def move(self, delta: int, snap: dict) -> None:
         rows = self.rows(snap)
@@ -869,6 +878,33 @@ class ModelControl:
     def request_stop(self) -> None:
         if self.selected and not self.busy:
             self.confirm = self.selected
+
+    def request_ttl(self) -> None:
+        if self.selected and not self.busy:
+            self.ttl_target = self.selected
+
+    def ttl_key(self, key: int) -> None:
+        """1-4 picks a keep-alive from TTL_CHOICES; any other key cancels."""
+        target, self.ttl_target = self.ttl_target, None
+        idx = key - ord("1")
+        if target is None or not 0 <= idx < len(TTL_CHOICES):
+            return
+        label, value = TTL_CHOICES[idx]
+        extra: dict = {"keep_alive": value}
+        ctx = (self._model(target) or {}).get("context_length")
+        if ctx:
+            extra["options"] = {"num_ctx": int(ctx)}
+        when = "until unloaded" if value == -1 else f"for {label}"
+        self._start("Extending", target, extra, UNLOAD_TIMEOUT,
+                    done=f"Keeping {self.label(target)} loaded {when}")
+
+    def _model(self, target: tuple[int, str]) -> dict | None:
+        """The /api/ps entry of `target` in the latest snapshot."""
+        endpoints = self._snap.get("endpoints") or [self._snap]
+        if target[0] >= len(endpoints):
+            return None
+        return next((m for m in endpoints[target[0]].get("models") or []
+                     if m.get("name") == target[1]), None)
 
     def answer(self, yes: bool) -> None:
         """y/N for whichever question is open: stop, or a load that evicts."""
@@ -954,19 +990,25 @@ class ModelControl:
 
     # ── actions ──────────────────────────────────────────────────────────────
 
-    def _start(self, verb: str, target: tuple[int, str], extra: dict, timeout: int) -> None:
+    _VERBS = {"Stopping": ("Stopped", "Stop"), "Loading": ("Loaded", "Load"),
+              "Extending": ("Extended", "Keep-alive of")}
+
+    def _start(self, verb: str, target: tuple[int, str], extra: dict, timeout: int,
+               done: str | None = None) -> None:
         if self.busy:
             return
         self.busy = (verb, target[0], target[1], time.monotonic())
-        threading.Thread(target=self._run, args=(verb, target, extra, timeout),
+        threading.Thread(target=self._run, args=(verb, target, extra, timeout, done),
                          daemon=True, name="mtop-action").start()
 
-    def _run(self, verb: str, target: tuple[int, str], extra: dict, timeout: int) -> None:
+    def _run(self, verb: str, target: tuple[int, str], extra: dict, timeout: int,
+             done: str | None = None) -> None:
         i, name = target
         ok, data = self.endpoints[i].post_json(
             "/api/generate", {"model": name, **extra}, timeout=timeout)
-        done, what = ("Stopped", "Stop") if verb == "Stopping" else ("Loaded", "Load")
-        text = f"{done} {self.label(target)}" if ok else f"{what} {name} failed: {data}"
+        past, what = self._VERBS[verb]
+        text = ((done or f"{past} {self.label(target)}") if ok
+                else f"{what} {name} failed: {data}")
         with self._lock:
             self._result = (text, ok, time.monotonic() + NOTICE_HOLD)
             self.busy = None
@@ -992,6 +1034,10 @@ class ModelControl:
             # The question first: long model names get cut at the right edge.
             return (f"Load {self.label((ep, name))}? [y/N] — {len(loaded)}/{limit} loaded "
                     f"({source}), Ollama will unload one of: {', '.join(loaded)}",
+                    curses.color_pair(C_WARN) | curses.A_BOLD)
+        if self.ttl_target:
+            keys = " │ ".join(f"{n}: {label}" for n, (label, _) in enumerate(TTL_CHOICES, 1))
+            return (f"Keep {self.label(self.ttl_target)} loaded for — {keys} │ other key: cancel",
                     curses.color_pair(C_WARN) | curses.A_BOLD)
         if self.confirm:
             return (f"Stop {self.label(self.confirm)}? [y/N]",
@@ -1107,6 +1153,8 @@ def curses_main(stdscr, args):
                 key = stdscr.getch()
                 if control and control.picker and key not in (-1, curses.KEY_RESIZE):
                     control.picker_key(key)
+                elif control and control.ttl_target and key not in (-1, curses.KEY_RESIZE):
+                    control.ttl_key(key)
                 elif control and control.asking and key not in (-1, curses.KEY_RESIZE):
                     control.answer(key in (ord("y"), ord("Y")))   # anything else: no
                 elif key in (ord("q"), ord("Q"), 27):  # q, Q, ESC
@@ -1131,6 +1179,8 @@ def curses_main(stdscr, args):
                     control.move(1, snap)
                 elif control and key == ord("s"):
                     control.request_stop()
+                elif control and key == ord("t"):
+                    control.request_ttl()
                 elif control and key == ord("L"):
                     control.open_picker()
                 elif key == curses.KEY_RESIZE:
