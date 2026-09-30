@@ -350,12 +350,14 @@ def test_no_question_when_the_limit_is_unknown(api):
     _wait_idle(c)
 
 
-def test_control_refuses_the_llama_swap_backend(monkeypatch, capsys):
-    monkeypatch.setattr("sys.argv", ["mtop", "--control", "--backend", "llama-swap"])
+def test_control_is_accepted_with_the_llama_swap_backend(monkeypatch):
+    seen = {}
+    monkeypatch.setattr("sys.argv", ["mtop", "--control", "--backend", "llama-swap", "--json"])
+    monkeypatch.setattr(mtop.cli, "headless_main",
+                        lambda args: seen.update(control=args.control, backend=args.backend) or 0)
     with pytest.raises(SystemExit) as e:
         mtop.main()
-    assert e.value.code == 2
-    assert "--control works with --backend ollama only" in capsys.readouterr().err
+    assert e.value.code == 0 and seen == {"control": True, "backend": "llama-swap"}
 
 
 # ── keep loaded (TTL) ────────────────────────────────────────────────────────

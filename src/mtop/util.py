@@ -110,14 +110,23 @@ def http_post_json(url: str, body: Any, timeout: int = 5,
     return _http_json(url, json.dumps(body).encode(), timeout, headers, context)
 
 
+def http_request(url: str, method: str = "GET", timeout: int = 5,
+                 headers: dict[str, str] | None = None,
+                 context: ssl.SSLContext | None = None) -> tuple[bool, Any]:
+    """A bodyless request whose reply is text, not JSON — llama-swap's
+    `POST /api/models/unload/<model>` and `/upstream/<model>/health` say `OK`."""
+    return _http_json(url, None, timeout, headers, context, method=method, parse=False)
+
+
 def _http_json(url: str, data: bytes | None, timeout: int,
                headers: dict[str, str] | None,
-               context: ssl.SSLContext | None) -> tuple[bool, Any]:
+               context: ssl.SSLContext | None,
+               method: str | None = None, parse: bool = True) -> tuple[bool, Any]:
     try:
         hdrs = {"Accept": "application/json", **(headers or {})}
         if data is not None:
             hdrs["Content-Type"] = "application/json"
-        req = urllib.request.Request(url, data=data, headers=hdrs)
+        req = urllib.request.Request(url, data=data, headers=hdrs, method=method)
         if context is not None:
             opener = urllib.request.build_opener(
                 urllib.request.HTTPSHandler(context=context),
@@ -125,7 +134,8 @@ def _http_json(url: str, data: bytes | None, timeout: int,
         else:
             opener = _DIRECT_OPENER if is_loopback_url(url) else _PROXY_OPENER
         with opener.open(req, timeout=timeout) as resp:
-            return True, json.loads(resp.read().decode())
+            body = resp.read().decode(errors="replace")
+            return True, (json.loads(body) if parse else body)
     except urllib.error.HTTPError as e:
         return False, f"HTTP {e.code} {e.reason}"
     except urllib.error.URLError as e:
@@ -207,6 +217,10 @@ class Endpoint:
     def post_json(self, path: str, body: Any, timeout: int = 5) -> tuple[bool, Any]:
         return http_post_json(self.url + path, body, timeout, self.headers or None,
                               self.context)
+
+    def request(self, method: str, path: str, timeout: int = 5) -> tuple[bool, Any]:
+        return http_request(self.url + path, method, timeout, self.headers or None,
+                            self.context)
 
     def describe(self) -> dict:
         return {"label": self.label, "url": self.url,

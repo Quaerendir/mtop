@@ -198,7 +198,8 @@ def main():
                         help="Allow model actions in the TUI: select a loaded model with "
                              "the arrow keys, 's' stops (unloads) it after a y/N prompt, "
                              "'t' keeps it loaded for 30m/2h/24h/forever, "
-                             "'L' picks a model from /api/tags and loads it. "
+                             "'L' picks a model from /api/tags and loads it (llama-swap: "
+                             "loads the selected catalog entry; no 't', TTL is config). "
                              "Off by default — without it mtop never writes to the API")
     parser.add_argument("--no-docker", action="store_true",
                         help="Alias for --mode api (kept for compatibility)")
@@ -253,10 +254,6 @@ def main():
     if args.no_docker and args.mode == "auto":
         args.mode = "api"
 
-    if args.control and args.backend != "ollama":
-        # Stop and load are Ollama's /api/generate and /api/tags; llama-swap
-        # has neither.
-        parser.error("--control works with --backend ollama only")
     if args.watch and not (args.json or args.prometheus):
         parser.error("--watch needs --json or --prometheus")
     if args.json and args.prometheus:

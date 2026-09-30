@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- **`--control` with `--backend llama-swap`.** Previously refused. The
+  cursor walks the whole catalog; `s` stops the selected model
+  (`POST /api/models/unload/<model>`, one model, not `/unload`'s all), `L`
+  starts it (`GET /upstream/<model>/health` — answers once the model is up,
+  and llama-swap keeps starting it if mtop exits). Without groups in its
+  config llama-swap runs one model at a time, so `L` asks
+  `Load <model>? [y/N]` and names what it will stop while another model
+  runs. `s` on a model that is not running and `t` (TTL is llama-swap
+  config) explain themselves in the footer instead of doing nothing.
+  Verified with llama-swap v256 on the Spark: load, swap warning, n/y,
+  stop. `Endpoint.request` / `http_request` added for its text replies.
+
 ## 0.13.1 — 2026-09-30
 
 ### Added

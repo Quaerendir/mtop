@@ -11,6 +11,7 @@ import curses
 import os
 import threading
 import time
+import urllib.parse
 from datetime import datetime
 
 from ._version import __version__
@@ -450,17 +451,16 @@ def render_models(win, y: int, snap: dict,
     """Models from /api/ps (Ollama) or /v1/models+/running (llama-swap) —
     one table per endpoint when there are several.
 
-    `selected` is (endpoint index, model name) of the --control cursor
-    (Ollama only).
+    `selected` is (endpoint index, model name) of the --control cursor.
     """
     backend = snap.get("backend", "ollama")
     endpoints = snap.get("endpoints") or [snap]
 
     def table(y: int, i: int, ep: dict, title: str) -> int:
+        name = selected[1] if selected and selected[0] == i else None
         if backend == "llama-swap":
-            return render_llama_swap_models_table(win, y, ep, title)
-        return render_models_table(win, y, ep, title,
-                                   selected[1] if selected and selected[0] == i else None)
+            return render_llama_swap_models_table(win, y, ep, title, name)
+        return render_models_table(win, y, ep, title, name)
 
     title = " MODELS " if backend == "llama-swap" else " LOADED MODELS "
     if len(endpoints) == 1:
@@ -471,7 +471,8 @@ def render_models(win, y: int, snap: dict,
     return y
 
 
-def render_llama_swap_models_table(win, y: int, ep: dict, title: str) -> int:
+def render_llama_swap_models_table(win, y: int, ep: dict, title: str,
+                                   selected_name: str | None = None) -> int:
     """llama-swap's catalog: every *configured* model, loaded or not — unlike
     Ollama's /api/ps, which only ever lists what is currently loaded. There is
     no VRAM/RAM split or context length here; that lives in the runner argv
@@ -510,9 +511,11 @@ def render_llama_swap_models_table(win, y: int, ep: dict, title: str) -> int:
     # draw_table's row_attr is a single style for the whole table (see its
     # docstring) — no per-row coloring, so "starting" and "ready" share the
     # same OK color rather than adding that capability for one table.
+    names = [m.get("name", "?") for m in models]
     y = draw_table(win, y, 3, headers, rows, col_widths,
                    hdr_attr=curses.color_pair(C_TABLE_HDR) | curses.A_BOLD,
-                   row_attr=curses.color_pair(C_OK))
+                   row_attr=curses.color_pair(C_OK),
+                   selected=names.index(selected_name) if selected_name in names else None)
     y += 1
     return y
 
@@ -763,7 +766,7 @@ def render_logs(win, y: int, snap: dict) -> int:
 
 def render_footer(win, interval: float, raw_ps: bool, can_raw_ps: bool,
                   runners: bool = True, runtime: str | None = None,
-                  env: bool = True, logs: bool = False, control: bool = False,
+                  env: bool = True, logs: bool = False, control: bool | str = False,
                   notice: tuple[str, int] | None = None):
     """Key hints, or — while a model action asks or reports — `notice` (text, attr)."""
     max_y, max_x = win.getmaxyx()
@@ -778,7 +781,8 @@ def render_footer(win, interval: float, raw_ps: bool, can_raw_ps: bool,
         return
     parts = ["q: quit", f"+/-: interval ({interval:.1f}s)"]
     if control:
-        parts.append("↑/↓: select │ s: stop │ t: keep loaded │ L: load model")
+        parts.append("↑/↓: select │ s: stop │ L: load model" if control == "llama-swap"
+                     else "↑/↓: select │ s: stop │ t: keep loaded │ L: load model")
     if can_raw_ps:
         parts.append(f"o: raw ps [{'on' if raw_ps else 'off'}]")
         parts.append(f"r: runners [{'on' if runners else 'off'}]")
@@ -829,10 +833,18 @@ class ModelControl:
     request as asking for default options and reloads the model with the
     Modelfile's context (seen on 0.34: 8192 -> 65536, new runner). All run
     on a thread so the UI keeps drawing; one at a time.
+
+    With llama-swap the cursor walks the whole catalog (every configured
+    model). Stop is `POST /api/models/unload/<model>`; load is
+    `GET /upstream/<model>/health`, which starts the model and answers once
+    it is up — and keeps starting it if mtop goes away. llama-swap runs one
+    model at a time unless its config groups them, so a load while another
+    model runs asks first. There is no keep-alive to change: TTL is config.
     """
 
-    def __init__(self, endpoints: list):
+    def __init__(self, endpoints: list, backend: str = "ollama"):
         self.endpoints = endpoints
+        self.swap = backend == "llama-swap"
         self.selected: tuple[int, str] | None = None
         self.confirm: tuple[int, str] | None = None
         self.busy: tuple[str, int, str, float] | None = None  # verb, ep, name, started
@@ -840,6 +852,8 @@ class ModelControl:
         # (endpoint, model, models that may be evicted, limit, limit source)
         self.load_confirm: tuple[int, str, list[str], int, str] | None = None
         self.ttl_target: tuple[int, str] | None = None
+        # llama-swap load: (endpoint, model, running models it would stop)
+        self.swap_confirm: tuple[int, str, list[str]] | None = None
         self._snap: dict = {}
         self._index = 0
         self._result: tuple[str, bool, float] | None = None   # text, ok, monotonic until
@@ -867,6 +881,8 @@ class ModelControl:
             self.confirm = None
         if self.ttl_target not in rows:
             self.ttl_target = None
+        if self.swap_confirm and self.swap_confirm[:2] not in rows:
+            self.swap_confirm = None
 
     def move(self, delta: int, snap: dict) -> None:
         rows = self.rows(snap)
@@ -876,12 +892,56 @@ class ModelControl:
         self.selected = rows[self._index]
 
     def request_stop(self) -> None:
-        if self.selected and not self.busy:
-            self.confirm = self.selected
+        if not self.selected or self.busy:
+            return
+        if self.swap and not self._running(self.selected):
+            self._say(f"{self.label(self.selected)} is not running", ok=False)
+            return
+        self.confirm = self.selected
 
     def request_ttl(self) -> None:
+        if self.swap:
+            self._say("llama-swap sets each model's TTL in its config", ok=False)
+            return
         if self.selected and not self.busy:
             self.ttl_target = self.selected
+
+    def request_load(self) -> None:
+        """`L`: the /api/tags picker (Ollama), or the selected catalog entry
+        (llama-swap — its whole catalog is already on screen)."""
+        if not self.swap:
+            self.open_picker()
+            return
+        if not self.selected or self.busy:
+            return
+        if self._running(self.selected):
+            self._say(f"{self.label(self.selected)} is already running", ok=True)
+            return
+        i = self.selected[0]
+        others = [m.get("name", "?") for m in self._models(i)
+                  if m.get("running") and m.get("name") != self.selected[1]]
+        if others:
+            self.swap_confirm = (i, self.selected[1], others)
+        else:
+            self._load(self.selected)
+
+    def _models(self, ep: int) -> list[dict]:
+        endpoints = self._snap.get("endpoints") or [self._snap]
+        return (endpoints[ep].get("models") or []) if ep < len(endpoints) else []
+
+    def _running(self, target: tuple[int, str]) -> bool:
+        return bool((self._model(target) or {}).get("running", True))
+
+    def _say(self, text: str, ok: bool) -> None:
+        with self._lock:
+            self._result = (text, ok, time.monotonic() + NOTICE_HOLD)
+
+    def _load(self, target: tuple[int, str]) -> None:
+        if self.swap:
+            path = f"/upstream/{urllib.parse.quote(target[1])}/health"
+            self._start("Loading", target, None, LOAD_TIMEOUT, request=("GET", path))
+        else:
+            self._start("Loading", target, {}, LOAD_TIMEOUT)
 
     def ttl_key(self, key: int) -> None:
         """1-4 picks a keep-alive from TTL_CHOICES; any other key cancels."""
@@ -910,14 +970,18 @@ class ModelControl:
         """y/N for whichever question is open: stop, or a load that evicts."""
         target, self.confirm = self.confirm, None
         load, self.load_confirm = self.load_confirm, None
-        if yes and target:
+        swap, self.swap_confirm = self.swap_confirm, None
+        if yes and target and self.swap:
+            path = f"/api/models/unload/{urllib.parse.quote(target[1])}"
+            self._start("Stopping", target, None, UNLOAD_TIMEOUT, request=("POST", path))
+        elif yes and target:
             self._start("Stopping", target, {"keep_alive": 0}, UNLOAD_TIMEOUT)
-        elif yes and load:
-            self._start("Loading", load[:2], {}, LOAD_TIMEOUT)
+        elif yes and (load or swap):
+            self._load((load or swap)[:2])
 
     @property
     def asking(self) -> bool:
-        return bool(self.confirm or self.load_confirm)
+        return bool(self.confirm or self.load_confirm or self.swap_confirm)
 
     def evictions(self, ep: int) -> tuple[list[str], int, str] | None:
         """Resident models on `ep` when it is at its model-count limit.
@@ -926,7 +990,7 @@ class ModelControl:
         reads). Which model Ollama drops is its scheduler's choice, so the
         warning names the candidates, not a victim.
         """
-        if ep != 0:
+        if ep != 0 or self.swap:
             return None
         limit = max_loaded_models(self._snap)
         if limit is None:
@@ -986,26 +1050,32 @@ class ModelControl:
             if full and name not in full[0]:      # reloading a resident model evicts nothing
                 self.load_confirm = (pk["ep"], name, *full)
             else:
-                self._start("Loading", (pk["ep"], name), {}, LOAD_TIMEOUT)
+                self._load((pk["ep"], name))
 
     # ── actions ──────────────────────────────────────────────────────────────
 
     _VERBS = {"Stopping": ("Stopped", "Stop"), "Loading": ("Loaded", "Load"),
               "Extending": ("Extended", "Keep-alive of")}
 
-    def _start(self, verb: str, target: tuple[int, str], extra: dict, timeout: int,
-               done: str | None = None) -> None:
+    def _start(self, verb: str, target: tuple[int, str], extra: dict | None, timeout: int,
+               done: str | None = None, request: tuple[str, str] | None = None) -> None:
+        """`extra` goes into Ollama's /api/generate body; `request` is a
+        (method, path) with no body instead — llama-swap's endpoints."""
         if self.busy:
             return
         self.busy = (verb, target[0], target[1], time.monotonic())
-        threading.Thread(target=self._run, args=(verb, target, extra, timeout, done),
+        threading.Thread(target=self._run,
+                         args=(verb, target, extra, timeout, done, request),
                          daemon=True, name="mtop-action").start()
 
-    def _run(self, verb: str, target: tuple[int, str], extra: dict, timeout: int,
-             done: str | None = None) -> None:
+    def _run(self, verb: str, target: tuple[int, str], extra: dict | None, timeout: int,
+             done: str | None = None, request: tuple[str, str] | None = None) -> None:
         i, name = target
-        ok, data = self.endpoints[i].post_json(
-            "/api/generate", {"model": name, **extra}, timeout=timeout)
+        if request is not None:
+            ok, data = self.endpoints[i].request(*request, timeout=timeout)
+        else:
+            ok, data = self.endpoints[i].post_json(
+                "/api/generate", {"model": name, **(extra or {})}, timeout=timeout)
         past, what = self._VERBS[verb]
         text = ((done or f"{past} {self.label(target)}") if ok
                 else f"{what} {name} failed: {data}")
@@ -1034,6 +1104,11 @@ class ModelControl:
             # The question first: long model names get cut at the right edge.
             return (f"Load {self.label((ep, name))}? [y/N] — {len(loaded)}/{limit} loaded "
                     f"({source}), Ollama will unload one of: {', '.join(loaded)}",
+                    curses.color_pair(C_WARN) | curses.A_BOLD)
+        if self.swap_confirm:
+            ep, name, others = self.swap_confirm
+            return (f"Load {self.label((ep, name))}? [y/N] — llama-swap will stop "
+                    f"{', '.join(others)} unless its config groups them",
                     curses.color_pair(C_WARN) | curses.A_BOLD)
         if self.ttl_target:
             keys = " │ ".join(f"{n}: {label}" for n, (label, _) in enumerate(TTL_CHOICES, 1))
@@ -1144,7 +1219,9 @@ def curses_main(stdscr, args):
         backend=getattr(args, "backend", "ollama"),
     )
     collector.start()
-    control = ModelControl(collector.endpoints) if getattr(args, "control", False) else None
+    backend = getattr(args, "backend", "ollama")
+    control = (ModelControl(collector.endpoints, backend)
+               if getattr(args, "control", False) else None)
     snap = collector.snapshot()
 
     try:
@@ -1182,7 +1259,7 @@ def curses_main(stdscr, args):
                 elif control and key == ord("t"):
                     control.request_ttl()
                 elif control and key == ord("L"):
-                    control.open_picker()
+                    control.request_load()
                 elif key == curses.KEY_RESIZE:
                     stdscr.erase()
             except curses.error:
@@ -1235,7 +1312,7 @@ def curses_main(stdscr, args):
             render_footer(stdscr, collector.interval, collector.show_raw_ps,
                           mode in ("docker", "local"), collector.show_runners,
                           snap.get("runtime"), collector.show_env, collector.show_logs,
-                          control is not None,
+                          backend if control else False,
                           control.notice(time.monotonic()) if control else None)
             stdscr.refresh()
     finally:

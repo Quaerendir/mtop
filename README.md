@@ -195,10 +195,10 @@ mtop
 | `r` | Toggle the `RUNNERS` section |
 | `e` | Toggle the `SERVER CONFIG` section |
 | `l` | Toggle the `LOGS` section (container logs / journalctl, request stats) |
-| `↑` / `↓` | Select a loaded model (`--control` only) |
+| `↑` / `↓` | Select a loaded model — with llama-swap, any catalog entry (`--control` only) |
 | `s` | Stop (unload) the selected model after a `y/N` prompt (`--control` only) |
-| `t` | Keep the selected model loaded for 30m / 2h / 24h / forever (`1`–`4`), keeping its context size (`--control` only) |
-| `L` | Pick a model from `/api/tags` and load it; `Tab` switches endpoint. Asks first when the server is at `OLLAMA_MAX_LOADED_MODELS` (`--control` only) |
+| `t` | Keep the selected model loaded for 30m / 2h / 24h / forever (`1`–`4`), keeping its context size (`--control`, Ollama only) |
+| `L` | Ollama: pick a model from `/api/tags` and load it; `Tab` switches endpoint; asks first when the server is at `OLLAMA_MAX_LOADED_MODELS`. llama-swap: load the selected catalog entry; asks first when another model runs (`--control` only) |
 
 ## What you see
 
@@ -230,7 +230,9 @@ The screenshot above is a real session on a DGX Spark (GB10) with Ollama in Dock
 
 Defaults follow the backend: the API is `http://localhost:8001` and the container name `llama-swap`, so on a box that runs both, `--mode auto` does not lock onto the unrelated `ollama` container. Pass `-u` / `-c` for anything else.
 
-Not available with this backend: the raw `ollama ps` table (`o`) and `--control` (stop/load use Ollama's `/api/generate` and `/api/tags`; mtop refuses the combination). Verified against llama-swap + vLLM on an NVIDIA GB10.
+`--control` works here too: the cursor walks the whole catalog, `s` stops the selected model (`POST /api/models/unload/<model>`), `L` starts it (`GET /upstream/<model>/health`, which answers once the model is up; the start carries on if mtop exits). llama-swap runs one model at a time unless its config groups them, so `L` asks first while another model runs. There is no `t`: llama-swap takes TTL from its config. Tested with llama-swap v256.
+
+Not available with this backend: the raw `ollama ps` table (`o`) and keep-loaded (`t`). Verified against llama-swap + vLLM and llama-server on an NVIDIA GB10.
 
 ## Supported Platforms
 

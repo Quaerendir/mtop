@@ -268,3 +268,154 @@ def test_unmatched_llama_server_shows_its_gguf_and_state_shows_for_any_engine():
     w = FakeWin(rows=6, cols=200)
     mtop.render_runners(w, 0, {"runners": [r]})
     assert "qwen3.8-fable-heretic-q4" in w.text() and "state:ready" in w.text()
+
+
+# ── --control with llama-swap ────────────────────────────────────────────────
+
+import http.server  # noqa: E402
+import threading  # noqa: E402
+import time  # noqa: E402
+
+
+def _swap_snap(running=("qwen3.8-27b",)):
+    names = ["gpt-oss-120b", "qwen3.8-27b", "qwen3.8-fable-heretic-q4"]
+    return {"backend": "llama-swap", "endpoints": [{
+        "label": "localhost:8001", "models_ok": True,
+        "models": [{"name": n, "state": "ready" if n in running else "unloaded",
+                    "running": n in running} for n in names]}]}
+
+
+@pytest.fixture
+def swap_api(monkeypatch):
+    calls = []
+
+    def request(url, method="GET", timeout=5, *a):
+        calls.append((method, url, timeout))
+        return True, "OK"
+
+    monkeypatch.setattr(mtop.util, "http_request", request)
+    monkeypatch.setattr(mtop.util, "http_post_json",
+                        lambda *a, **k: pytest.fail("no Ollama /api/generate under llama-swap"))
+    return calls
+
+
+def _swap_control(snap, select):
+    c = mtop.ModelControl([mtop.Endpoint("localhost:8001")], backend="llama-swap")
+    c.sync(snap)
+    while c.selected[1] != select:
+        c.move(1, snap)
+    return c
+
+
+def _idle(c):
+    deadline = time.monotonic() + 2
+    while c.busy and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert c.busy is None
+
+
+def test_swap_stop_unloads_one_model_after_asking(swap_api):
+    c = _swap_control(_swap_snap(), "qwen3.8-27b")
+    c.request_stop()
+    assert c.notice(time.monotonic())[0] == "Stop qwen3.8-27b? [y/N]"
+    c.answer(True)
+    _idle(c)
+    assert swap_api == [("POST", "http://localhost:8001/api/models/unload/qwen3.8-27b",
+                         mtop.ui.UNLOAD_TIMEOUT)]
+    assert c.notice(time.monotonic())[0] == "Stopped qwen3.8-27b"
+
+
+def test_swap_stop_of_a_model_that_is_not_running_says_so(swap_api):
+    c = _swap_control(_swap_snap(), "gpt-oss-120b")
+    c.request_stop()
+    assert not c.asking and not swap_api
+    assert c.notice(time.monotonic())[0] == "gpt-oss-120b is not running"
+
+
+def test_swap_load_with_nothing_running_starts_right_away(swap_api):
+    c = _swap_control(_swap_snap(running=()), "qwen3.8-fable-heretic-q4")
+    c.request_load()
+    assert c.picker is None and not c.asking
+    _idle(c)
+    assert swap_api == [("GET", "http://localhost:8001/upstream/qwen3.8-fable-heretic-q4/health",
+                         mtop.ui.LOAD_TIMEOUT)]
+    assert c.notice(time.monotonic())[0] == "Loaded qwen3.8-fable-heretic-q4"
+
+
+def test_swap_load_while_another_runs_warns_about_the_swap(swap_api):
+    c = _swap_control(_swap_snap(), "gpt-oss-120b")
+    c.request_load()
+    assert c.notice(time.monotonic())[0] == (
+        "Load gpt-oss-120b? [y/N] — llama-swap will stop qwen3.8-27b "
+        "unless its config groups them")
+    c.answer(False)
+    assert not swap_api and not c.asking
+    c.request_load()
+    c.answer(True)
+    _idle(c)
+    assert swap_api[-1][:2] == ("GET", "http://localhost:8001/upstream/gpt-oss-120b/health")
+
+
+def test_swap_load_of_a_running_model_and_ttl_are_explained(swap_api):
+    c = _swap_control(_swap_snap(), "qwen3.8-27b")
+    c.request_load()
+    assert c.notice(time.monotonic())[0] == "qwen3.8-27b is already running"
+    c.request_ttl()
+    assert c.ttl_target is None
+    assert c.notice(time.monotonic())[0] == "llama-swap sets each model's TTL in its config"
+    assert not swap_api
+
+
+def test_swap_model_names_are_quoted_in_paths(swap_api):
+    snap = _swap_snap(running=())
+    snap["endpoints"][0]["models"].append({"name": "org/my model", "running": False})
+    c = _swap_control(snap, "org/my model")
+    c.request_load()
+    _idle(c)
+    assert swap_api[-1][1] == "http://localhost:8001/upstream/org/my%20model/health"
+
+
+def test_swap_cursor_is_drawn_and_footer_has_no_ttl_key():
+    w = FakeWin(rows=12, cols=140)
+    mtop.render_models(w, 0, _swap_snap(), selected=(0, "qwen3.8-27b"))
+    rev = [t for _, _, t, attr in w.calls if attr & mtop.ui.curses.A_REVERSE]
+    assert len(rev) == 1 and rev[0].startswith("qwen3.8-27b")
+    w = FakeWin(rows=3, cols=160)
+    mtop.render_footer(w, 1.0, False, False, control="llama-swap")
+    assert "s: stop │ L: load model" in w.line(2) and "t: keep" not in w.line(2)
+
+
+@pytest.fixture
+def text_server():
+    seen = []
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def _reply(self):
+            seen.append((self.command, self.path))
+            code, body = (404, b'{"error":"model not found"}') if "nope" in self.path \
+                else (200, b"OK")
+            self.send_response(code)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        do_GET = do_POST = _reply
+
+    srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        yield f"http://127.0.0.1:{srv.server_address[1]}", seen
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_endpoint_request_returns_text_and_http_errors(text_server):
+    base, seen = text_server
+    ep = mtop.Endpoint(base)
+    assert ep.request("POST", "/api/models/unload/m") == (True, "OK")
+    assert seen[-1] == ("POST", "/api/models/unload/m")
+    assert ep.request("POST", "/api/models/unload/nope") == (False, "HTTP 404 Not Found")
