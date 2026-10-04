@@ -221,7 +221,7 @@ The screenshot above is a real session on a DGX Spark (GB10) with Ollama in Dock
 
 | Section | Ollama | llama-swap |
 |---------|--------|------------|
-| MODELS | `/api/ps`: loaded models only, VRAM/RAM split, context, processor, expiry | `/v1/models` merged with `/running`: every *configured* model, loaded or not, with STATE (`ready`, `starting`, …), PORT of its upstream, TTL and the config's description |
+| MODELS | `/api/ps`: loaded models only, VRAM/RAM split, context, processor, expiry | `/v1/models` merged with `/running`: every *configured* model, loaded or not, with STATE (`ready`, `starting`, …), PORT of its upstream, TTL left and the config's description |
 | RUNNERS | llama.cpp / `ollama runner` argv | `vllm serve` argv: context (`--max-model-len`), plus `gpu-util`, `quant`, `tp` (when > 1), `trust-remote-code`; or a `llama-server` argv (GGUF models), as for Ollama. Both carry the model's llama-swap state. vLLM runners join the catalog by exact id (`--served-model-name` = llama-swap's config key), `llama-server` by its port (the upstream port in `/running`). GPU memory of vLLM's `EngineCore` child counts toward its runner |
 | Server discovery | container `ollama`, system unit `ollama.service`, or an `ollama serve` process | container `llama-swap`, the **user** unit `llama-swap.service` (`systemctl --user`), or a process named `llama-swap` |
 | SERVER CONFIG | `OLLAMA_*`, GPU selection | the same prefixes plus `VLLM_*`, `HF_*`, `TORCH_*`, `TRITON_*`, read from the container, the process or the user unit |
@@ -231,6 +231,8 @@ The screenshot above is a real session on a DGX Spark (GB10) with Ollama in Dock
 Defaults follow the backend: the API is `http://localhost:8001` and the container name `llama-swap`, so on a box that runs both, `--mode auto` does not lock onto the unrelated `ollama` container. Pass `-u` / `-c` for anything else.
 
 `--control` works here too: the cursor walks the whole catalog, `s` stops the selected model (`POST /api/models/unload/<model>`), `L` starts it (`GET /upstream/<model>/health`, which answers once the model is up; the start carries on if mtop exits). llama-swap runs one model at a time unless its config groups them, so `L` asks first while another model runs. There is no `t`: llama-swap takes TTL from its config. Tested with llama-swap v256.
+
+TTL counts down from the model's last request. llama-swap reports only the configured TTL, so mtop follows its `/api/events` stream (inflight requests, the `/upstream/<model>/…` access-log lines, models turning `ready`) and counts from what it sees. Until mtop has seen a model used, the column shows the configured TTL as an upper bound, e.g. `≤1d 0h`. A one-shot `--json` / `--prometheus` has nothing to count from; with `--watch` they get `ttl_left` / `expires_at` and `mtop_model_expires_seconds` like Ollama.
 
 Not available with this backend: the raw `ollama ps` table (`o`) and keep-loaded (`t`). Verified against llama-swap + vLLM and llama-server on an NVIDIA GB10.
 

@@ -20,7 +20,7 @@ Usage:
          [--json | --prometheus] [--watch] [-o FILE] [-h]
 """
 
-from . import cli, collector, container, export, gpu, logs, procfs, runner, util
+from . import cli, collector, container, export, gpu, logs, procfs, runner, swapwatch, util
 from ._version import __version__
 from .cli import (API_KEY_ENV, DEFAULT_API_BASE, DEFAULT_CONTAINER, DEFAULT_INTERVAL,
                   JSON_SCHEMA_VERSION, headless_main, json_main, main, snapshot_healthy,
@@ -44,7 +44,8 @@ from .util import (CLK_TCK, FOREVER_AFTER_SEC, IS_DARWIN, IS_LINUX, Endpoint, ap
 
 __all__ = [
     "__version__", "main", "Collector", "Endpoint",
-    "cli", "collector", "container", "export", "gpu", "logs", "procfs", "runner", "util",
+    "cli", "collector", "container", "export", "gpu", "logs", "procfs", "runner", "swapwatch",
+    "util",
     "API_KEY_ENV", "DEFAULT_API_BASE", "DEFAULT_CONTAINER", "DEFAULT_INTERVAL",
     "JSON_SCHEMA_VERSION", "headless_main", "json_main", "snapshot_healthy", "write_output",
     "DEFAULT_LOG_LINES", "HISTORY_LEN", "JSON_CPU_WINDOW", "LOG_FETCH", "SLOW_FLOOR",

@@ -93,6 +93,8 @@ def headless_main(args) -> int:
         return json.dumps(snap, indent=2) + "\n"
 
     try:
+        if watch:
+            collector.watch_activity()
         snap = collector.collect(time.monotonic())
         if collector.needs_second_sample(snap):
             # CPU% is a delta between two samples (/proc ticks, or one-shot

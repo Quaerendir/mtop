@@ -498,8 +498,11 @@ def render_llama_swap_models_table(win, y: int, ep: dict, title: str,
     rows = []
     for m in models:
         state = m.get("state") or "unknown"
-        ttl = m.get("ttl")
-        ttl_str = "—" if ttl in (None, 0) else fmt_duration(ttl)
+        # ttl_left once the event stream has seen the model used; until then
+        # only the configured TTL is known — an upper bound.
+        ttl, left = m.get("ttl"), m.get("ttl_left")
+        ttl_str = ("—" if ttl in (None, 0) else fmt_duration(left) if left is not None
+                   else "≤" + fmt_duration(ttl))
         rows.append([
             m.get("name", "?"),
             state,

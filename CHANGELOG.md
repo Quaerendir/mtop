@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+- **llama-swap TTL showed the configured value, not the time left.**
+  `/running` reports only the config's `ttl`. mtop now follows
+  `/api/events` (inflight requests, `/upstream/<model>/…` access-log lines,
+  the switch to `ready`) and counts down from the last use it saw. A model
+  mtop has not yet seen used shows `≤<ttl>`. Models get `ttl_left` and an
+  Ollama-style `expires_at` in `--json`, and `mtop_model_expires_seconds`
+  in Prometheus, in the TUI and with `--watch`. Verified with llama-swap v256.
+
 ## 0.13.2 — 2026-09-30
 
 ### Added

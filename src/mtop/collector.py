@@ -13,7 +13,7 @@ import os
 import threading
 import time
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from .container import ContainerRuntime, detect_runtime
@@ -29,6 +29,7 @@ from .procfs import (find_llama_swap_pid, find_ollama_pid, host_cpu_count, proce
                      systemd_output_file, total_ram_bytes)
 from .runner import (inference_env, link_runners_to_gpus, match_runners_to_models,
                      match_vllm_runners_to_models, parse_runner_argv, parse_vllm_argv)
+from .swapwatch import SwapActivity
 from .util import (CLK_TCK, IS_DARWIN, IS_LINUX, Endpoint, api_port, fmt_duration,
                    is_loopback_url, relative_time, run_cmd, to_float)
 
@@ -140,6 +141,10 @@ class Collector(threading.Thread):
             max_workers=len(self.endpoints), thread_name_prefix="mtop-api")
             if len(self.endpoints) > 1 else None)
 
+        # llama-swap /api/events followers, one per endpoint, for the TTL
+        # countdown. Only long-running modes start them (watch_activity).
+        self._activity: dict[str, SwapActivity] = {}
+
         # Multi-vendor GPU registry, built lazily so `use_docker` is already
         # resolved when the nvidia provider asks for its argv prefixes.
         self._gpu_monitor: GpuMonitor | None = None
@@ -170,6 +175,7 @@ class Collector(threading.Thread):
     # -- lifecycle -------------------------------------------------------------
 
     def run(self):
+        self.watch_activity()
         while not self._stop.is_set():
             t0 = time.monotonic()
             snap = self.collect(t0)
@@ -182,9 +188,20 @@ class Collector(threading.Thread):
         self._stop.set()
         self.close()
 
+    def watch_activity(self) -> None:
+        """Follow each llama-swap endpoint's event stream, so a loaded model's
+        TTL counts down. A one-shot snapshot has nothing to count from."""
+        if self.backend != "llama-swap" or self._activity:
+            return
+        for ep in self.endpoints:
+            self._activity[ep.label] = w = SwapActivity(ep)
+            w.start()
+
     def close(self) -> None:
         """Release the endpoint thread pool (one-shot modes call this on exit,
         so a hung remote does not delay process exit by its timeout)."""
+        for w in self._activity.values():
+            w.stop()
         if self._pool is not None:
             self._pool.shutdown(wait=False, cancel_futures=True)
             self._pool = None
@@ -406,6 +423,7 @@ class Collector(threading.Thread):
             m["state"] = r.get("state") or m.get("state", "unknown")
             m["running"] = True
             m["ttl"] = r.get("ttl")
+            self._ttl_left(ep, m)
             proxy = str(r.get("proxy", ""))
             m["port"] = proxy.rsplit(":", 1)[-1] if ":" in proxy else None
 
@@ -415,6 +433,20 @@ class Collector(threading.Thread):
             "models": models,
             "models_err": "" if ok else str(data),
         }
+
+    def _ttl_left(self, ep: Endpoint, m: dict) -> None:
+        """`ttl_left` (s) and an Ollama-style `expires_at` for a ready model
+        whose last use the event stream has seen; absent otherwise."""
+        w = self._activity.get(ep.label)
+        ttl = m.get("ttl")
+        if w is None or not ttl or m.get("state") != "ready":
+            return
+        since = w.idle_since(m["name"])
+        if since is None:
+            return
+        left = max(0.0, ttl - (time.monotonic() - since))
+        m["ttl_left"] = round(left)
+        m["expires_at"] = (datetime.now(timezone.utc) + timedelta(seconds=left)).isoformat()
 
     def _fetch_one(self, ep: Endpoint) -> dict:
         return (self._llama_swap_result(ep) if self.backend == "llama-swap"

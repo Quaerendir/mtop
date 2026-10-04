@@ -118,6 +118,25 @@ def http_request(url: str, method: str = "GET", timeout: int = 5,
     return _http_json(url, None, timeout, headers, context, method=method, parse=False)
 
 
+def _opener(url: str, context: ssl.SSLContext | None) -> urllib.request.OpenerDirector:
+    """Loopback goes direct (a corporate $http_proxy must not see it); a
+    custom TLS context needs its own opener."""
+    if context is None:
+        return _DIRECT_OPENER if is_loopback_url(url) else _PROXY_OPENER
+    return urllib.request.build_opener(
+        urllib.request.HTTPSHandler(context=context),
+        *([urllib.request.ProxyHandler({})] if is_loopback_url(url) else []))
+
+
+def http_open_stream(url: str, timeout: float, headers: dict[str, str] | None = None,
+                     context: ssl.SSLContext | None = None):
+    """Open a long-lived GET (Server-Sent Events) and return the response to
+    iterate line by line; raises on failure, unlike the JSON helpers."""
+    req = urllib.request.Request(url, headers={"Accept": "text/event-stream",
+                                               **(headers or {})})
+    return _opener(url, context).open(req, timeout=timeout)
+
+
 def _http_json(url: str, data: bytes | None, timeout: int,
                headers: dict[str, str] | None,
                context: ssl.SSLContext | None,
@@ -127,13 +146,7 @@ def _http_json(url: str, data: bytes | None, timeout: int,
         if data is not None:
             hdrs["Content-Type"] = "application/json"
         req = urllib.request.Request(url, data=data, headers=hdrs, method=method)
-        if context is not None:
-            opener = urllib.request.build_opener(
-                urllib.request.HTTPSHandler(context=context),
-                *([urllib.request.ProxyHandler({})] if is_loopback_url(url) else []))
-        else:
-            opener = _DIRECT_OPENER if is_loopback_url(url) else _PROXY_OPENER
-        with opener.open(req, timeout=timeout) as resp:
+        with _opener(url, context).open(req, timeout=timeout) as resp:
             body = resp.read().decode(errors="replace")
             return True, (json.loads(body) if parse else body)
     except urllib.error.HTTPError as e:
@@ -221,6 +234,9 @@ class Endpoint:
     def request(self, method: str, path: str, timeout: int = 5) -> tuple[bool, Any]:
         return http_request(self.url + path, method, timeout, self.headers or None,
                             self.context)
+
+    def open_stream(self, path: str, timeout: float):
+        return http_open_stream(self.url + path, timeout, self.headers or None, self.context)
 
     def describe(self) -> dict:
         return {"label": self.label, "url": self.url,
