@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.13.4 — 2026-10-06
+
+### Added
+- **ACPI temperature next to the GPU's.** On the DGX Spark (GB10) the board's
+  ACPI thermal zones read noticeably different from the GPU sensor that
+  NVML/`nvidia-smi` report. The GPU section now ends with an `ACPI` line:
+  the hottest `acpitz` zone, the spread across zones and the critical trip
+  point, turning yellow 20°C and red 10°C below it. Read from
+  `/sys/class/thermal` (Linux, no root); `acpi_thermal` in `--json`,
+  `mtop_acpi_temperature_celsius{zone}` in Prometheus. Hidden with `--no-gpu`.
+
 ## 0.13.3 — 2026-10-04
 
 ### Fixed

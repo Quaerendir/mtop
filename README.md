@@ -25,7 +25,7 @@ It also watches [llama-swap](https://github.com/mostlygeek/llama-swap) fronting 
 - **Which model on which card** — NVIDIA per-process VRAM via NVML (ctypes, no `nvidia-smi` fork) joined to the runner PIDs: a `GPU` column in RUNNERS and a `procs:` line under each card
 - **Loaded models** — name, VRAM/RAM split, context length, processor type, TTL countdown
 - **Container health** — status indicator (●/✗/○), uptime, CPU & memory with progress bars
-- **Multi-vendor GPU monitoring** — NVIDIA via NVML (`nvidia-smi` as fallback), AMD and Intel via sysfs, Apple Silicon via `ioreg`; side by side on the same host; utilization, VRAM/GTT, temperature, power draw
+- **Multi-vendor GPU monitoring** — NVIDIA via NVML (`nvidia-smi` as fallback), AMD and Intel via sysfs, Apple Silicon via `ioreg`; side by side on the same host; utilization, VRAM/GTT, temperature, power draw; ACPI thermal zones alongside (on the DGX Spark they differ from the GPU sensor)
 - **AMD without ROCm** — telemetry comes from `/sys/class/drm/card*/device`, so a bare `amdgpu` driver is enough; `rocm-smi` is only a fallback
 - **Jetson / Tegra / NVIDIA Spark** — automatic fallback to unified memory via `/proc/meminfo`
 - **Non-blocking UI** — all I/O (docker, nvidia-smi, HTTP) runs in a background collector thread; the interface stays responsive at 100 ms even when the API hangs, and stale data is flagged

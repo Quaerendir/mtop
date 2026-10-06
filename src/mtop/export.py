@@ -273,4 +273,11 @@ def prometheus_text(snap: dict, version: str, now: float | None = None) -> str:
                     w.sample("mtop_gpu_process_memory_bytes",
                              {**key, "pid": pr.get("pid"), "model": pr.get("model")},
                              pr["mem_mib"] * (1 << 20))
+
+    # ── ACPI thermal zones (board/SoC sensors, next to the GPU's own) ──
+    acpi = snap.get("acpi_thermal")
+    if acpi:
+        w.metric("mtop_acpi_temperature_celsius", "ACPI thermal zone temperature")
+        for z in acpi.get("zones") or []:
+            w.sample("mtop_acpi_temperature_celsius", {"zone": z["zone"]}, z["temp"])
     return w.text()

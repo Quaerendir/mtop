@@ -19,6 +19,8 @@ import sys
 
 from .util import CLK_TCK, IS_DARWIN, run_cmd, to_float
 
+SYSFS_THERMAL = "/sys/class/thermal"
+
 
 def read_unified_memory() -> tuple[str, int, int] | None:
     """Detect Tegra/Jetson/Spark unified-memory platforms via device-tree.
@@ -42,6 +44,47 @@ def read_unified_memory() -> tuple[str, int, int] | None:
         return model, used_kb // 1024, total_kb // 1024
     except (FileNotFoundError, PermissionError, KeyError, ValueError):
         return None
+
+
+def read_acpi_thermal() -> dict | None:
+    """ACPI thermal zones (`acpitz`) from sysfs, in °C.
+
+    On SoCs like the GB10 the GPU sensor reads well below what the board
+    reports, so the ACPI zones are shown next to it. Returns
+    {"max", "zones": [{"zone", "temp"}], "crit"} or None when there are none.
+    """
+    zones: list[dict] = []
+    crits: list[float] = []
+    try:
+        entries = sorted(os.listdir(SYSFS_THERMAL), key=lambda e: (len(e), e))
+    except OSError:
+        return None
+    for entry in entries:
+        if not entry.startswith("thermal_zone"):
+            continue
+        base = os.path.join(SYSFS_THERMAL, entry)
+        try:
+            with open(os.path.join(base, "type")) as f:
+                if f.read().strip() != "acpitz":
+                    continue
+            with open(os.path.join(base, "temp")) as f:
+                temp = int(f.read().strip()) / 1000
+        except (OSError, ValueError):
+            continue
+        zones.append({"zone": entry, "temp": round(temp, 1)})
+        for i in range(16):
+            try:
+                with open(os.path.join(base, f"trip_point_{i}_type")) as f:
+                    kind = f.read().strip()
+                if kind == "critical":
+                    with open(os.path.join(base, f"trip_point_{i}_temp")) as f:
+                        crits.append(int(f.read().strip()) / 1000)
+            except (OSError, ValueError):
+                break
+    if not zones:
+        return None
+    return {"max": max(z["temp"] for z in zones), "zones": zones,
+            "crit": min(crits) if crits else None}
 
 
 def host_cpu_count() -> float:

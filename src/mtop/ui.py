@@ -442,8 +442,35 @@ def render_gpu_stats(win, y: int, snap: dict) -> int:
                               f"{gtt_used:.0f} / {gtt_total:.0f} MiB",
                               curses.color_pair(C_DIM))
 
+    acpi = snap.get("acpi_thermal")
+    if acpi:
+        y = safe_addstr(win, y, 3, format_acpi_thermal(acpi),
+                        curses.color_pair(acpi_color(acpi)))
+
     y += 1
     return y
+
+
+def format_acpi_thermal(acpi: dict) -> str:
+    """'ACPI  58°C  (max of 7 zones, 52–58°C, crit 105°C)'"""
+    temps = [z["temp"] for z in acpi.get("zones") or []]
+    text = f"ACPI  {acpi['max']:.0f}°C"
+    bits = []
+    if len(temps) > 1:
+        bits.append(f"max of {len(temps)} zones, {min(temps):.0f}–{max(temps):.0f}°C")
+    if acpi.get("crit"):
+        bits.append(f"crit {acpi['crit']:.0f}°C")
+    return text + (f"  ({', '.join(bits)})" if bits else "")
+
+
+def acpi_color(acpi: dict) -> int:
+    """Warn 20°C below the critical trip point, error at 10°C below."""
+    crit = acpi.get("crit")
+    if crit and acpi["max"] >= crit - 10:
+        return C_ERR
+    if crit and acpi["max"] >= crit - 20:
+        return C_WARN
+    return C_DIM
 
 
 def render_models(win, y: int, snap: dict,

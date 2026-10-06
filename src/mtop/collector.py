@@ -23,9 +23,9 @@ from .gpu import (AmdSysfsProvider, AppleGpuProvider, GpuMonitor, GpuProvider,
                   TegraUnifiedProvider)
 from .logs import ContainerLogs, FileLogs, JournalLogs, LogSource, line_level, request_stats
 from .procfs import (find_llama_swap_pid, find_ollama_pid, host_cpu_count, process_tree,
-                     proc_uptime_sec, read_proc_cmdline, read_proc_cpu_ticks, read_proc_environ,
-                     read_proc_ppid, read_proc_pss_bytes, read_proc_rss_bytes, read_unified_memory,
-                     systemd_environment, systemd_llama_swap, systemd_ollama,
+                     proc_uptime_sec, read_acpi_thermal, read_proc_cmdline, read_proc_cpu_ticks,
+                     read_proc_environ, read_proc_ppid, read_proc_pss_bytes, read_proc_rss_bytes,
+                     read_unified_memory, systemd_environment, systemd_llama_swap, systemd_ollama,
                      systemd_output_file, total_ram_bytes)
 from .runner import (inference_env, link_runners_to_gpus, match_runners_to_models,
                      match_vllm_runners_to_models, parse_runner_argv, parse_vllm_argv)
@@ -132,6 +132,7 @@ class Collector(threading.Thread):
         self._res_stats: dict | None = None
         self._runners: list[dict] | None = None
         self._gpu_cache: list[dict] | None = None
+        self._acpi_cache: dict | None = None
         self._last_inspect: dict | None = None
         self._uptime_sec: float | None = None     # numeric twin of snap["uptime"]
         # Slow-path too: the version never changes and the environment only
@@ -325,6 +326,7 @@ class Collector(threading.Thread):
                 self._res_stats = None
             if self.show_gpu:
                 self._gpu_cache = self._gpu_read()
+                self._acpi_cache = read_acpi_thermal() if IS_LINUX else None
             self._server = self._server_info(mode, snap.get("pid"))
             self._logs = self._read_logs(mode) if self.show_logs else None
             self._slow_ts = now
@@ -336,6 +338,7 @@ class Collector(threading.Thread):
         snap["runners"] = (self._runners if mode == "docker"
                            else (self._res_stats or {}).get("runners"))
         snap["gpus"] = self._gpu_cache if self.show_gpu else None
+        snap["acpi_thermal"] = self._acpi_cache if self.show_gpu else None
         snap["server"] = self._server
         if slow_due:
             self._record_history(snap)
