@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- **README demo of `--control`:** an asciinema recording
+  (`docs/demo-control.cast`) and its GIF: load from the picker, keep-alive,
+  pull with progress, stop. `tools/demo-control.sh` records and renders it
+  again (tmux, `uvx asciinema`, agg).
+
 ## 0.14.0 — 2026-10-06
 
 ### Added
