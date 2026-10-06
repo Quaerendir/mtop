@@ -6,7 +6,7 @@
 ![License: MIT](https://img.shields.io/badge/license-MIT-green)
 ![Platform: Linux](https://img.shields.io/badge/platform-Linux-lightgrey)
 
-![mtop on a DGX Spark: Ollama in Docker, two models loaded, NVML per-process memory, runner config, server environment and the access log](docs/screenshot.png)
+![mtop on a DGX Spark: Ollama in Docker, two models loaded, NVML per-process memory, ACPI temperature, runner config, server environment and the access log](docs/screenshot.png)
 
 ## Why?
 
@@ -206,7 +206,7 @@ The screenshot above is a real session on a DGX Spark (GB10) with Ollama in Dock
 
 - **header** — host, container (or `ollama: serve · pid`, or the API URL in api mode), uptime, the Ollama version, and `+N endpoints` when several are polled; `STALE` appears if the collector falls behind
 - **CONTAINER / PROCESS RESOURCES** — CPU normalized to the cgroup / systemd / affinity budget, memory with the accounting named (`pss`, `rss` or cgroup), sparklines of the recent history
-- **GPU** — one block per card, any vendor; `procs:` lists what NVML sees on the card, joined to the runners by PID
+- **GPU** — one block per card, any vendor; `procs:` lists what NVML sees on the card, joined to the runners by PID; `ACPI` is the hottest ACPI thermal zone, which on the GB10 reads differently from the GPU sensor
 - **LOADED MODELS** — `/api/ps`, one table per endpoint when there are several; PROCESSOR computed exactly as `ollama ps` does
 - **RUNNERS** — the negotiated inference config from each runner's argv, plus the card it sits on
 - **SERVER CONFIG** — the `OLLAMA_*` environment the server was started with and where it was read from
@@ -222,11 +222,13 @@ The screenshot above is a real session on a DGX Spark (GB10) with Ollama in Dock
 | Section | Ollama | llama-swap |
 |---------|--------|------------|
 | MODELS | `/api/ps`: loaded models only, VRAM/RAM split, context, processor, expiry | `/v1/models` merged with `/running`: every *configured* model, loaded or not, with STATE (`ready`, `starting`, …), PORT of its upstream, TTL left and the config's description |
-| RUNNERS | llama.cpp / `ollama runner` argv | `vllm serve` argv: context (`--max-model-len`), plus `gpu-util`, `quant`, `tp` (when > 1), `trust-remote-code`; or a `llama-server` argv (GGUF models), as for Ollama. Both carry the model's llama-swap state. vLLM runners join the catalog by exact id (`--served-model-name` = llama-swap's config key), `llama-server` by its port (the upstream port in `/running`). GPU memory of vLLM's `EngineCore` child counts toward its runner |
+| RUNNERS | llama.cpp / `ollama runner` argv | `vllm serve` argv: context (`--max-model-len`), plus `gpu-util`, `quant`, `tp` (when > 1), `trust-remote-code`; or a `llama-server` argv (GGUF models), as for Ollama. Any other upstream (SGLang, a wrapper script that `exec`s its server) is a runner too, named by its program, with `--model`, `--port` and `--served-model-name`/`--name` read from its argv. All carry the model's llama-swap state. vLLM runners join the catalog by exact id (`--served-model-name` = llama-swap's config key), `llama-server` and others also by port (the upstream port in `/running`). GPU memory of vLLM's `EngineCore` child counts toward its runner; VRAM is what NVML charges the runner. The header's `+Nr` counts these runners, not llama-swap's own `nvidia-smi` |
 | Server discovery | container `ollama`, system unit `ollama.service`, or an `ollama serve` process | container `llama-swap`, the **user** unit `llama-swap.service` (`systemctl --user`), or a process named `llama-swap` |
-| SERVER CONFIG | `OLLAMA_*`, GPU selection | the same prefixes plus `VLLM_*`, `HF_*`, `TORCH_*`, `TRITON_*`, read from the container, the process or the user unit |
+| SERVER CONFIG | `OLLAMA_*`, GPU selection | the same prefixes plus `VLLM_*`, `HF_*`, `TORCH_*`, `TRITON_*`, read from the container, the process or the user unit, plus the runners' own environment (per-model launchers usually export these, so they never reach llama-swap) |
 | LOGS | container log or `journalctl -u ollama` | container log, `journalctl --user -u llama-swap`, or the file the unit writes to (`StandardOutput=append:/path`). llama-swap's `Request …` lines feed the request stats; its lines carry no time, so from a file the rate counts what arrives while mtop runs |
 | Version in header | `/api/version` | `/api/version` (`llama-swap v256`); an older llama-swap without it is asked once and shows none |
+
+![mtop --backend llama-swap on the same Spark: the configured catalog with one model ready, its runner joined to the GPU, the launcher's environment and llama-swap's access log](docs/screenshot-llama-swap.png)
 
 Defaults follow the backend: the API is `http://localhost:8001` and the container name `llama-swap`, so on a box that runs both, `--mode auto` does not lock onto the unrelated `ollama` container. Pass `-u` / `-c` for anything else.
 

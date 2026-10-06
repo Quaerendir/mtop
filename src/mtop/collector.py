@@ -22,13 +22,14 @@ from .gpu import (AmdSysfsProvider, AppleGpuProvider, GpuMonitor, GpuProvider,
                   IntelSysfsProvider, NvidiaSmiProvider, NvmlProvider, RocmSmiProvider,
                   TegraUnifiedProvider)
 from .logs import ContainerLogs, FileLogs, JournalLogs, LogSource, line_level, request_stats
-from .procfs import (find_llama_swap_pid, find_ollama_pid, host_cpu_count, process_tree,
-                     proc_uptime_sec, read_acpi_thermal, read_proc_cmdline, read_proc_cpu_ticks,
-                     read_proc_environ, read_proc_ppid, read_proc_pss_bytes, read_proc_rss_bytes,
-                     read_unified_memory, systemd_environment, systemd_llama_swap, systemd_ollama,
-                     systemd_output_file, total_ram_bytes)
+from .procfs import (find_llama_swap_pid, find_ollama_pid, host_cpu_count, proc_children_map,
+                     process_tree, proc_uptime_sec, read_acpi_thermal, read_proc_cmdline,
+                     read_proc_cpu_ticks, read_proc_environ, read_proc_ppid, read_proc_pss_bytes,
+                     read_proc_rss_bytes, read_unified_memory, systemd_environment,
+                     systemd_llama_swap, systemd_ollama, systemd_output_file, total_ram_bytes)
 from .runner import (inference_env, link_runners_to_gpus, match_runners_to_models,
-                     match_vllm_runners_to_models, parse_runner_argv, parse_vllm_argv)
+                     match_vllm_runners_to_models, parse_generic_argv, parse_runner_argv,
+                     parse_vllm_argv)
 from .swapwatch import SwapActivity
 from .util import (CLK_TCK, IS_DARWIN, IS_LINUX, Endpoint, api_port, fmt_duration,
                    is_loopback_url, relative_time, run_cmd, to_float)
@@ -610,12 +611,38 @@ class Collector(threading.Thread):
             pairs = read_proc_environ(pid)
             if pairs is not None:
                 info["env"], info["env_source"] = inference_env(pairs), "process"
+                if self.backend == "llama-swap":
+                    self._add_runner_env(info)
             else:
                 sd = (systemd_environment("llama-swap.service", user=True)
                      if self.backend == "llama-swap" else systemd_environment())
                 if sd is not None:
                     info["env"], info["env_source"] = inference_env(sd), "systemd"
         return info
+
+    def _add_runner_env(self, info: dict) -> None:
+        """Fold the model servers' environment into llama-swap's.
+
+        VLLM_* / HF_* are usually exported by the per-model launcher script,
+        so they exist only in the runner processes. A variable the runners
+        disagree on shows every value, `a | b`.
+        """
+        values: dict[str, list[str]] = {}
+        nread = 0
+        for r in (self._res_stats or {}).get("runners") or []:
+            pairs = read_proc_environ(r["pid"]) if r.get("pid") else None
+            if pairs is None:
+                continue
+            nread += 1
+            for k, v in inference_env(pairs).items():
+                if v not in values.setdefault(k, []):
+                    values[k].append(v)
+        if not nread:
+            return
+        # The runner's value is the effective one where both set a variable.
+        env = {**info["env"], **{k: " | ".join(vs) for k, vs in values.items()}}
+        info["env"] = dict(sorted(env.items()))
+        info["env_source"] = f"process + {nread} runner{'s' if nread > 1 else ''}"
 
     # -- local (bare-metal) process source -------------------------------------
 
@@ -668,7 +695,8 @@ class Collector(threading.Thread):
         spike the cycle a runner spawns (its accumulated ticks appear at once)
         and a clamped-to-zero dip the cycle one exits.
         """
-        tree = process_tree(pid)
+        children = proc_children_map()
+        tree = process_tree(pid, children)
         ticks_by_pid: dict[int, int] = {}
         rss = 0
         pss = 0
@@ -696,6 +724,8 @@ class Collector(threading.Thread):
                     runners.append(info)
         if not ticks_by_pid:
             return None
+        if self.backend == "llama-swap":
+            runners += self._generic_runners(pid, children, runners)
 
         now = time.monotonic()
         cpu_pct = 0.0
@@ -725,6 +755,26 @@ class Collector(threading.Thread):
             "mem_used_bytes": int(mem),
             "mem_limit_bytes": int(total),
         }
+
+    def _generic_runners(self, pid: int, children: dict[int, list[int]],
+                         known: list[dict]) -> list[dict]:
+        """llama-swap upstreams no full parser recognized.
+
+        Each direct child of llama-swap is one model server (its launchers
+        `exec`), so a child with no vLLM/llama-server runner anywhere in its
+        subtree becomes a runner of its own, named by its program.
+        """
+        known_pids = {r["pid"] for r in known}
+        out: list[dict] = []
+        for c in children.get(pid, []):
+            if known_pids & set(process_tree(c, children)):
+                continue
+            info = parse_generic_argv(read_proc_cmdline(c) or [])
+            if info:
+                info["pid"] = c
+                info["rss"] = read_proc_rss_bytes(c)
+                out.append(info)
+        return out
 
     def _local_stats_macos(self, pid: int, total: int) -> dict | None:
         """Same tree rollup as Linux, but from one `ps -ax` snapshot.

@@ -287,9 +287,15 @@ def render_header(win, y: int, snap: dict, stale: bool) -> int:
         field("api: ", status_icon + snap.get("api_url", ""), status_attr)
     elif mode == "local":
         # "+2r" = two model runner subprocesses rolled into the stats below.
-        procs = (snap.get("res_stats") or {}).get("procs") or 1
-        runners = f" +{procs - 1}r" if procs > 1 else ""
         backend = snap.get("backend", "ollama")
+        stats = snap.get("res_stats") or {}
+        if backend == "llama-swap":
+            # Not the tree size: llama-swap keeps an nvidia-smi child, and a
+            # vLLM server has its own EngineCore/compile workers below it.
+            nrun = len(stats.get("runners") or [])
+        else:
+            nrun = (stats.get("procs") or 1) - 1
+        runners = f" +{nrun}r" if nrun > 0 else ""
         label, verb = (("llama-swap: ", "") if backend == "llama-swap" else ("ollama: ", "serve"))
         field(label, status_icon + (f"{verb} · pid {pid}{runners}".strip(" ·")
                                     if pid else (verb or "running")),
@@ -633,7 +639,8 @@ def render_runners(win, y: int, snap: dict) -> int:
     for itself.
 
     VRAM and HOST are deliberately separate columns measuring different things.
-    VRAM is Ollama's own `size_vram` for the matched model; HOST is the runner
+    VRAM is Ollama's own `size_vram` for the matched model (for vLLM and other
+    llama-swap upstreams, the device memory NVML charges them); HOST is the runner
     process's resident set. On CPU inference they converge. On an accelerator
     they do not and should not: weights allocated through CUDA/ROCm/Metal are
     not charged to the process, so a GB10 Spark holding an 82 GB model reports
@@ -650,7 +657,8 @@ def render_runners(win, y: int, snap: dict) -> int:
         kv_k, kv_v = r.get("kv_k", ""), r.get("kv_v", "")
         kv = kv_k if kv_k == kv_v else "/".join(x for x in (kv_k, kv_v) if x)
         rss = r.get("rss")
-        vram = r.get("vram")
+        # Ollama's size_vram when matched, else what NVML charges the runner.
+        vram = r.get("vram") or (r.get("gpu_mem_mib") or 0) * 1024**2
         # Ollama blobs have no name but a digest; a llama-server under
         # llama-swap that matched nothing still has its GGUF file name.
         name = (r.get("model_name") or r.get("digest", "")[:12]
@@ -679,6 +687,8 @@ def render_runners(win, y: int, snap: dict) -> int:
                 extras.append(f"tp:{r['tp']}")
             if r.get("trust_remote_code"):
                 extras.append("trust-remote-code")
+        elif r.get("engine") not in (None, "ollama", "llama"):
+            extras.append(r["engine"])      # a llama-swap upstream named by its program
         if r.get("state"):                  # llama-swap's view, any engine
             extras.append(f"state:{r['state']}")
         # Card indices from the NVML pid join; "—" when nothing linked (AMD,
@@ -763,7 +773,9 @@ def format_request_stats(req: dict | None) -> str:
     if classes:
         parts.append(classes)
     if req.get("latency_p50") is not None:
-        parts.append(f"p50 {req['latency_p50']:.2g}s")
+        p50 = req["latency_p50"]
+        # llama-swap answers its own endpoints in µs; '0.00053s' reads badly.
+        parts.append(f"p50 {p50 * 1000:.2g}ms" if p50 < 0.1 else f"p50 {p50:.2g}s")
     return " · ".join(parts)
 
 

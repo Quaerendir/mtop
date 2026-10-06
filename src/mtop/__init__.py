@@ -37,7 +37,8 @@ from .procfs import (find_llama_swap_pid, find_llama_swap_pids, find_ollama_pid,
                      systemd_environment, systemd_llama_swap, systemd_ollama, total_ram_bytes)
 from .runner import (ENV_PREFIXES, RUNNER_BASENAMES, VLLM_BASENAMES, inference_env,
                      link_runners_to_gpus, match_runners_to_models, match_vllm_runners_to_models,
-                     parse_runner_argv, parse_vllm_argv, processor_label)
+                     parse_generic_argv, parse_runner_argv, parse_vllm_argv,
+                     processor_label)
 from .util import (CLK_TCK, FOREVER_AFTER_SEC, IS_DARWIN, IS_LINUX, Endpoint, api_port,
                    bytes_to_gib, fmt_duration, http_get_json, http_post_json, http_request,
                    is_loopback_url, make_ssl_context, normalize_api_url, parse_endpoint_arg,
@@ -61,7 +62,7 @@ __all__ = [
     "systemd_environment", "systemd_llama_swap", "systemd_ollama", "total_ram_bytes",
     "ENV_PREFIXES", "RUNNER_BASENAMES", "VLLM_BASENAMES", "inference_env",
     "link_runners_to_gpus", "match_runners_to_models", "match_vllm_runners_to_models",
-    "parse_runner_argv", "parse_vllm_argv", "processor_label",
+    "parse_generic_argv", "parse_runner_argv", "parse_vllm_argv", "processor_label",
     "CLK_TCK", "FOREVER_AFTER_SEC", "IS_DARWIN", "IS_LINUX", "api_port", "bytes_to_gib",
     "fmt_duration", "http_get_json", "http_post_json", "http_request", "is_loopback_url",
     "make_ssl_context", "normalize_api_url", "parse_endpoint_arg", "parse_header_arg",

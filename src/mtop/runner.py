@@ -325,6 +325,56 @@ def parse_vllm_argv(args: list[str]) -> dict | None:
     return out
 
 
+# llama-swap runs whatever `cmd` its config names: vLLM and llama-server are
+# parsed in full above, anything else (SGLang, a custom wrapper like
+# basal-serve) still shows up as a runner from its direct-child position,
+# with only the flags most servers agree on.
+HELPER_BASENAMES = {"nvidia-smi"}    # llama-swap's own GPU poller
+_INTERPRETERS = ("python", "bash", "sh", "env", "node", "uv")
+
+_GENERIC_FLAGS: dict[str, tuple[str, bool]] = {
+    "--model": ("model", True), "--model-path": ("model", True),
+    "--served-model-name": ("served_model_name", True), "--name": ("served_model_name", True),
+    "--port": ("port", True),
+    "--max-model-len": ("ctx", True), "--context-length": ("ctx", True),
+    "--ctx-size": ("ctx", True),
+}
+
+
+def parse_generic_argv(args: list[str]) -> dict | None:
+    """A llama-swap upstream that is neither vLLM nor llama-server.
+
+    ``engine`` is the program's name: the script after an interpreter
+    (`python /path/basal-serve ...` -> basal-serve, `python -m sglang.launch_server`
+    -> sglang.launch_server). Returns None for llama-swap's helpers.
+    """
+    if not args:
+        return None
+    i = 0
+    base = os.path.basename(args[0])
+    while base.startswith(_INTERPRETERS) and i + 1 < len(args):
+        nxt = args[i + 1]
+        if nxt == "-m" and i + 2 < len(args):
+            i, base = i + 2, args[i + 2]
+            break
+        if nxt.startswith("-"):
+            break
+        i, base = i + 1, os.path.basename(nxt)
+    if base in HELPER_BASENAMES:
+        return None
+    out: dict[str, Any] = {"engine": base}
+    i += 1
+    while i < len(args):
+        spec = _GENERIC_FLAGS.get(args[i])
+        if spec is not None and i + 1 < len(args):
+            out[spec[0]] = args[i + 1]
+            i += 2
+            continue
+        i += 1
+    out["model_name"] = out.get("served_model_name") or out.get("model", "")
+    return out
+
+
 def processor_label(size: int | float | None, size_vram: int | float | None) -> str:
     """The PROCESSOR column exactly as `ollama ps` computes it (cmd/cmd.go)."""
     size = size or 0

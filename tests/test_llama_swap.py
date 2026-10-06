@@ -468,3 +468,78 @@ def test_llama_swap_version_on_screen_and_in_prometheus():
     text = export.prometheus_text(snap, "9.9.9", now=0.0)
     assert 'mtop_llama_swap_info{endpoint="a",url="u",version="v256"} 1' in text
     assert "mtop_ollama_info{" not in text
+
+
+# ── upstreams that are neither vLLM nor llama-server ─────────────────────────
+
+BASAL = ["/home/u/basal-env/bin/python", "/home/u/basal-env/bin/basal-serve",
+         "--model", "Remek/basal-1.5-max", "--host", "0.0.0.0", "--port", "8103",
+         "--mode", "fp8", "--name", "basal-1.5-max-fp8"]
+
+
+@pytest.mark.parametrize("argv,engine,name", [
+    (BASAL, "basal-serve", "basal-1.5-max-fp8"),
+    (["python3", "-m", "sglang.launch_server", "--model-path", "Qwen/Q", "--port", "9"],
+     "sglang.launch_server", "Qwen/Q"),
+    (["/usr/bin/env", "python3", "/opt/srv.py", "--served-model-name", "x"], "srv.py", "x"),
+    (["/opt/tabby/start"], "start", ""),
+])
+def test_generic_upstream_argv(argv, engine, name):
+    r = mtop.parse_generic_argv(argv)
+    assert r["engine"] == engine and r["model_name"] == name
+
+
+def test_generic_argv_skips_llama_swaps_gpu_poller():
+    assert mtop.parse_generic_argv(["nvidia-smi", "--query-gpu=index", "--loop=1"]) is None
+    assert mtop.parse_generic_argv([]) is None
+
+
+def test_generic_runners_only_for_children_without_a_parsed_runner(monkeypatch):
+    # 10 = llama-swap; 11 nvidia-smi; 12 basal-serve (+ compile worker 13);
+    # 14 a bash wrapper that did not exec, with `vllm serve` as 15 below it.
+    argv = {11: ["nvidia-smi", "--loop=1"], 12: BASAL,
+            13: ["python", "compile_worker/__main__.py"], 14: ["bash", "run.sh"],
+            15: ["python", "/v/bin/vllm", "serve", "m", "--port", "8105"]}
+    monkeypatch.setattr("mtop.collector.read_proc_cmdline", argv.get)
+    monkeypatch.setattr("mtop.collector.read_proc_rss_bytes", lambda p: 1 << 30)
+    children = {10: [11, 12, 14], 12: [13], 14: [15]}
+    c = mtop.Collector(container="llama-swap", api_url="http://localhost:8001", interval=1.0,
+                       show_gpu=False, mode="api", backend="llama-swap")
+    try:
+        out = c._generic_runners(10, children, [{"pid": 15, "engine": "vllm"}])
+    finally:
+        c.close()
+    assert [(r["pid"], r["engine"], r["port"]) for r in out] == [(12, "basal-serve", "8103")]
+
+
+def test_header_counts_llama_swap_runners_not_its_process_tree():
+    w = FakeWin(rows=4, cols=160)
+    mtop.render_header(w, 0, {"status": "running", "mode": "local", "backend": "llama-swap",
+                              "pid": 10, "uptime": "",
+                              "res_stats": {"procs": 4, "runners": [{"pid": 12}]}}, stale=False)
+    assert "pid 10 +1r" in w.line(1)
+
+
+def test_runner_vram_falls_back_to_nvml_memory():
+    r = mtop.parse_generic_argv(BASAL)
+    r.update(pid=12, gpu=["nvidia:0"], gpu_mem_mib=17283)
+    w = FakeWin(rows=6, cols=200)
+    mtop.render_runners(w, 0, {"runners": [r]})
+    assert "16.9 G" in w.text() and "basal-1.5-max-fp8" in w.text() and "basal-serve" in w.text()
+
+
+def test_server_config_adds_the_runners_environment(monkeypatch):
+    envs = {12: ["HF_HOME=/h", "TRITON_PTXAS_PATH=/p", "HOME=/x"],
+            16: ["HF_HOME=/other", "VLLM_API_KEY=s"]}
+    monkeypatch.setattr("mtop.collector.read_proc_environ", envs.get)
+    c = mtop.Collector(container="llama-swap", api_url="http://localhost:8001", interval=1.0,
+                       show_gpu=False, mode="api", backend="llama-swap")
+    try:
+        c._res_stats = {"runners": [{"pid": 12}, {"pid": 16}, {"pid": 99}]}
+        info = {"env": {"CUDA_VISIBLE_DEVICES": "0", "HF_HOME": "/swap"}, "env_source": "process"}
+        c._add_runner_env(info)
+    finally:
+        c.close()
+    assert info["env"] == {"CUDA_VISIBLE_DEVICES": "0", "HF_HOME": "/h | /other",
+                           "TRITON_PTXAS_PATH": "/p", "VLLM_API_KEY": "••••"}
+    assert info["env_source"] == "process + 2 runners"

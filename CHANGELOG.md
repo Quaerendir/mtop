@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.13.5 — 2026-10-06
+
+### Fixed
+- **llama-swap upstreams other than vLLM and llama-server were invisible.** A
+  wrapper such as `basal-serve` (or SGLang) left RUNNERS empty and its GPU
+  memory as a bare `pid N`. Every direct child of llama-swap with no parsed
+  runner below it is now a runner named by its program, joined to the
+  catalog by `--name`/`--served-model-name` or port.
+- **RUNNERS VRAM showed `—` for vLLM and llama-swap upstreams.** It now falls
+  back to the device memory NVML charges the runner.
+- **`+Nr` in the header counted llama-swap's `nvidia-smi` child** and vLLM's
+  worker processes. Under llama-swap it now counts runners.
+- **SERVER CONFIG was empty under llama-swap** when the per-model launcher
+  exported `VLLM_*` / `HF_*`. The runners' environment is merged in
+  (`source: process + N runners`); values that differ between runners show
+  as `a | b`.
+- Request latency under 100 ms shows in ms (`p50 0.54ms`, not `0.00053s`).
+
+### Changed
+- README screenshot refreshed (0.13.5, Ollama on the Spark), plus a second
+  one for `--backend llama-swap`. `tools/screenshot.py` draws with Pillow
+  when no headless Chrome is installed.
+
 ## 0.13.4 — 2026-10-06
 
 ### Added

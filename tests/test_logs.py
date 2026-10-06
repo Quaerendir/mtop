@@ -295,6 +295,9 @@ def test_render_logs_panel(win):
 def test_format_request_stats():
     assert mtop.format_request_stats(None) == ""
     assert mtop.format_request_stats({"total": 0, "window_sec": 60}) == "no requests in last 60s"
+    req = {"total": 3, "window_sec": 60, "by_status": {"2xx": 3}}
+    assert mtop.format_request_stats({**req, "latency_p50": 0.00053}).endswith("p50 0.53ms")
+    assert mtop.format_request_stats({**req, "latency_p50": 0.72}).endswith("p50 0.72s")
 
 
 def test_prometheus_log_metrics():

@@ -7,8 +7,10 @@ The README screenshot is a real session, not a mock-up. To refresh it:
     sleep 14; tmux capture-pane -e -p -t shot > shot.ansi; tmux send-keys -t shot q
     python tools/screenshot.py shot.ansi docs/screenshot.png
 
-Needs google-chrome (headless) and Pillow; stdlib otherwise. `-e` keeps the
-SGR color codes, which this script turns into spans on a dark palette.
+Needs Pillow, plus google-chrome (headless) for the best text rendering;
+without Chrome the capture is drawn cell by cell with Pillow and DejaVu Sans
+Mono. `-e` keeps the SGR color codes, which this script turns into spans on a
+dark palette.
 """
 import html
 import re
@@ -19,25 +21,22 @@ PALETTE = ["#45475a", "#f38ba8", "#a6e3a1", "#f9e2af", "#89b4fa", "#f5c2e7", "#9
 BG, FG = "#1e1e2e", "#cdd6f4"
 SGR = re.compile(r"\x1b\[([0-9;]*)m")
 
-def render(text: str) -> str:
-    out = []
+def runs(text: str):
+    """Per line, a list of (text, fg, bg, bold, dim) runs with colors resolved."""
     st = {"fg": None, "bg": None, "bold": False, "dim": False, "rev": False}
-    def open_span():
+    def style():
         fg = PALETTE[st["fg"]] if st["fg"] is not None else FG
         bg = PALETTE[st["bg"]] if st["bg"] is not None else BG
         if st["rev"]:
             fg, bg = bg, fg
-        style = f"color:{fg};background:{bg};"
-        if st["bold"]:
-            style += "font-weight:bold;"
-        if st["dim"]:
-            style += "opacity:.7;"
-        return f'<span style="{style}">'
+        return fg, bg, st["bold"], st["dim"]
+    lines = []
     for line in text.splitlines():
         pos = 0
-        out.append(open_span())
+        cur = []
         for m in SGR.finditer(line):
-            out.append(html.escape(line[pos:m.start()]))
+            if m.start() > pos:
+                cur.append((line[pos:m.start()], *style()))
             pos = m.end()
             codes = [int(c) if c else 0 for c in m.group(1).split(";")]
             i = 0
@@ -72,8 +71,23 @@ def render(text: str) -> str:
                     st["fg" if c == 38 else "bg"] = n if n < 16 else None
                     i += 2
                 i += 1
-            out.append("</span>" + open_span())
-        out.append(html.escape(line[pos:]) + "</span>\n")
+        if pos < len(line):
+            cur.append((line[pos:], *style()))
+        lines.append(cur)
+    return lines
+
+
+def render(text: str) -> str:
+    out = []
+    for line in runs(text):
+        for chunk, fg, bg, bold, dim in line:
+            css = f"color:{fg};background:{bg};"
+            if bold:
+                css += "font-weight:bold;"
+            if dim:
+                css += "opacity:.7;"
+            out.append(f'<span style="{css}">{html.escape(chunk)}</span>')
+        out.append("\n")
     body = "".join(out)
     return f"""<!doctype html><meta charset="utf-8"><style>
 html,body{{margin:0;background:{BG}}}
@@ -95,6 +109,55 @@ def trim(text: str) -> str:
     return "\n".join([*rows, "", footer]) + "\n"
 
 
+FONT_DIR = "/usr/share/fonts/truetype/dejavu"
+
+
+def draw_pillow(text: str, out: str, scale: int = 2) -> None:
+    """Chrome-less fallback: one fixed-size cell per character."""
+    import os
+
+    from PIL import Image, ImageDraw, ImageFont
+    size = 15 * scale
+    reg = ImageFont.truetype(os.path.join(FONT_DIR, "DejaVuSansMono.ttf"), size)
+    bold = ImageFont.truetype(os.path.join(FONT_DIR, "DejaVuSansMono-Bold.ttf"), size)
+    cw = round(reg.getlength("M"))
+    ch = round(size * 1.28)
+    lines = runs(text)
+    cols = max((sum(len(c[0]) for c in ln) for ln in lines), default=0)
+    padx, pady = 22 * scale, 18 * scale
+    im = Image.new("RGB", (cols * cw + 2 * padx, len(lines) * ch + 2 * pady), BG)
+    d = ImageDraw.Draw(im)
+
+    def mix(fg: str, bg: str, a: float) -> str:
+        f = [int(fg[i:i + 2], 16) for i in (1, 3, 5)]
+        b = [int(bg[i:i + 2], 16) for i in (1, 3, 5)]
+        return "#" + "".join(f"{round(x * a + y * (1 - a)):02x}" for x, y in zip(f, b, strict=True))
+
+    for row, line in enumerate(lines):
+        x, y = padx, pady + row * ch
+        for chunk, fg, bg, is_bold, dim in line:
+            w = len(chunk) * cw
+            if bg != BG:
+                d.rectangle([x, y, x + w - 1, y + ch - 1], fill=bg)
+            color = mix(fg, bg, 0.7) if dim else fg
+            font = bold if is_bold else reg
+            for i, c in enumerate(chunk):
+                cx = x + i * cw
+                if c in "█░▁▂▃▄▅▆▇":
+                    # Block elements fill the whole cell, as in a terminal.
+                    if c == "░":
+                        d.rectangle([cx, y, cx + cw - 1, y + ch - 1], fill=mix(fg, bg, 0.25))
+                    else:
+                        frac = 1.0 if c == "█" else ("▁▂▃▄▅▆▇".index(c) + 1) / 8
+                        d.rectangle([cx, y + round(ch * (1 - frac)), cx + cw - 1, y + ch - 1],
+                                    fill=color)
+                elif c != " ":
+                    d.text((cx, y + ch / 2), c, font=font, fill=color, anchor="lm")
+            x += w
+    os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+    im.save(out, optimize=True)
+
+
 def main() -> int:
     import os
     import shutil
@@ -106,15 +169,16 @@ def main() -> int:
     src, out = sys.argv[1], sys.argv[2]
     chrome = next((c for c in ("google-chrome", "chromium", "chromium-browser")
                    if shutil.which(c)), None)
+    with open(src, encoding="utf-8", errors="replace") as f:
+        capture = f.read()
     if not chrome:
-        print("no headless chrome found", file=sys.stderr)
-        return 1
+        draw_pillow(trim(capture), out)
+        print(f"wrote {out} (no headless chrome: drawn with Pillow)")
+        return 0
     from PIL import Image
     with tempfile.TemporaryDirectory() as td:
         html_path = os.path.join(td, "shot.html")
         png_path = os.path.join(td, "shot.png")
-        with open(src, encoding="utf-8", errors="replace") as f:
-            capture = f.read()
         with open(html_path, "w") as f:
             f.write(render(trim(capture)))
         subprocess.run([chrome, "--headless=new", "--disable-gpu", "--hide-scrollbars",
