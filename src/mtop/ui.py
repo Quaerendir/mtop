@@ -878,10 +878,13 @@ def _footer_put(win, y: int, x: int, text: str, attr: int, width: int) -> int:
 
 
 def help_lines(interval: float, raw_ps: bool, can_raw_ps: bool, runners: bool, env: bool,
-               logs: bool, control: bool | str, runtime: str | None) -> list[tuple[str | None, str]]:
+               logs: bool, control: bool | str,
+               runtime: str | None) -> list[tuple[str | None, str]]:
     """(key, description) rows of the `?` overlay; ("", title) starts a section,
     (None, text) is a dim note."""
-    onoff = lambda b: "on" if b else "off"
+    def onoff(b: bool) -> str:
+        return "on" if b else "off"
+
     rows = [("", "GENERAL"),
             ("q  Esc", "quit"),
             ("+  -", f"refresh faster / slower (now {interval:.1f}s)"),

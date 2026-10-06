@@ -189,7 +189,7 @@ def test_help_lists_every_key_and_the_toggle_state():
     rows = mtop.help_lines(2.0, False, True, True, False, True, True, "docker-api")
     keys = {k for k, _ in rows if k}
     assert {"q  Esc", "+  -", "?", "o", "r", "e", "l", "s", "t", "L", "P", "X"} <= keys
-    text = dict((k, t) for k, t in rows if k)
+    text = {k: t for k, t in rows if k}
     assert text["e"].endswith("[off]") and text["l"].endswith("[on]")
     assert rows[-1][1].endswith("· via docker-api")
     swap = {k for k, _ in mtop.help_lines(2.0, False, False, True, True, False,
