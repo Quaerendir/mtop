@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.14.0 — 2026-10-06
+
+### Added
+- **Pull a model with progress (`P`, `--control`, Ollama).** Type a name
+  (`Tab` picks the endpoint when there are several), `Enter` streams
+  `POST /api/pull`. A row above the footer shows a bar, bytes done/total,
+  speed, ETA and the layer being fetched; stop, load and keep-alive work
+  while it runs. `X` cancels at once (Ollama keeps the finished layers, so
+  pulling again resumes). Errors come from Ollama's own message
+  (`pull model manifest: file does not exist`). One pull at a time.
+
+### Fixed
+- **`q` hung under `--backend llama-swap`** until llama-swap sent its next
+  event (20 s and more on an idle server). Closing the `/api/events` stream
+  from the UI thread waited for the reader thread's lock; the socket is now
+  shut down instead, and `q` exits in ~0.1 s.
+
+### Changed
+- `ModelControl` (the `--control` actions) moved from `ui.py` to the new
+  `control.py`; it reports what kind of notice it has and `ui.py` picks the
+  colors. `ui.py` is down from ~1350 to ~1100 lines.
+
 ## 0.13.5 — 2026-10-06
 
 ### Fixed

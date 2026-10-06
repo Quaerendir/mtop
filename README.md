@@ -118,7 +118,7 @@ Options:
       --log-lines N      Log lines to show (default: 8)
       --control          Allow model actions: arrow keys select a loaded model, s stops
                          (unloads) it after a y/N prompt, t keeps it loaded longer,
-                         L loads one from /api/tags.
+                         L loads one from /api/tags, P pulls one by name (X cancels).
                          Off by default — without it mtop never writes to the API
       --no-docker        API-only mode: skip all docker calls (remote instances)
       --json             Print one snapshot as JSON and exit (exit 1 on unhealthy)
@@ -199,6 +199,7 @@ mtop
 | `s` | Stop (unload) the selected model after a `y/N` prompt (`--control` only) |
 | `t` | Keep the selected model loaded for 30m / 2h / 24h / forever (`1`–`4`), keeping its context size (`--control`, Ollama only) |
 | `L` | Ollama: pick a model from `/api/tags` and load it; `Tab` switches endpoint; asks first when the server is at `OLLAMA_MAX_LOADED_MODELS`. llama-swap: load the selected catalog entry; asks first when another model runs (`--control` only) |
+| `P` | Pull a model by name (`POST /api/pull`): type it, `Tab` switches endpoint, `Enter` starts. A progress row above the footer shows bytes, speed, ETA and the current layer; stop/load keep working meanwhile. `X` cancels — Ollama keeps the layers it has, so the next pull resumes (`--control`, Ollama only) |
 
 ## What you see
 
@@ -232,7 +233,7 @@ The screenshot above is a real session on a DGX Spark (GB10) with Ollama in Dock
 
 Defaults follow the backend: the API is `http://localhost:8001` and the container name `llama-swap`, so on a box that runs both, `--mode auto` does not lock onto the unrelated `ollama` container. Pass `-u` / `-c` for anything else.
 
-`--control` works here too: the cursor walks the whole catalog, `s` stops the selected model (`POST /api/models/unload/<model>`), `L` starts it (`GET /upstream/<model>/health`, which answers once the model is up; the start carries on if mtop exits). llama-swap runs one model at a time unless its config groups them, so `L` asks first while another model runs. There is no `t`: llama-swap takes TTL from its config. Tested with llama-swap v256.
+`--control` works here too: the cursor walks the whole catalog, `s` stops the selected model (`POST /api/models/unload/<model>`), `L` starts it (`GET /upstream/<model>/health`, which answers once the model is up; the start carries on if mtop exits). llama-swap runs one model at a time unless its config groups them, so `L` asks first while another model runs. There is no `t` or `P`: llama-swap takes TTL and its models from its config. Tested with llama-swap v256.
 
 TTL counts down from the model's last request. llama-swap reports only the configured TTL, so mtop follows its `/api/events` stream (inflight requests, the `/upstream/<model>/…` access-log lines, models turning `ready`) and counts from what it sees. Until mtop has seen a model used, the column shows the configured TTL as an upper bound, e.g. `≤1d 0h`. A one-shot `--json` / `--prometheus` has nothing to count from; with `--watch` they get `ttl_left` / `expires_at` and `mtop_model_expires_seconds` like Ollama.
 
@@ -268,7 +269,7 @@ Not available with this backend: the raw `ollama ps` table (`o`) and keep-loaded
 - [x] AMD GPU support (sysfs first, `rocm-smi` fallback)
 - [x] Apple Silicon GPU stats (via `ioreg`, no root — `powermetrics` needs sudo)
 - [x] Intel GPU stats via sysfs (partial: no utilization without CAP_PERFMON)
-- [ ] Model pull progress tracking
+- [x] Model pull with progress (`P` under `--control`)
 - [x] Multi-host support (repeatable `-u`, per-endpoint model tables)
 - [x] Docker Engine API over the socket, Podman support
 - [x] Configurable layout (raw `ollama ps` toggle; more sections to follow)

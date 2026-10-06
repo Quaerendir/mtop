@@ -165,3 +165,38 @@ def test_event_stream_end_to_end():
     finally:
         w.stop()
         srv.shutdown()
+
+
+def test_stop_returns_while_the_stream_is_silent():
+    """`q` under llama-swap hung until the next event: resp.close() from the
+    UI thread waited for the reader's buffer lock. stop() must not wait."""
+    connected = threading.Event()
+    release = threading.Event()
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            self.wfile.write(b": hello\n\n")
+            self.wfile.flush()
+            connected.set()
+            release.wait(10)                    # then nothing, like an idle llama-swap
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    w = SwapActivity(mtop.Endpoint(f"http://127.0.0.1:{srv.server_port}"))
+    w.start()
+    try:
+        assert connected.wait(3)
+        time.sleep(0.1)                         # the reader is now blocked in recv()
+        t0 = time.monotonic()
+        w.stop()
+        w.join(2)
+        assert time.monotonic() - t0 < 1 and not w.is_alive()
+    finally:
+        release.set()
+        srv.shutdown()

@@ -71,8 +71,9 @@ __all__ = [
 
 
 def __getattr__(name: str):
-    """Curses-only names (render_*, draw_*, curses_main) load on demand so the
-    package imports without curses — Windows can still run --json.
+    """Curses-only names (render_*, draw_*, curses_main, and the --control
+    actions in mtop.control) load on demand so the package imports without
+    curses — Windows can still run --json.
 
     importlib, not `from . import ui`: the latter probes `hasattr(mtop, "ui")`
     before the attribute exists and would re-enter this hook forever.
@@ -81,7 +82,10 @@ def __getattr__(name: str):
     ui = importlib.import_module("mtop.ui")
     if name == "ui":
         return ui
-    try:
-        return getattr(ui, name)
-    except AttributeError:
-        raise AttributeError(f"module 'mtop' has no attribute {name!r}") from None
+    control = importlib.import_module("mtop.control")
+    if name == "control":
+        return control
+    for mod in (ui, control):
+        if hasattr(mod, name):
+            return getattr(mod, name)
+    raise AttributeError(f"module 'mtop' has no attribute {name!r}")

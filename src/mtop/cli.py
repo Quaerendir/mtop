@@ -200,8 +200,10 @@ def main():
                         help="Allow model actions in the TUI: select a loaded model with "
                              "the arrow keys, 's' stops (unloads) it after a y/N prompt, "
                              "'t' keeps it loaded for 30m/2h/24h/forever, "
-                             "'L' picks a model from /api/tags and loads it (llama-swap: "
-                             "loads the selected catalog entry; no 't', TTL is config). "
+                             "'L' picks a model from /api/tags and loads it, "
+                             "'P' pulls a model by name with a progress bar, 'X' cancels "
+                             "the pull (llama-swap: 'L' loads the selected catalog entry; "
+                             "no 't' or 'P', TTL and models are config). "
                              "Off by default — without it mtop never writes to the API")
     parser.add_argument("--no-docker", action="store_true",
                         help="Alias for --mode api (kept for compatibility)")

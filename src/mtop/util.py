@@ -11,6 +11,7 @@ import base64
 import json
 import os
 import re
+import socket
 import ssl
 import subprocess
 import sys
@@ -137,6 +138,40 @@ def http_open_stream(url: str, timeout: float, headers: dict[str, str] | None = 
     return _opener(url, context).open(req, timeout=timeout)
 
 
+def http_open_post_stream(url: str, body: Any, timeout: float,
+                          headers: dict[str, str] | None = None,
+                          context: ssl.SSLContext | None = None):
+    """POST JSON and return the open response, read as NDJSON line by line
+    (`/api/pull` progress). Raises on failure, like http_open_stream."""
+    req = urllib.request.Request(url, data=json.dumps(body).encode(),
+                                 headers={"Accept": "application/x-ndjson",
+                                          "Content-Type": "application/json",
+                                          **(headers or {})})
+    return _opener(url, context).open(req, timeout=timeout)
+
+
+def shutdown_stream(resp) -> None:
+    """Unblock a thread reading `resp` (http_open_stream / _post_stream).
+
+    resp.close() from another thread is no use: it waits for the buffer lock
+    the reader holds while blocked in recv(), so it returns only when the
+    next line arrives — `q` under llama-swap waited for the next event.
+    Shutting the socket down wakes the reader at once; it then closes."""
+    try:
+        resp.fp.raw._sock.shutdown(socket.SHUT_RDWR)
+    except Exception:
+        pass
+
+
+def http_error_text(e: Exception) -> str:
+    """The same wording the JSON helpers use for a failed request."""
+    if isinstance(e, urllib.error.HTTPError):
+        return f"HTTP {e.code} {e.reason}"
+    if isinstance(e, urllib.error.URLError):
+        return str(e.reason)
+    return str(e)
+
+
 def _http_json(url: str, data: bytes | None, timeout: int,
                headers: dict[str, str] | None,
                context: ssl.SSLContext | None,
@@ -149,12 +184,8 @@ def _http_json(url: str, data: bytes | None, timeout: int,
         with _opener(url, context).open(req, timeout=timeout) as resp:
             body = resp.read().decode(errors="replace")
             return True, (json.loads(body) if parse else body)
-    except urllib.error.HTTPError as e:
-        return False, f"HTTP {e.code} {e.reason}"
-    except urllib.error.URLError as e:
-        return False, str(e.reason)
     except Exception as e:
-        return False, str(e)
+        return False, http_error_text(e)
 
 
 def make_ssl_context(insecure: bool = False,
@@ -237,6 +268,10 @@ class Endpoint:
 
     def open_stream(self, path: str, timeout: float):
         return http_open_stream(self.url + path, timeout, self.headers or None, self.context)
+
+    def open_post_stream(self, path: str, body: Any, timeout: float):
+        return http_open_post_stream(self.url + path, body, timeout, self.headers or None,
+                                     self.context)
 
     def describe(self) -> dict:
         return {"label": self.label, "url": self.url,

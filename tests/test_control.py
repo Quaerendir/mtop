@@ -115,7 +115,7 @@ def test_stop_asks_first_and_posts_keep_alive_zero(monkeypatch):
     _wait_idle(c)
     assert calls == [("http://localhost:2/api/generate", {"model": "y", "keep_alive": 0})]
     assert c.notice(time.monotonic())[0] == "Stopped y on b"
-    assert c.notice(time.monotonic() + mtop.ui.NOTICE_HOLD + 1) is None
+    assert c.notice(time.monotonic() + mtop.control.NOTICE_HOLD + 1) is None
 
 
 def test_stop_failure_is_reported(monkeypatch):
@@ -147,7 +147,7 @@ def test_selected_row_is_drawn_reversed(win):
 def test_footer_shows_control_keys_or_the_notice():
     w = FakeWin(rows=3, cols=160)
     mtop.render_footer(w, 1.0, False, False, control=True)
-    assert "s: stop │ t: keep loaded │ L: load model" in w.line(2)
+    assert "s: stop │ t: keep loaded │ L: load │ P: pull" in w.line(2)
     w = FakeWin(rows=3, cols=160)
     mtop.render_footer(w, 1.0, False, False, control=True, notice=("Stop a? [y/N]", 0))
     assert w.line(2).strip() == "Stop a? [y/N]"
@@ -206,7 +206,7 @@ def test_picker_lists_tags_sorted_and_loads_the_chosen_one(api):
     _wait_idle(c)
     url, body, timeout = api[-1]
     assert url == "http://localhost:1/api/generate" and body == {"model": "qwen3.6:35b"}
-    assert timeout == mtop.ui.LOAD_TIMEOUT
+    assert timeout == mtop.control.LOAD_TIMEOUT
     assert c.notice(time.monotonic())[0] == "Loaded qwen3.6:35b"
 
 

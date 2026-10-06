@@ -321,7 +321,7 @@ def test_swap_stop_unloads_one_model_after_asking(swap_api):
     c.answer(True)
     _idle(c)
     assert swap_api == [("POST", "http://localhost:8001/api/models/unload/qwen3.8-27b",
-                         mtop.ui.UNLOAD_TIMEOUT)]
+                         mtop.control.UNLOAD_TIMEOUT)]
     assert c.notice(time.monotonic())[0] == "Stopped qwen3.8-27b"
 
 
@@ -338,7 +338,7 @@ def test_swap_load_with_nothing_running_starts_right_away(swap_api):
     assert c.picker is None and not c.asking
     _idle(c)
     assert swap_api == [("GET", "http://localhost:8001/upstream/qwen3.8-fable-heretic-q4/health",
-                         mtop.ui.LOAD_TIMEOUT)]
+                         mtop.control.LOAD_TIMEOUT)]
     assert c.notice(time.monotonic())[0] == "Loaded qwen3.8-fable-heretic-q4"
 
 

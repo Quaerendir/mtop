@@ -28,7 +28,7 @@ import urllib.parse
 from collections.abc import Callable
 
 from .logs import parse_gin
-from .util import Endpoint
+from .util import Endpoint, shutdown_stream
 
 STREAM_TIMEOUT = 60.0   # s without a byte before reconnecting
 RETRY_DELAY = 5.0       # s between connection attempts
@@ -42,7 +42,7 @@ class SwapActivity(threading.Thread):
         self.ep = ep
         self.clock = clock
         self._lock = threading.Lock()
-        self._stop = threading.Event()
+        self._halt = threading.Event()
         self._resp = None
         self._last: dict[str, float] = {}       # model -> clock() of last activity
         self._inflight: dict[str, str] = {}     # request id -> model
@@ -135,7 +135,7 @@ class SwapActivity(threading.Thread):
     # -- the stream ------------------------------------------------------------
 
     def run(self) -> None:
-        while not self._stop.is_set():
+        while not self._halt.is_set():
             try:
                 self._resp = self.ep.open_stream("/api/events", STREAM_TIMEOUT)
                 self.connected()
@@ -149,12 +149,12 @@ class SwapActivity(threading.Thread):
                         resp.close()
                     except Exception:
                         pass
-            self._stop.wait(RETRY_DELAY)
+            self._halt.wait(RETRY_DELAY)
 
     def _read(self, resp) -> None:
         data: list[str] = []
         for raw in resp:
-            if self._stop.is_set():
+            if self._halt.is_set():
                 return
             line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
             if line.startswith("data:"):
@@ -169,10 +169,7 @@ class SwapActivity(threading.Thread):
                     self.feed(event)
 
     def stop(self) -> None:
-        self._stop.set()
+        self._halt.set()
         resp = self._resp
         if resp is not None:
-            try:
-                resp.close()
-            except Exception:
-                pass
+            shutdown_stream(resp)      # not close(): see shutdown_stream
