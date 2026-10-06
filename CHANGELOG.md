@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.15.1 — 2026-10-06
 
 ### Fixed
 - **`t` no longer shows "Keeping x loaded for 2h" over the old EXPIRES.**
