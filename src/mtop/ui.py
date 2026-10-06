@@ -906,7 +906,8 @@ def help_lines(interval: float, raw_ps: bool, can_raw_ps: bool, runners: bool, e
                      ("L", "pick a model from /api/tags and load it"),
                      ("P", "pull a model by name, with progress"),
                      ("X", "cancel the running pull")]
-    rows += [(None, ""), (None, f"mtop v{__version__}" + (f" · via {runtime}" if runtime else ""))]
+    rows += [(None, ""), (None, f"mtop v{__version__}" + (f" · via {runtime}" if runtime else "")),
+             (None, "by Quaerendir · github.com/Quaerendir/mtop")]
     return rows
 
 

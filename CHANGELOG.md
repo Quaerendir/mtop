@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+- The `?` overlay ends with the author and the project page:
+  `by Quaerendir · github.com/Quaerendir/mtop`.
+
 ## 0.15.0 — 2026-10-06
 
 ### Added

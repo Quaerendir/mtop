@@ -191,7 +191,8 @@ def test_help_lists_every_key_and_the_toggle_state():
     assert {"q  Esc", "+  -", "?", "o", "r", "e", "l", "s", "t", "L", "P", "X"} <= keys
     text = {k: t for k, t in rows if k}
     assert text["e"].endswith("[off]") and text["l"].endswith("[on]")
-    assert rows[-1][1].endswith("· via docker-api")
+    assert rows[-2][1].endswith("· via docker-api")
+    assert rows[-1][1].startswith("by Quaerendir")
     swap = {k for k, _ in mtop.help_lines(2.0, False, False, True, True, False,
                                           "llama-swap", None) if k}
     assert "L" in swap and not {"t", "P", "X", "o"} & swap
