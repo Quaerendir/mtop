@@ -2,6 +2,8 @@
 
 import argparse
 import json
+import threading
+import time
 
 import pytest
 from conftest import OLLAMA_ENGINE_ARGV, FakeWin
@@ -598,3 +600,20 @@ def test_endpoint_results_include_auth_and_tls(monkeypatch):
                                                         insecure=True)])
     ep = c.collect(100.0)["endpoints"][0]
     assert ep["auth"] is True and ep["tls"] == "insecure"
+
+
+def test_refresh_wakes_the_loop_before_the_interval(monkeypatch):
+    c = _collector(interval=30.0)
+    passes = []
+    monkeypatch.setattr(c, "collect", lambda now: passes.append(now) or {"ts": now})
+    t = threading.Thread(target=c.run, daemon=True)
+    t.start()
+    deadline = time.monotonic() + 2
+    while not passes and time.monotonic() < deadline:
+        time.sleep(0.01)
+    c.refresh()
+    while len(passes) < 2 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    c.stop()
+    t.join(2)
+    assert len(passes) >= 2 and not t.is_alive()         # not 30 s later

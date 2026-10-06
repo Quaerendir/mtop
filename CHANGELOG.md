@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Fixed
+- **`t` no longer shows "Keeping x loaded for 2h" over the old EXPIRES.**
+  The result went to the footer as soon as Ollama answered, while the
+  table waited for the next collection, up to one interval later. Now a
+  finished action wakes the collector at once (`Collector.refresh()`), and
+  the footer says `Extending x…` until a snapshot taken after the action is
+  on screen (at most 3 s). The same goes for stop and load.
+
 ### Changed
 - The `?` overlay ends with the author and the project page:
   `by Quaerendir · github.com/Quaerendir/mtop`.

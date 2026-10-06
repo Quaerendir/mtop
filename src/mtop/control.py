@@ -23,6 +23,7 @@ LOAD_TIMEOUT = 900        # s — a 100B+ model from a cold disk takes minutes
 # `t` on a loaded model: key -> (label, keep_alive value Ollama accepts)
 TTL_CHOICES = (("30m", "30m"), ("2h", "2h"), ("24h", "24h"), ("forever", -1))
 NOTICE_HOLD = 5.0         # s a model-action result stays in the footer
+FRESH_WAIT = 3.0          # s at most a success waits for a snapshot that shows it
 PULL_READ_TIMEOUT = 120   # s with no progress line before a pull counts as stalled
 # What a footer notice is, for the UI to color: key hints, a warning, a y/N
 # question, an action in progress, its success or its failure.
@@ -78,8 +79,9 @@ class ModelControl:
     next pull resumes).
     """
 
-    def __init__(self, endpoints: list, backend: str = "ollama"):
+    def __init__(self, endpoints: list, backend: str = "ollama", on_done=None):
         self.endpoints = endpoints
+        self.on_done = on_done              # called after an action; the UI's refresh
         self.swap = backend == "llama-swap"
         self.selected: tuple[int, str] | None = None
         self.confirm: tuple[int, str] | None = None
@@ -93,6 +95,10 @@ class ModelControl:
         self._snap: dict = {}
         self._index = 0
         self._result: tuple[str, bool, float] | None = None   # text, ok, monotonic until
+        # A success is announced once a snapshot taken after it is on screen,
+        # else "Keeping x loaded for 2h" sits over the old EXPIRES for a cycle:
+        # (finished at, text shown meanwhile).
+        self._pending: tuple[float, str] | None = None
         self._lock = threading.Lock()
         self.pull_prompt: dict | None = None    # {"ep", "text"} while typing a name
         self.pull: dict | None = None           # the running pull, see _pull_run
@@ -450,9 +456,13 @@ class ModelControl:
         past, what = self._VERBS[verb]
         text = ((done or f"{past} {self.label(target)}") if ok
                 else f"{what} {name} failed: {data}")
+        now = time.monotonic()
         with self._lock:
-            self._result = (text, ok, time.monotonic() + NOTICE_HOLD)
+            self._result = (text, ok, now + NOTICE_HOLD)
+            self._pending = (now, f"{verb} {self.label(target)}…") if ok else None
             self.busy = None
+        if self.on_done:
+            self.on_done()
 
     def label(self, target: tuple[int, str]) -> str:
         i, name = target
@@ -500,7 +510,9 @@ class ModelControl:
             return (f"{verb} {self.label((i, name))}… {now - started:.0f}s",
                     "info")
         with self._lock:
-            result = self._result
+            result, pending = self._result, self._pending
+        if pending and self._snap.get("ts", 0.0) < pending[0] < now < pending[0] + FRESH_WAIT:
+            return pending[1], "info"
         if result and now < result[2]:
             return result[0], "ok" if result[1] else "err"
         return None

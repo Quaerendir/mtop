@@ -312,6 +312,7 @@ def _idle(c):
     while c.busy and time.monotonic() < deadline:
         time.sleep(0.01)
     assert c.busy is None
+    c.sync({**c._snap, "ts": time.monotonic()})   # the snapshot the UI gets next
 
 
 def test_swap_stop_unloads_one_model_after_asking(swap_api):

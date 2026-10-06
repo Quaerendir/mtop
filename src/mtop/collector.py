@@ -124,6 +124,7 @@ class Collector(threading.Thread):
 
         self._lock = threading.Lock()
         self._stop = threading.Event()
+        self._wake = threading.Event()      # refresh(): collect now, not after the interval
         self._snapshot: dict = {"ts": 0.0, "status": "starting", "uptime": ""}
 
         # Slow-path caches (container/process stats + nvidia-smi), refreshed at
@@ -184,10 +185,17 @@ class Collector(threading.Thread):
             with self._lock:
                 self._snapshot = snap
             elapsed = time.monotonic() - t0
-            self._stop.wait(max(0.05, self.interval - elapsed))
+            self._wake.wait(max(0.05, self.interval - elapsed))
+            self._wake.clear()
+
+    def refresh(self) -> None:
+        """Collect again right away (after a model action changed the server).
+        A pass already running finishes first, then the next one starts."""
+        self._wake.set()
 
     def stop(self):
         self._stop.set()
+        self._wake.set()
         self.close()
 
     def watch_activity(self) -> None:

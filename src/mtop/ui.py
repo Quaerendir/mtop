@@ -1083,7 +1083,7 @@ def curses_main(stdscr, args):
     )
     collector.start()
     backend = getattr(args, "backend", "ollama")
-    control = (ModelControl(collector.endpoints, backend)
+    control = (ModelControl(collector.endpoints, backend, on_done=collector.refresh)
                if getattr(args, "control", False) else None)
     snap = collector.snapshot()
     show_help = False

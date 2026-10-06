@@ -91,6 +91,7 @@ def _wait_idle(c):
     while c.busy and time.monotonic() < deadline:
         time.sleep(0.01)
     assert c.busy is None
+    c.sync({**c._snap, "ts": time.monotonic()})   # the snapshot the UI gets next
 
 
 def test_stop_asks_first_and_posts_keep_alive_zero(monkeypatch):
@@ -458,6 +459,35 @@ def test_keep_loaded_other_keys_cancel_and_vanished_model_drops_the_question(api
     c.request_ttl()
     c.sync(_snap(("local", [])))
     assert c.ttl_target is None
+
+
+def test_success_waits_for_a_snapshot_taken_after_it(monkeypatch):
+    monkeypatch.setattr(mtop.util, "http_post_json", lambda *a, **k: (True, {}))
+    done = []
+    c = mtop.ModelControl([mtop.Endpoint("localhost:1")], on_done=lambda: done.append(1))
+    c.sync({**_snap(("local", ["x"])), "ts": time.monotonic()})
+    c.request_ttl()
+    c.ttl_key(ord("2"))
+    deadline = time.monotonic() + 2
+    while c.busy and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert done == [1]                                   # the UI collects right away
+    # The old snapshot still shows the old EXPIRES: no "Keeping" over it yet.
+    assert c.notice(time.monotonic()) == ("Extending x…", "info")
+    c.sync({**c._snap, "ts": time.monotonic()})
+    assert c.notice(time.monotonic()) == ("Keeping x loaded for 2h", "ok")
+
+
+def test_success_shows_anyway_when_no_snapshot_comes(monkeypatch):
+    monkeypatch.setattr(mtop.util, "http_post_json", lambda *a, **k: (True, {}))
+    c = mtop.ModelControl([mtop.Endpoint("localhost:1")])
+    c.sync(_snap(("local", ["x"])))
+    c.request_stop()
+    c.answer(True)
+    _wait_idle(c)
+    c.sync({**c._snap, "ts": 0.0})                       # collector stuck on an old pass
+    later = time.monotonic() + mtop.control.FRESH_WAIT + 0.1
+    assert c.notice(later) == ("Stopped x", "ok")
 
 
 def test_keep_loaded_failure_is_reported(monkeypatch):
