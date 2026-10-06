@@ -189,6 +189,7 @@ mtop
 | Key | Action |
 |-----|--------|
 | `q` / `ESC` | Quit |
+| `?` | All keys with what they do and which sections are on; any key closes it |
 | `+` | Decrease refresh interval (faster) |
 | `-` | Increase refresh interval (slower) |
 | `o` | Toggle raw `ollama ps` section |
@@ -209,14 +210,14 @@ mtop
 
 The screenshot above is a real session on a DGX Spark (GB10) with Ollama in Docker and two models loaded. Top to bottom:
 
-- **header** — host, container (or `ollama: serve · pid`, or the API URL in api mode), uptime, the Ollama version, and `+N endpoints` when several are polled; `STALE` appears if the collector falls behind
+- **header** — host, container and the runtime in use (`ollama · docker-api`; or `ollama: serve · pid`, or the API URL in api mode), uptime, the Ollama version, and `+N endpoints` when several are polled; `STALE` appears if the collector falls behind
 - **CONTAINER / PROCESS RESOURCES** — CPU normalized to the cgroup / systemd / affinity budget, memory with the accounting named (`pss`, `rss` or cgroup), sparklines of the recent history
 - **GPU** — one block per card, any vendor; `procs:` lists what NVML sees on the card, joined to the runners by PID; `ACPI` is the hottest ACPI thermal zone, which on the GB10 reads differently from the GPU sensor
 - **LOADED MODELS** — `/api/ps`, one table per endpoint when there are several; PROCESSOR computed exactly as `ollama ps` does
 - **RUNNERS** — the negotiated inference config from each runner's argv, plus the card it sits on
 - **SERVER CONFIG** — the `OLLAMA_*` environment the server was started with and where it was read from
 - **LOGS** — tail of the container log or journal, with request rate and latency parsed from the GIN access log
-- **footer** — keys, the container runtime in use (`via docker-api`), version
+- **footer** — keys in short form, toggles that are on in green; on a narrow terminal the view toggles go first, then the model keys, `? help` always stays
 
 `o` adds the raw `ollama ps` table. Refresh the screenshot with `tools/screenshot.py` (see its docstring).
 

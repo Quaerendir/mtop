@@ -3,10 +3,23 @@
 ## Unreleased
 
 ### Added
+- **`?` shows every key** in a framed overlay: what it does, which sections
+  are on, the version and the container runtime. Any key closes it.
 - **README demo of `--control`:** an asciinema recording
   (`docs/demo-control.cast`) and its GIF: load from the picker, keep-alive,
   pull with progress, stop. `tools/demo-control.sh` records and renders it
   again (tmux, `uvx asciinema`, agg).
+
+### Changed
+- **Shorter footer.** Under `--control` it was 187 columns and lost
+  `l: logs` and more on a 136-column terminal; now it is ~110:
+  `q quit  +- 2.0s │ ↑↓ select  s stop  t keep  L load  P pull │ o ps  r runners  e env  l logs │ ? help`.
+  Keys are bold, a toggle that is on has a green label instead of `[on]`.
+  When the terminal is narrower, whole groups drop out from the end (view
+  toggles, then model keys); `q quit` and `? help` stay.
+- The version and `via <runtime>` left the footer: the version was already
+  in the header's title, the runtime now follows the container name there
+  (`container: ● ollama · docker-api`).
 
 ## 0.14.0 — 2026-10-06
 

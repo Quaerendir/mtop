@@ -382,7 +382,7 @@ def test_swap_cursor_is_drawn_and_footer_has_no_ttl_key():
     assert len(rev) == 1 and rev[0].startswith("qwen3.8-27b")
     w = FakeWin(rows=3, cols=160)
     mtop.render_footer(w, 1.0, False, False, control="llama-swap")
-    assert "s: stop │ L: load model" in w.line(2) and "t: keep" not in w.line(2)
+    assert "s stop  L load" in w.line(2) and "t keep" not in w.line(2)
 
 
 @pytest.fixture

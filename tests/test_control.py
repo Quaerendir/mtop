@@ -147,13 +147,57 @@ def test_selected_row_is_drawn_reversed(win):
 def test_footer_shows_control_keys_or_the_notice():
     w = FakeWin(rows=3, cols=160)
     mtop.render_footer(w, 1.0, False, False, control=True)
-    assert "s: stop │ t: keep loaded │ L: load │ P: pull" in w.line(2)
+    assert "↑↓ select  s stop  t keep  L load  P pull" in w.line(2)
     w = FakeWin(rows=3, cols=160)
     mtop.render_footer(w, 1.0, False, False, control=True, notice=("Stop a? [y/N]", 0))
     assert w.line(2).strip() == "Stop a? [y/N]"
     w = FakeWin(rows=3, cols=160)
     mtop.render_footer(w, 1.0, False, False)
     assert "stop" not in w.line(2)
+
+
+def _footer(cols, **kw):
+    w = FakeWin(rows=3, cols=cols)
+    mtop.render_footer(w, 2.0, False, True, control=True, **kw)
+    return w, w.line(2)
+
+
+def test_footer_fits_136_columns_with_every_group():
+    _, line = _footer(136)
+    assert line.startswith(" q quit  +- 2.0s │ ↑↓ select")
+    assert "l logs │ ? help" in line and len(line) < 136
+    assert "mtop v" not in line and "via " not in line     # both live in the header
+
+
+def test_footer_drops_whole_groups_when_narrow_but_keeps_help():
+    _, line = _footer(80)
+    assert "P pull │ ? help" in line and "runners" not in line
+    _, line = _footer(40)
+    assert line.strip() == "q quit  +- 2.0s │ ? help"
+    _, line = _footer(12)                    # cut, never raises
+    assert line.startswith(" q quit")
+
+
+def test_footer_marks_toggles_that_are_on():
+    w = FakeWin(rows=3, cols=160)
+    mtop.render_footer(w, 1.0, False, True, runners=True, env=False, logs=True)
+    bold = {t for _, _, t, a in w.calls if a & curses.A_BOLD}
+    assert {"runners", "logs"} <= bold and not {"ps", "env"} & bold
+
+
+def test_help_lists_every_key_and_the_toggle_state():
+    rows = mtop.help_lines(2.0, False, True, True, False, True, True, "docker-api")
+    keys = {k for k, _ in rows if k}
+    assert {"q  Esc", "+  -", "?", "o", "r", "e", "l", "s", "t", "L", "P", "X"} <= keys
+    text = dict((k, t) for k, t in rows if k)
+    assert text["e"].endswith("[off]") and text["l"].endswith("[on]")
+    assert rows[-1][1].endswith("· via docker-api")
+    swap = {k for k, _ in mtop.help_lines(2.0, False, False, True, True, False,
+                                          "llama-swap", None) if k}
+    assert "L" in swap and not {"t", "P", "X", "o"} & swap
+    w = FakeWin(rows=30, cols=100)
+    mtop.render_help(w, rows)
+    assert "─ KEYS ─" in w.line(3) and "pull a model by name" in w.text()
 
 
 # ── load picker ──────────────────────────────────────────────────────────────

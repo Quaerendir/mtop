@@ -295,7 +295,9 @@ def render_header(win, y: int, snap: dict, stale: bool) -> int:
                                     if pid else (verb or "running")),
               status_attr)
     else:
-        field("container: ", status_icon + container, status_attr)
+        runtime = snap.get("runtime")
+        field("container: ", status_icon + container + (f" · {runtime}" if runtime else ""),
+              status_attr)
     if uptime and mode != "api" and status != "api-only":
         field("up: ", uptime, curses.color_pair(C_DIM))
     version = (snap.get("server") or {}).get("version")
@@ -800,39 +802,143 @@ def render_logs(win, y: int, snap: dict) -> int:
     return y + 1
 
 
+def footer_groups(interval: float, raw_ps: bool, can_raw_ps: bool, runners: bool = True,
+                  env: bool = True, logs: bool = False,
+                  control: bool | str = False) -> list[list[tuple]]:
+    """Key hints as groups of (key, label, state), most important first.
+
+    state is None for an action, True/False for a view toggle (drawn
+    highlighted when on). render_footer drops whole groups from the end
+    when the terminal is too narrow; `? help` always stays.
+    """
+    groups = [[("q", "quit", None), ("+-", f"{interval:.1f}s", None)]]
+    if control == "llama-swap":
+        groups.append([("↑↓", "select", None), ("s", "stop", None), ("L", "load", None)])
+    elif control:
+        groups.append([("↑↓", "select", None), ("s", "stop", None), ("t", "keep", None),
+                       ("L", "load", None), ("P", "pull", None)])
+    if can_raw_ps:
+        groups.append([("o", "ps", raw_ps), ("r", "runners", runners),
+                       ("e", "env", env), ("l", "logs", logs)])
+    return groups
+
+
+FOOTER_HELP = [("?", "help", None)]
+
+
+def _footer_text(groups: list[list[tuple]]) -> str:
+    return " " + " │ ".join("  ".join(f"{k} {lbl}" for k, lbl, _ in g) for g in groups) + " "
+
+
 def render_footer(win, interval: float, raw_ps: bool, can_raw_ps: bool,
-                  runners: bool = True, runtime: str | None = None,
-                  env: bool = True, logs: bool = False, control: bool | str = False,
-                  notice: tuple[str, int] | None = None):
-    """Key hints, or — while a model action asks or reports — `notice` (text, attr)."""
+                  runners: bool = True, env: bool = True, logs: bool = False,
+                  control: bool | str = False, notice: tuple[str, int] | None = None):
+    """Key hints, or — while a model action asks or reports — `notice` (text, attr).
+
+    Keys are bold, toggles that are on get a green label; groups that do not
+    fit are dropped from the end, the full list is behind `?`.
+    """
     max_y, max_x = win.getmaxyx()
     footer_y = max_y - 1
+    width = max_x - 1                    # the last cell is unwritable via addstr
+    base = curses.color_pair(C_DIM) | curses.A_REVERSE
     if notice:
         text, attr = notice
         try:
-            win.addstr(footer_y, 0, (" " + text + " ")[: max_x - 1].ljust(max_x - 1),
+            win.addstr(footer_y, 0, (" " + text + " ")[:width].ljust(width),
                        attr | curses.A_REVERSE)
         except curses.error:
             pass
         return
-    parts = ["q: quit", f"+/-: interval ({interval:.1f}s)"]
-    if control:
-        parts.append("↑/↓: select │ s: stop │ L: load model" if control == "llama-swap"
-                     else "↑/↓: select │ s: stop │ t: keep loaded │ L: load │ P: pull")
-    if can_raw_ps:
-        parts.append(f"o: raw ps [{'on' if raw_ps else 'off'}]")
-        parts.append(f"r: runners [{'on' if runners else 'off'}]")
-        parts.append(f"e: env [{'on' if env else 'off'}]")
-        parts.append(f"l: logs [{'on' if logs else 'off'}]")
-    if runtime:
-        parts.append(f"via {runtime}")
-    parts.append(f"mtop v{__version__}")
-    footer = " " + " │ ".join(parts) + " "
-    footer = footer[: max_x - 1].ljust(max_x - 1)
+    groups = footer_groups(interval, raw_ps, can_raw_ps, runners, env, logs, control)
+    while len(groups) > 1 and len(_footer_text(groups + [FOOTER_HELP])) > width:
+        groups.pop()
+    groups.append(FOOTER_HELP)
     try:
-        win.addstr(footer_y, 0, footer, curses.color_pair(C_DIM) | curses.A_REVERSE)
+        win.addstr(footer_y, 0, " " * width, base)
+        x = 1
+        for gi, group in enumerate(groups):
+            if gi:
+                x = _footer_put(win, footer_y, x, " │ ", base, width)
+            for ii, (key, label, state) in enumerate(group):
+                if ii:
+                    x = _footer_put(win, footer_y, x, "  ", base, width)
+                x = _footer_put(win, footer_y, x, key, base | curses.A_BOLD, width)
+                x = _footer_put(win, footer_y, x, " ", base, width)
+                on = curses.color_pair(C_OK) | curses.A_REVERSE | curses.A_BOLD
+                x = _footer_put(win, footer_y, x, label, on if state else base, width)
     except curses.error:
         pass
+
+
+def _footer_put(win, y: int, x: int, text: str, attr: int, width: int) -> int:
+    if x < width:
+        win.addstr(y, x, text[: width - x], attr)
+    return x + len(text)
+
+
+def help_lines(interval: float, raw_ps: bool, can_raw_ps: bool, runners: bool, env: bool,
+               logs: bool, control: bool | str, runtime: str | None) -> list[tuple[str | None, str]]:
+    """(key, description) rows of the `?` overlay; ("", title) starts a section,
+    (None, text) is a dim note."""
+    onoff = lambda b: "on" if b else "off"
+    rows = [("", "GENERAL"),
+            ("q  Esc", "quit"),
+            ("+  -", f"refresh faster / slower (now {interval:.1f}s)"),
+            ("?", "this help (any key closes it)")]
+    if can_raw_ps:
+        rows += [("", "VIEW"),
+                 ("o", f"raw `ollama ps` table [{onoff(raw_ps)}]"),
+                 ("r", f"RUNNERS section [{onoff(runners)}]"),
+                 ("e", f"SERVER CONFIG section [{onoff(env)}]"),
+                 ("l", f"LOGS section [{onoff(logs)}]")]
+    if control:
+        rows += [("", "MODELS (--control)"),
+                 ("↑  ↓", "select a model"),
+                 ("s", "stop (unload) the selected model")]
+        if control == "llama-swap":
+            rows += [("L", "load the selected catalog entry")]
+        else:
+            rows += [("t", "keep the selected model loaded (30m / 2h / 24h / forever)"),
+                     ("L", "pick a model from /api/tags and load it"),
+                     ("P", "pull a model by name, with progress"),
+                     ("X", "cancel the running pull")]
+    rows += [(None, ""), (None, f"mtop v{__version__}" + (f" · via {runtime}" if runtime else ""))]
+    return rows
+
+
+def draw_box(win, y0: int, x0: int, width: int, height: int, title: str, footer: str,
+             lines: list[str], attrs: list[int]) -> None:
+    """A ┌─┐ frame in C_ACCENT with `lines` inside, padded to the width."""
+    frame = curses.color_pair(C_ACCENT)
+    inner = width - 2
+    safe_addstr(win, y0, x0, "┌" + title.center(inner, "─")[:inner] + "┐", frame)
+    for r in range(height - 2):
+        safe_addstr(win, y0 + 1 + r, x0, "│", frame)
+        text = lines[r] if r < len(lines) else ""
+        safe_addstr(win, y0 + 1 + r, x0 + 1, (" " + text)[:inner].ljust(inner),
+                    attrs[r] if r < len(attrs) else 0)
+        safe_addstr(win, y0 + 1 + r, x0 + width - 1, "│", frame)
+    safe_addstr(win, y0 + height - 1, x0, "└" + footer.rjust(inner, "─") + "┘", frame)
+
+
+def render_help(win, rows: list[tuple[str | None, str]]) -> None:
+    """The `?` overlay: every key with what it does and the toggles' state."""
+    max_y, max_x = win.getmaxyx()
+    width = min(max_x - 4, 72)
+    height = min(len(rows) + 2, max_y - 4)
+    if width < 30 or height < 3:
+        return
+    lines, attrs = [], []
+    for key, text in rows:
+        if key:
+            lines.append(f"  {key:<7} {text}")
+            attrs.append(0)
+        else:
+            lines.append(text)
+            attrs.append(curses.color_pair(C_DIM) if key is None
+                         else curses.color_pair(C_TABLE_HDR) | curses.A_BOLD)
+    draw_box(win, 3, (max_x - width) // 2, width, height, " KEYS ", "", lines, attrs)
 
 
 def fmt_bytes(n: float) -> str:
@@ -945,17 +1051,8 @@ def render_picker(win, control: ModelControl, snap: dict) -> None:
             attr = curses.color_pair(C_OK)
             attrs.append(attr | curses.A_REVERSE if n == idx else attr)
 
-    frame = curses.color_pair(C_ACCENT)
-    inner = width - 2
-    safe_addstr(win, y0, x0, "┌" + title.center(inner, "─")[:inner] + "┐", frame)
-    for r in range(height - 2):
-        safe_addstr(win, y0 + 1 + r, x0, "│", frame)
-        text = lines[r] if r < len(lines) else ""
-        safe_addstr(win, y0 + 1 + r, x0 + 1, (" " + text)[:inner].ljust(inner),
-                    attrs[r] if r < len(attrs) else 0)
-        safe_addstr(win, y0 + 1 + r, x0 + width - 1, "│", frame)
     count = f" {pk['index'] + 1}/{len(items)} " if items else ""
-    safe_addstr(win, y0 + height - 1, x0, "└" + count.rjust(inner, "─") + "┘", frame)
+    draw_box(win, y0, x0, width, height, title, count, lines, attrs)
 
 
 def curses_main(stdscr, args):
@@ -985,12 +1082,15 @@ def curses_main(stdscr, args):
     control = (ModelControl(collector.endpoints, backend)
                if getattr(args, "control", False) else None)
     snap = collector.snapshot()
+    show_help = False
 
     try:
         while True:
             try:
                 key = stdscr.getch()
-                if control and control.pull_prompt and key not in (-1, curses.KEY_RESIZE):
+                if show_help and key not in (-1, curses.KEY_RESIZE):
+                    show_help = False                   # any key closes, q too
+                elif control and control.pull_prompt and key not in (-1, curses.KEY_RESIZE):
                     control.pull_key(key)
                 elif control and control.picker and key not in (-1, curses.KEY_RESIZE):
                     control.picker_key(key)
@@ -998,6 +1098,8 @@ def curses_main(stdscr, args):
                     control.ttl_key(key)
                 elif control and control.asking and key not in (-1, curses.KEY_RESIZE):
                     control.answer(key in (ord("y"), ord("Y")))   # anything else: no
+                elif key == ord("?"):
+                    show_help = True
                 elif key in (ord("q"), ord("Q"), 27):  # q, Q, ESC
                     break
                 elif key == ord("+"):
@@ -1079,11 +1181,13 @@ def curses_main(stdscr, args):
                 render_picker(stdscr, control, snap)
             if control:
                 render_pull(stdscr, control)
-            render_footer(stdscr, collector.interval, collector.show_raw_ps,
-                          mode in ("docker", "local"), collector.show_runners,
-                          snap.get("runtime"), collector.show_env, collector.show_logs,
-                          backend if control else False,
-                          notice_attr(control.notice(time.monotonic())) if control else None)
+            view = (collector.interval, collector.show_raw_ps, mode in ("docker", "local"),
+                    collector.show_runners, collector.show_env, collector.show_logs,
+                    backend if control else False)
+            if show_help:
+                render_help(stdscr, help_lines(*view, snap.get("runtime")))
+            render_footer(stdscr, *view,
+                          notice=notice_attr(control.notice(time.monotonic())) if control else None)
             stdscr.refresh()
     finally:
         collector.stop()
