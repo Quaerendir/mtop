@@ -1,14 +1,14 @@
 # Changelog
 
-## Unreleased
+## 0.15.0 — 2026-10-06
 
 ### Added
 - **`?` shows every key** in a framed overlay: what it does, which sections
   are on, the version and the container runtime. Any key closes it.
 - **README demo of `--control`:** an asciinema recording
   (`docs/demo-control.cast`) and its GIF: load from the picker, keep-alive,
-  pull with progress, stop. `tools/demo-control.sh` records and renders it
-  again (tmux, `uvx asciinema`, agg).
+  pull with progress, `?`, stop. `tools/demo-control.sh` records and renders
+  it again (tmux, `uvx asciinema`, agg).
 
 ### Changed
 - **Shorter footer.** Under `--control` it was 187 columns and lost

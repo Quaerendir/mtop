@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Record docs/demo-control.cast and render docs/demo-control.gif: a scripted
 # `mtop --control` session against a local Ollama (load from the picker,
-# keep-alive, pull with progress, stop).
+# keep-alive, the ? key list, pull with progress, stop).
 #
 #   tools/demo-control.sh            # needs tmux, uvx (asciinema 2.x), agg
 #
@@ -45,6 +45,7 @@ sleep 0.8; key Enter
 wait_for "Loaded " 180; sleep 2.5
 key t; sleep 1.8; key 2
 wait_for "Keeping" 30; sleep 2.5
+key '?'; sleep 4; key Space; sleep 1
 key P; sleep 0.8
 for ((i = 0; i < ${#PULL}; i++)); do key -l "${PULL:i:1}"; sleep 0.12; done
 sleep 0.8; key Enter

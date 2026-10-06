@@ -202,9 +202,9 @@ mtop
 | `L` | Ollama: pick a model from `/api/tags` and load it; `Tab` switches endpoint; asks first when the server is at `OLLAMA_MAX_LOADED_MODELS`. llama-swap: load the selected catalog entry; asks first when another model runs (`--control` only) |
 | `P` | Pull a model by name (`POST /api/pull`): type it, `Tab` switches endpoint, `Enter` starts. A progress row above the footer shows bytes, speed, ETA and the current layer; stop/load keep working meanwhile. `X` cancels — Ollama keeps the layers it has, so the next pull resumes (`--control`, Ollama only) |
 
-![mtop --control on a DGX Spark: two models loaded from the picker, one kept loaded for 2h, a model pulled with live progress, one stopped](docs/demo-control.gif)
+![mtop --control on a DGX Spark: two models loaded from the picker, one kept loaded for 2h, the ? key list, a model pulled with live progress, one stopped](docs/demo-control.gif)
 
-`--control` on the Spark, in real time (waits over 2 s cut): `L` loads two models from the picker (Ollama itself unloads the first when the second needs the memory), `t` `2` keeps one loaded for 2h, `P` pulls `smollm:135m`, `s` `y` stops a model. The recording is [`docs/demo-control.cast`](docs/demo-control.cast) (`asciinema play docs/demo-control.cast`); `tools/demo-control.sh` records and renders it again.
+`--control` on the Spark, in real time (waits over 2 s cut): `L` loads two models from the picker (Ollama itself unloads the first when the second needs the memory), `t` `2` keeps one loaded for 2h, `?` lists the keys, `P` pulls `smollm:135m`, `s` `y` stops a model. The recording is [`docs/demo-control.cast`](docs/demo-control.cast) (`asciinema play docs/demo-control.cast`); `tools/demo-control.sh` records and renders it again.
 
 ## What you see
 
