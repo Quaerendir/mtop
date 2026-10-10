@@ -61,6 +61,25 @@ def test_upstream_request_line_restarts_the_window(watch):
     assert w.idle_since("qwen") is None
 
 
+def test_http_source_is_the_v259_access_log(watch):
+    """llama-swap >= v259 puts request lines on `/api/events/logs`, `source: http`."""
+    w, clock = watch
+    w.logs_connected()
+    w.feed(log(UP_LINE * 3, "http"))             # http backlog: skipped like proxy's
+    assert w.idle_since("basal") is None
+    clock.t = 1100.0
+    w.feed(log(UP_LINE, "http"))
+    assert w.idle_since("basal") == 1100.0
+
+
+def test_events_reconnect_keeps_the_http_backlog_pending(watch):
+    w, clock = watch
+    w.logs_connected()
+    w.connected()                                # /api/events dropped and came back
+    w.feed(log(UP_LINE, "http"))                 # still the http backlog
+    assert w.idle_since("basal") is None
+
+
 def test_inflight_request_holds_the_window_open(watch):
     w, clock = watch
     w.feed(ev("inflight", {"operation": "upsert",
@@ -136,6 +155,67 @@ def test_ttl_column_counts_down_or_marks_an_upper_bound():
     assert "—" in row(ttl=None)
 
 
+def _serve(routes):
+    """routes: {path: body | None}; None answers 404 like an older llama-swap."""
+    class H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            body = routes.get(self.path)
+            if body is None:
+                self.send_error(404)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            self.wfile.write(body.encode())
+            self.wfile.flush()
+            time.sleep(0.5)
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
+def _sse(*events):
+    return "".join(f"event:message\ndata:{json.dumps(e)}\n\n" for e in events)
+
+
+def test_v259_server_logs_come_from_the_logs_endpoint():
+    srv = _serve({
+        "/api/events": _sse(status(basal="ready")),            # no logData any more
+        "/api/events/logs?stream=http": _sse(log(UP_LINE, "http"), log(UP_LINE, "http")),
+    })
+    w = SwapActivity(mtop.Endpoint(f"http://127.0.0.1:{srv.server_port}"))
+    w.start()
+    try:
+        deadline = time.monotonic() + 3
+        while w.idle_since("basal") is None and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert w.idle_since("basal") is not None
+    finally:
+        w.stop()
+        srv.shutdown()
+
+
+def test_older_server_without_the_logs_endpoint_still_works(monkeypatch):
+    """404 on /api/events/logs: logData stays on /api/events, and mtop backs off."""
+    monkeypatch.setattr("mtop.swapwatch.LOGS_RETRY_DELAY", 30.0)
+    srv = _serve({"/api/events": _sse(log(UP_LINE), status(basal="ready"), log(UP_LINE)),
+                  "/api/events/logs?stream=http": None})
+    w = SwapActivity(mtop.Endpoint(f"http://127.0.0.1:{srv.server_port}"))
+    w.start()
+    try:
+        deadline = time.monotonic() + 3
+        while w.idle_since("basal") is None and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert w.idle_since("basal") is not None
+    finally:
+        w.stop()
+        srv.shutdown()
+
+
 def test_event_stream_end_to_end():
     body = "".join(f"event:message\ndata:{json.dumps(e)}\n\n" for e in (
         log(UP_LINE), status(basal="ready"), log(UP_LINE)))
@@ -145,7 +225,9 @@ def test_event_stream_end_to_end():
             pass
 
         def do_GET(self):
-            assert self.path == "/api/events"
+            if self.path != "/api/events":      # the logs endpoint: absent, like older servers
+                self.send_error(404)
+                return
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.end_headers()
