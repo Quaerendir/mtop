@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+- **Live TTL under llama-swap v259+.** v259 moved the access log off
+  `/api/events` to `/api/events/logs` (`source: http`), so `/upstream/<model>/...`
+  calls stopped counting as activity and the TTL countdown overstated the time
+  left. mtop now also follows `/api/events/logs?stream=http`. Older servers answer
+  that path with an error; mtop asks again once a minute and keeps reading the
+  access log from `/api/events` as before. Checked live against v263.
+
 ## 0.15.1 — 2026-10-06
 
 ### Fixed
