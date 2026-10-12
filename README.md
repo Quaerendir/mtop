@@ -14,7 +14,7 @@ There are web dashboards, Prometheus exporters, and chat TUIs for Ollama. But th
 
 `mtop` fills that gap. One file, one command, pure stdlib Python. It auto-detects whether Ollama runs in a Docker/Podman container or as a bare-metal process (systemd or a manual `ollama serve`) and monitors it either way.
 
-It also watches [llama-swap](https://github.com/mostlygeek/llama-swap) fronting vLLM (`--backend llama-swap`), with the same host, GPU and runner views. See [llama-swap + vLLM](#llama-swap--vllm). And [ComfyUI](https://github.com/comfyanonymous/ComfyUI) (`--backend comfyui`): the models its jobs load, the queue and the model catalog. See [ComfyUI](#comfyui).
+It also watches [llama-swap](https://github.com/mostlygeek/llama-swap) fronting vLLM (`--backend llama-swap`), with the same host, GPU and runner views. See [llama-swap + vLLM](#llama-swap--vllm). And [ComfyUI](https://github.com/comfyanonymous/ComfyUI) (`--backend comfyui`): the models its jobs load, live job progress with ETA, the queue and the model catalog, with `--control` to cancel, clear and free. See [ComfyUI](#comfyui).
 
 ## Features
 
@@ -251,28 +251,41 @@ Not available with this backend: the raw `ollama ps` table (`o`) and keep-loaded
 
 ## ComfyUI
 
-`mtop --backend comfyui` monitors [ComfyUI](https://github.com/comfyanonymous/ComfyUI). ComfyUI's API has no equivalent of `/api/ps`: nothing in it says which models are in memory. What it does expose is the workflow of the running job (`/queue`) and of the finished ones (`/history`), so mtop reads the loader nodes in them (`CheckpointLoaderSimple`, `UNETLoader`, `CLIPLoader`, `VAELoader`, `LoraLoader`, … and custom loaders named the same way, e.g. `UnetLoaderGGUF`):
+`mtop --backend comfyui` monitors [ComfyUI](https://github.com/comfyanonymous/ComfyUI), the node-based image and video generation server. Header, resources, GPU, SERVER CONFIG and LOGS work as for Ollama. The MODELS section is built differently, because ComfyUI is not a model server: it loads models as a job's workflow asks for them.
+
+![mtop --backend comfyui on the same Spark during a render: the job at step 24/60 of its KSampler with ETA, one more queued, the three models of the workflow in use, 28 GiB held by ComfyUI on the GPU, and ComfyUI's own log](docs/screenshot-comfyui.png)
+
+The screenshot is a real render of Qwen-Image on the Spark. Top to bottom in MODELS:
+
+- **queue** — jobs running and waiting (`/queue`), and the **GPU memory held** by the ComfyUI process (NVML per-process memory; 0.3 GiB after `/free`, about 28 GiB with this workflow loaded)
+- **catalog** — model files per folder from `/models`, re-read once a minute. Files under a Hugging Face hub cache (`models--org--name/…`), which ComfyUI lists in every folder an `extra_model_paths` entry points at, are counted once, apart
+- **job** — the running job: node, sampler step x/y with a bar, elapsed time, ETA; when idle, the last job's outcome and duration (red when it failed or was interrupted)
+- **table** — the models in the workflows of the running job and the last 20 finished ones
+
+| Section | Ollama | ComfyUI |
+|---------|--------|---------|
+| MODELS | `/api/ps`: what is loaded, VRAM/RAM split, context, expiry | loader nodes (`CheckpointLoaderSimple`, `UNETLoader`, `CLIPLoader`, `VAELoader`, `LoraLoader`, … and custom loaders named the same way, e.g. `UnetLoaderGGUF`) of the running job (`/queue`) and the finished ones (`/history`), with KIND, STATE, LAST USED and JOBS (how many of the recent jobs loaded it) |
+| Progress | — (`P` pull progress only) | the running job's node and steps, from ComfyUI's websocket `/ws` |
+| RUNNERS | llama.cpp / `ollama runner` argv | none: ComfyUI runs the models in its own process |
+| Server discovery | container `ollama`, `ollama.service`, or an `ollama serve` process | container `comfyui`, or a `python main.py` whose script path or working directory names ComfyUI (no systemd unit) |
+| LOGS | container log or journal, request stats from the GIN lines | container log, ANSI colors stripped, no request stats (ComfyUI logs no access lines) |
+| Version in header | `/api/version` | `system.comfyui_version` from `/system_stats` |
+| `--control` | stop / load / keep / pull a model | cancel the job, clear the queue, free the models |
+
+**STATE.** ComfyUI's API has no equivalent of `/api/ps`: nothing in it says which models are in memory. So the state says where mtop knows a model from:
 
 | STATE | Meaning |
 |---|---|
 | `in use` | loaded by the job running now: certainly in memory |
-| `recent` | loaded by one of the last 20 jobs. ComfyUI keeps a model cached after the job until memory runs short, `/free` is called or the server restarts (a restart also clears the history), so it is *probably* still in memory |
+| `recent` | loaded by one of the last 20 jobs. ComfyUI keeps a model cached after the job until memory runs short, `/free` is called or the server restarts (a restart also clears the history), so it is *probably* still in memory. GPU memory held tells: it drops when ComfyUI frees them |
 
-`LAST USED` is when the newest of those jobs finished, `JOBS` how many of them loaded the model. Only `in use` models count as loaded for `mtop_models_loaded`.
+Only `in use` models count as loaded for `mtop_models_loaded`.
 
-The line above the table shows the queue (running / pending jobs), the GPU memory NVML charges the ComfyUI process tree (the direct sign of whether the `recent` models are still resident: it drops when ComfyUI frees them), and the `/models` catalog per folder. Files under a Hugging Face hub cache (`models--org--name/…`), which ComfyUI lists in every folder an `extra_model_paths` entry points at, are counted once, apart. The catalog is re-read once a minute.
-
-Defaults follow the backend: the API is `http://localhost:8188` and the container name `comfyui`. Without a container, `--mode local` finds a `python main.py` whose script path or working directory names ComfyUI. There is no systemd unit to read, so LOGS comes from the container only, and without request stats: ComfyUI logs no access lines. The version comes from `/system_stats`. ComfyUI runs its models in its own process, so there is no RUNNERS section. Not available: the raw `ollama ps` table (`o`).
-
-**Job progress.** Under the catalog line sits the running job:
-
-```
-job 6569b3d0 · KSampler #8 [██░░░░░░░░░░░░░░] 8/60  13% · 0m 6s · ETA 0m 34s
-```
-
-The node and its steps come from ComfyUI's websocket (`/ws`), which mtop follows with a client id of its own. ComfyUI sends a job's progress to the client that queued it, and to everyone only when the job was queued without a `client_id` — as scripts posting to `/prompt` usually do. A job queued from the web UI belongs to the browser tab, so for it the line says `running 1m 05s · progress goes only to the client that queued it`. mtop never borrows the tab's id, as that would take the progress away from the tab. ComfyUI publishes no start time for a running job either, so the time counts from when mtop first found the job running. That is exact to one refresh, except for a job already running when mtop starts, which shows `≥`. The ETA covers the current node's steps (the sampler: nearly the whole job) at the rate of the steps so far. When the queue is idle, the line shows the last job instead: `last job: success in 1m 56s, 2m ago` (red when it failed or was interrupted). One-shot `--json` / `--prometheus` read no websocket, so they have the time but no steps.
+**Job progress.** The node and its steps come from `/ws`, which mtop follows with a client id of its own. ComfyUI sends a job's progress to the client that queued it, and to everyone only when the job was queued without a `client_id`, as scripts posting to `/prompt` usually do. A job queued from the web UI belongs to the browser tab, so for it the line says `running 1m 05s · progress goes only to the client that queued it`. mtop never borrows the tab's id, as that would take the progress away from the tab. ComfyUI publishes no start time for a running job either, so the time counts from when mtop first found the job running. That is exact to one refresh, except for a job already running when mtop starts, which shows `≥`. The ETA covers the current node's steps (the sampler: nearly the whole job) at the rate of the steps so far. One-shot `--json` / `--prometheus` read no websocket, so they have the time but no steps.
 
 **`--control`** acts on the server, not on a model, and asks y/N first: `s` cancels the running job (`POST /api/jobs/<id>/cancel`, which interrupts only that job; an older ComfyUI gets `POST /interrupt` with the prompt id), `C` clears the pending queue (`POST /queue {"clear": true}`), `F` unloads every model and frees memory (`POST /free`). There is no cursor. With several `-u`, the actions go to the first endpoint.
+
+Defaults follow the backend: the API is `http://localhost:8188` and the container name `comfyui`. Pass `-u` / `-c` for anything else. Not available: the raw `ollama ps` table (`o`).
 
 Prometheus adds `mtop_comfyui_info`, `mtop_comfyui_queue_jobs{state}`, `mtop_comfyui_gpu_memory_bytes`, `mtop_comfyui_model_last_used_seconds{model,kind}`, `mtop_comfyui_job_elapsed_seconds{prompt_id}`, `mtop_comfyui_job_progress_ratio{prompt_id,node}` and `mtop_comfyui_websocket_up`. Verified against ComfyUI 0.37.0 in Docker on an NVIDIA GB10: progress, cancel, clear and free on real renders.
 
@@ -319,6 +332,7 @@ Prometheus adds `mtop_comfyui_info`, `mtop_comfyui_queue_jobs{state}`, `mtop_com
 - [x] Request rate from the access log (tokens/s is per-response data Ollama returns only to the caller — not observable from outside)
 - [x] Effective server environment (`OLLAMA_*`) per source
 - [x] Runner → GPU mapping via NVML per-process memory
+- [x] ComfyUI backend — models of the running and recent jobs, live job progress over `/ws`, cancel / clear / free (`--backend comfyui`)
 
 ## Contributing
 
