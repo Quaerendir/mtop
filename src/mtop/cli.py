@@ -211,7 +211,9 @@ def main():
                              "'L' picks a model from /api/tags and loads it, "
                              "'P' pulls a model by name with a progress bar, 'X' cancels "
                              "the pull (llama-swap: 'L' loads the selected catalog entry; "
-                             "no 't' or 'P', TTL and models are config). "
+                             "no 't' or 'P', TTL and models are config; comfyui: 's' "
+                             "cancels the running job, 'C' clears the queue, 'F' frees "
+                             "the models). "
                              "Off by default — without it mtop never writes to the API")
     parser.add_argument("--no-docker", action="store_true",
                         help="Alias for --mode api (kept for compatibility)")
@@ -259,8 +261,6 @@ def main():
             # Docker, locks onto *that* unrelated container instead of ever
             # reaching this backend's own process.
             args.container = container
-    if args.control and args.backend == "comfyui":
-        parser.error("--control is not available with --backend comfyui")
     try:
         args.endpoints = [Endpoint(u, headers, args.insecure, args.cacert)
                           for u in (args.api_urls or [DEFAULT_API_BASE])]

@@ -72,6 +72,13 @@ class ModelControl:
     model at a time unless its config groups them, so a load while another
     model runs asks first. There is no keep-alive to change: TTL is config.
 
+    With ComfyUI there is no model cursor: its actions are on the server,
+    each asked y/N first. `s` cancels the running job
+    (`POST /api/jobs/<id>/cancel`, which interrupts only that job; a server
+    without it gets `POST /interrupt` with the prompt_id), `C` clears the
+    pending queue (`POST /queue {"clear": true}`), `F` unloads every model and
+    frees the cache (`POST /free`). They act on the primary endpoint.
+
     Pull (`P`, Ollama only) asks for a name and streams `POST /api/pull`.
     It runs beside the other actions — a 70 GB download should not block a
     stop — one pull at a time, and `X` cancels it by closing the stream,
@@ -83,6 +90,9 @@ class ModelControl:
         self.endpoints = endpoints
         self.on_done = on_done              # called after an action; the UI's refresh
         self.swap = backend == "llama-swap"
+        self.comfy = backend == "comfyui"
+        # ComfyUI y/N: (verb, endpoint, what) — see COMFY_ACTIONS
+        self.comfy_confirm: tuple[str, int, str] | None = None
         self.selected: tuple[int, str] | None = None
         self.confirm: tuple[int, str] | None = None
         self.busy: tuple[str, int, str, float] | None = None  # verb, ep, name, started
@@ -103,8 +113,9 @@ class ModelControl:
         self.pull_prompt: dict | None = None    # {"ep", "text"} while typing a name
         self.pull: dict | None = None           # the running pull, see _pull_run
 
-    @staticmethod
-    def rows(snap: dict) -> list[tuple[int, str]]:
+    def rows(self, snap: dict) -> list[tuple[int, str]]:
+        if self.comfy:
+            return []                       # no cursor: ComfyUI's actions are server-wide
         endpoints = snap.get("endpoints") or [snap]
         return [(i, m.get("name", "?")) for i, ep in enumerate(endpoints)
                 if ep.get("models_ok") for m in ep.get("models", [])]
@@ -136,6 +147,9 @@ class ModelControl:
         self.selected = rows[self._index]
 
     def request_stop(self) -> None:
+        if self.comfy:
+            self._comfy_ask("Cancelling")
+            return
         if not self.selected or self.busy:
             return
         if self.swap and not self._running(self.selected):
@@ -144,6 +158,8 @@ class ModelControl:
         self.confirm = self.selected
 
     def request_ttl(self) -> None:
+        if self.comfy:
+            return
         if self.swap:
             self._say("llama-swap sets each model's TTL in its config", ok=False)
             return
@@ -153,6 +169,8 @@ class ModelControl:
     def request_load(self) -> None:
         """`L`: the /api/tags picker (Ollama), or the selected catalog entry
         (llama-swap — its whole catalog is already on screen)."""
+        if self.comfy:
+            return
         if not self.swap:
             self.open_picker()
             return
@@ -168,6 +186,57 @@ class ModelControl:
             self.swap_confirm = (i, self.selected[1], others)
         else:
             self._load(self.selected)
+
+    # ── ComfyUI ──────────────────────────────────────────────────────────────
+
+    def request_clear(self) -> None:
+        if self.comfy:
+            self._comfy_ask("Clearing")
+
+    def request_free(self) -> None:
+        if self.comfy:
+            self._comfy_ask("Freeing")
+
+    def _comfy_ask(self, verb: str) -> None:
+        """Open the y/N for a ComfyUI action, or say why there is nothing to do."""
+        if self.busy:
+            return
+        ep = (self._snap.get("endpoints") or [self._snap])[0]
+        queue = ep.get("queue") or {}
+        if verb == "Cancelling":
+            pid = queue.get("prompt_id")
+            if not pid:
+                self._say("No job is running", ok=False)
+                return
+            self.comfy_confirm = (verb, 0, str(pid))
+        elif verb == "Clearing":
+            n = queue.get("pending") or 0
+            if not n:
+                self._say("No jobs are waiting", ok=False)
+                return
+            self.comfy_confirm = (verb, 0, f"{n} pending job{'s' if n != 1 else ''}")
+        else:
+            self.comfy_confirm = (verb, 0, "all models")
+
+    def _comfy_run(self, verb: str, ep: int, what: str) -> None:
+        e = self.endpoints[ep]
+        if verb == "Cancelling":
+            def call():
+                ok, data = e.request("POST", f"/api/jobs/{urllib.parse.quote(what)}/cancel")
+                if not ok and str(data).startswith(("HTTP 404", "HTTP 405")):
+                    ok, data = e.post_json("/interrupt", {"prompt_id": what}, parse=False)
+                return ok, data
+            label, done = f"job {what[:8]}", f"Cancelled job {what[:8]}"
+        elif verb == "Clearing":
+            def call():
+                return e.post_json("/queue", {"clear": True}, parse=False)
+            label, done = what, f"Cleared {what}"
+        else:
+            def call():
+                return e.post_json("/free", {"unload_models": True, "free_memory": True},
+                                  parse=False)
+            label, done = what, "Asked ComfyUI to unload all models and free memory"
+        self._start(verb, (ep, label), None, UNLOAD_TIMEOUT, done=done, call=call)
 
     def _models(self, ep: int) -> list[dict]:
         endpoints = self._snap.get("endpoints") or [self._snap]
@@ -215,7 +284,10 @@ class ModelControl:
         target, self.confirm = self.confirm, None
         load, self.load_confirm = self.load_confirm, None
         swap, self.swap_confirm = self.swap_confirm, None
-        if yes and target and self.swap:
+        comfy, self.comfy_confirm = self.comfy_confirm, None
+        if yes and comfy:
+            self._comfy_run(*comfy)
+        elif yes and target and self.swap:
             path = f"/api/models/unload/{urllib.parse.quote(target[1])}"
             self._start("Stopping", target, None, UNLOAD_TIMEOUT, request=("POST", path))
         elif yes and target:
@@ -225,7 +297,8 @@ class ModelControl:
 
     @property
     def asking(self) -> bool:
-        return bool(self.confirm or self.load_confirm or self.swap_confirm)
+        return bool(self.confirm or self.load_confirm or self.swap_confirm
+                    or self.comfy_confirm)
 
     def evictions(self, ep: int) -> tuple[list[str], int, str] | None:
         """Resident models on `ep` when it is at its model-count limit.
@@ -432,23 +505,30 @@ class ModelControl:
     # ── actions ──────────────────────────────────────────────────────────────
 
     _VERBS = {"Stopping": ("Stopped", "Stop"), "Loading": ("Loaded", "Load"),
-              "Extending": ("Extended", "Keep-alive of")}
+              "Extending": ("Extended", "Keep-alive of"),
+              "Cancelling": ("Cancelled", "Cancel of"), "Clearing": ("Cleared", "Clear of"),
+              "Freeing": ("Freed", "Free of")}
 
     def _start(self, verb: str, target: tuple[int, str], extra: dict | None, timeout: int,
-               done: str | None = None, request: tuple[str, str] | None = None) -> None:
+               done: str | None = None, request: tuple[str, str] | None = None,
+               call=None) -> None:
         """`extra` goes into Ollama's /api/generate body; `request` is a
-        (method, path) with no body instead — llama-swap's endpoints."""
+        (method, path) with no body instead — llama-swap's endpoints; `call`
+        makes the request itself and returns (ok, data) — ComfyUI's."""
         if self.busy:
             return
         self.busy = (verb, target[0], target[1], time.monotonic())
         threading.Thread(target=self._run,
-                         args=(verb, target, extra, timeout, done, request),
+                         args=(verb, target, extra, timeout, done, request, call),
                          daemon=True, name="mtop-action").start()
 
     def _run(self, verb: str, target: tuple[int, str], extra: dict | None, timeout: int,
-             done: str | None = None, request: tuple[str, str] | None = None) -> None:
+             done: str | None = None, request: tuple[str, str] | None = None,
+             call=None) -> None:
         i, name = target
-        if request is not None:
+        if call is not None:
+            ok, data = call()
+        elif request is not None:
             ok, data = self.endpoints[i].request(*request, timeout=timeout)
         else:
             ok, data = self.endpoints[i].post_json(
@@ -497,6 +577,12 @@ class ModelControl:
             return (f"Load {self.label((ep, name))}? [y/N] — llama-swap will stop "
                     f"{', '.join(others)} unless its config groups them",
                     "ask")
+        if self.comfy_confirm:
+            verb, ep, what = self.comfy_confirm
+            question = {"Cancelling": f"Cancel the running job {what[:8]}?",
+                        "Clearing": f"Clear the queue ({what})?",
+                        "Freeing": "Unload all models and free ComfyUI's memory?"}[verb]
+            return f"{question} [y/N]", "ask"
         if self.ttl_target:
             keys = " │ ".join(f"{n}: {label}" for n, (label, _) in enumerate(TTL_CHOICES, 1))
             return (f"Keep {self.label(self.ttl_target)} loaded for — {keys} │ other key: cancel",

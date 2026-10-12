@@ -155,3 +155,50 @@ def catalog_counts(lists: dict[str, list]) -> dict:
         if n:
             counts[folder] = n
     return {"folders": counts, "hf_cache": len(hf)}
+
+
+def _running_item(queue: Any, prompt_id: str | None) -> Any:
+    q = queue if isinstance(queue, dict) else {}
+    for item in q.get("queue_running") or []:
+        if isinstance(item, (list, tuple)) and len(item) > 1 and item[1] == prompt_id:
+            return item
+    return None
+
+
+def node_class(queue: Any, prompt_id: str | None, node: str | None) -> str | None:
+    """class_type of a node of the running job's graph (`KSampler`)."""
+    graph = _graph(_running_item(queue, prompt_id))
+    n = graph.get(str(node)) if isinstance(graph, dict) and node is not None else None
+    return str(n.get("class_type")) if isinstance(n, dict) and n.get("class_type") else None
+
+
+def queued_by_client(queue: Any, prompt_id: str | None) -> bool:
+    """True when the running job was queued with a client_id — its progress
+    then goes to that client only (see mtop.comfywatch)."""
+    item = _running_item(queue, prompt_id)
+    extra = item[3] if item is not None and len(item) > 3 else None
+    return bool(isinstance(extra, dict) and extra.get("client_id"))
+
+
+def last_job(history: Any) -> dict | None:
+    """The newest finished job: {prompt_id, outcome, took (s), ended (ISO)}.
+    outcome is success, error or interrupted."""
+    if not isinstance(history, dict) or not history:
+        return None
+    pid, entry = list(history.items())[-1]
+    if not isinstance(entry, dict):
+        return None
+    status = entry.get("status") or {}
+    times: dict[str, int] = {}
+    for msg in status.get("messages") or []:
+        if isinstance(msg, (list, tuple)) and len(msg) == 2 and isinstance(msg[1], dict):
+            t = msg[1].get("timestamp")
+            if isinstance(t, (int, float)):
+                times[str(msg[0])] = int(t)
+    outcome = ("interrupted" if "execution_interrupted" in times
+               else str(status.get("status_str") or "unknown"))
+    start, end = times.get("execution_start"), _ended_ms(entry)
+    return {"prompt_id": pid, "outcome": outcome,
+            "took": round((end - start) / 1000, 1) if start and end else None,
+            "ended": (datetime.fromtimestamp(end / 1000, timezone.utc)
+                      .isoformat(timespec="seconds") if end else None)}

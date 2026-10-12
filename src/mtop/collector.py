@@ -16,8 +16,9 @@ from collections import deque
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from .comfyui import (HISTORY_ITEMS, NON_MODEL_FOLDERS, catalog_counts, models_in_use,
-                      queue_summary)
+from .comfyui import (HISTORY_ITEMS, NON_MODEL_FOLDERS, catalog_counts, last_job,
+                      models_in_use, node_class, queue_summary, queued_by_client)
+from .comfywatch import ComfyProgress
 from .container import ContainerRuntime, detect_runtime
 from .export import parse_iso, parse_size
 from .gpu import (AmdSysfsProvider, AppleGpuProvider, GpuMonitor, GpuProvider,
@@ -156,9 +157,16 @@ class Collector(threading.Thread):
             max_workers=len(self.endpoints), thread_name_prefix="mtop-api")
             if len(self.endpoints) > 1 else None)
 
-        # llama-swap /api/events followers, one per endpoint, for the TTL
-        # countdown. Only long-running modes start them (watch_activity).
-        self._activity: dict[str, SwapActivity] = {}
+        # llama-swap /api/events followers (the TTL countdown) or ComfyUI /ws
+        # followers (job progress), one per endpoint. Only long-running modes
+        # start them (watch_activity).
+        self._activity: dict[str, SwapActivity | ComfyProgress] = {}
+        # ComfyUI: (prompt_id, monotonic) the running job was first seen in
+        # /queue, per endpoint — its elapsed time when /ws saw no start.
+        self._job_seen: dict[str, tuple[str, float, bool]] = {}
+        # Endpoints whose /queue answered before: a job first seen running
+        # there started within one cycle, so that time is its start.
+        self._queue_polled: set[str] = set()
 
         # Multi-vendor GPU registry, built lazily so `use_docker` is already
         # resolved when the nvidia provider asks for its argv prefixes.
@@ -212,11 +220,13 @@ class Collector(threading.Thread):
 
     def watch_activity(self) -> None:
         """Follow each llama-swap endpoint's event stream, so a loaded model's
-        TTL counts down. A one-shot snapshot has nothing to count from."""
-        if self.backend != "llama-swap" or self._activity:
+        TTL counts down, or each ComfyUI endpoint's websocket, for the running
+        job's progress. A one-shot snapshot has nothing to follow."""
+        if self.backend not in ("llama-swap", "comfyui") or self._activity:
             return
+        watcher = SwapActivity if self.backend == "llama-swap" else ComfyProgress
         for ep in self.endpoints:
-            self._activity[ep.label] = w = SwapActivity(ep)
+            self._activity[ep.label] = w = watcher(ep)
             w.start()
 
     def close(self) -> None:
@@ -490,13 +500,69 @@ class Collector(threading.Thread):
             return {**ep.describe(), "models_ok": False, "models": [],
                     "models_err": str(queue), "queue": None, "catalog": None}
         ok2, history = ep.get_json(f"/history?max_items={HISTORY_ITEMS}")
+        summary = queue_summary(queue)
         return {
             **ep.describe(),
             "models_ok": True,
             "models": models_in_use(queue, history if ok2 else None),
             "models_err": "",
-            "queue": queue_summary(queue),
+            "queue": summary,
+            "job": self._comfyui_job(ep, queue, summary["prompt_id"]),
+            "last_job": last_job(history) if ok2 else None,
+            "websocket": self._comfyui_ws_state(ep),
             "catalog": self._comfyui_catalog(ep),
+        }
+
+    def _comfyui_ws_state(self, ep: Endpoint) -> str | None:
+        """connected / connecting / the last error; None when not followed
+        (one-shot --json and --prometheus)."""
+        w = self._activity.get(ep.label)
+        if not isinstance(w, ComfyProgress):
+            return None
+        return "connected" if w.connected else (w.error or "connecting")
+
+    def _comfyui_job(self, ep: Endpoint, queue: Any, pid: str | None) -> dict | None:
+        """The running job: node, step x/y and ETA from /ws when mtop sees its
+        events (`live`), else only how long it has been running.
+
+        ComfyUI publishes no start time for a running job (/ws sends
+        `execution_start` only to the job's own client), so the time counts
+        from when mtop first found the job running in /queue. That is the
+        start, to within one cycle, when the previous /queue read showed
+        something else (`elapsed_exact`); on mtop's first read it is only a
+        lower bound.
+        The ETA covers the current node's steps only (the sampler, usually
+        nearly all of the job), at the rate of the steps done so far.
+        """
+        polled_before = ep.label in self._queue_polled
+        self._queue_polled.add(ep.label)
+        if pid is None:
+            self._job_seen.pop(ep.label, None)
+            return None
+        now = time.monotonic()
+        seen = self._job_seen.get(ep.label)
+        if seen is None or seen[0] != pid:
+            seen = self._job_seen[ep.label] = (pid, now, polled_before)
+        w = self._activity.get(ep.label)
+        p = w.job(pid) if isinstance(w, ComfyProgress) else None
+        started = p["started"] if p and p["started"] is not None else None
+        value, total = (p["value"], p["max"]) if p else (None, None)
+        eta = None
+        if p and p["node_started"] is not None and value and total and value < total:
+            eta = round((now - p["node_started"]) / value * (total - value), 1)
+        node = p["node"] if p else None
+        return {
+            "prompt_id": pid,
+            "live": p is not None,
+            "queued_by_client": queued_by_client(queue, pid),
+            "node": node,
+            "node_class": node_class(queue, pid, node),
+            "value": value,
+            "max": total,
+            "elapsed": round(now - (started if started is not None else seen[1]), 1),
+            "elapsed_exact": started is not None or seen[2],
+            "eta": eta,
+            "cached": p["cached"] if p else None,
         }
 
     def _comfyui_catalog(self, ep: Endpoint) -> dict | None:

@@ -575,6 +575,52 @@ def comfyui_status_lines(ep: dict) -> list[str]:
     return lines
 
 
+def comfyui_job_line(ep: dict) -> tuple[str, str] | None:
+    """The running job — or, when idle, the last one — as (text, kind),
+    kind one of ok / warn / err / dim.
+
+    `job 694df408 · KSampler #5 [██████░░░░░░░░░░] 12/30  40% · 1m 05s · ETA 25s`
+    """
+    job = ep.get("job")
+    if job:
+        parts = [f"job {str(job.get('prompt_id', '?'))[:8]}"]
+        elapsed = fmt_duration(job.get("elapsed") or 0)
+        if not job.get("elapsed_exact"):
+            elapsed = "≥" + elapsed
+        if job.get("live"):
+            if job.get("node"):
+                parts.append(f"{job.get('node_class') or 'node'} #{job['node']}")
+            value, total = job.get("value"), job.get("max")
+            if value is not None and total:
+                frac = max(0.0, min(1.0, value / total))
+                filled = int(frac * 16)
+                parts[-1] += (f" [{'█' * filled}{'░' * (16 - filled)}] "
+                              f"{value}/{total} {frac * 100:3.0f}%")
+            parts.append(elapsed)
+            if job.get("eta") is not None:
+                parts.append(f"ETA {fmt_duration(job['eta'])}")
+            return " · ".join(parts), "ok"
+        parts.append(f"running {elapsed}")
+        ws = ep.get("websocket")
+        if ws is None:
+            pass                            # one-shot: no websocket followed
+        elif ws != "connected":
+            parts.append(f"no progress: websocket {ws}")
+        elif job.get("queued_by_client"):
+            parts.append("progress goes only to the client that queued it")
+        else:
+            parts.append("waiting for progress")
+        return " · ".join(parts), "warn"
+    last = ep.get("last_job")
+    if last:
+        took = f" in {fmt_duration(last['took'])}" if last.get("took") is not None else ""
+        ago = relative_time(last.get("ended") or "")
+        text = f"last job: {last.get('outcome', '?')}{took}" + (f", {ago}" if last.get("ended")
+                                                                  else "")
+        return text, ("dim" if last.get("outcome") == "success" else "err")
+    return None
+
+
 def render_comfyui_models_table(win, y: int, ep: dict, title: str) -> int:
     """ComfyUI: the models of the running job and of the recent ones.
 
@@ -592,6 +638,11 @@ def render_comfyui_models_table(win, y: int, ep: dict, title: str) -> int:
 
     for line in comfyui_status_lines(ep):
         y = safe_addstr(win, y, 3, line, curses.color_pair(C_DIM))
+    job = comfyui_job_line(ep)
+    if job:
+        attr = {"ok": curses.color_pair(C_OK) | curses.A_BOLD, "warn": curses.color_pair(C_WARN),
+                "err": curses.color_pair(C_ERR)}.get(job[1], curses.color_pair(C_DIM))
+        y = safe_addstr(win, y, 3, job[0], attr)
     models = ep.get("models", [])
     if not models:
         y = safe_addstr(win, y, 3, "No jobs in the history yet",
@@ -871,6 +922,9 @@ def footer_groups(interval: float, raw_ps: bool, can_raw_ps: bool, runners: bool
     groups = [[("q", "quit", None), ("+-", f"{interval:.1f}s", None)]]
     if control == "llama-swap":
         groups.append([("↑↓", "select", None), ("s", "stop", None), ("L", "load", None)])
+    elif control == "comfyui":
+        groups.append([("s", "cancel job", None), ("C", "clear queue", None),
+                       ("F", "free", None)])
     elif control:
         groups.append([("↑↓", "select", None), ("s", "stop", None), ("t", "keep", None),
                        ("L", "load", None), ("P", "pull", None)])
@@ -952,7 +1006,12 @@ def help_lines(interval: float, raw_ps: bool, can_raw_ps: bool, runners: bool, e
                  ("r", f"RUNNERS section [{onoff(runners)}]"),
                  ("e", f"SERVER CONFIG section [{onoff(env)}]"),
                  ("l", f"LOGS section [{onoff(logs)}]")]
-    if control:
+    if control == "comfyui":
+        rows += [("", "COMFYUI (--control, each asks y/N first)"),
+                 ("s", "cancel the running job"),
+                 ("C", "clear the queue of pending jobs"),
+                 ("F", "unload all models and free memory (/free)")]
+    elif control:
         rows += [("", "MODELS (--control)"),
                  ("↑  ↓", "select a model"),
                  ("s", "stop (unload) the selected model")]
@@ -1191,6 +1250,10 @@ def curses_main(stdscr, args):
                     control.request_pull()
                 elif control and key == ord("X") and control.pull:
                     control.cancel_pull()
+                elif control and key == ord("C"):
+                    control.request_clear()
+                elif control and key == ord("F"):
+                    control.request_free()
                 elif key == curses.KEY_RESIZE:
                     stdscr.erase()
             except curses.error:
