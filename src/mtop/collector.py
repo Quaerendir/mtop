@@ -16,13 +16,17 @@ from collections import deque
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from .comfyui import (HISTORY_ITEMS, NON_MODEL_FOLDERS, catalog_counts, models_in_use,
+                      queue_summary)
 from .container import ContainerRuntime, detect_runtime
 from .export import parse_iso, parse_size
 from .gpu import (AmdSysfsProvider, AppleGpuProvider, GpuMonitor, GpuProvider,
                   IntelSysfsProvider, NvidiaSmiProvider, NvmlProvider, RocmSmiProvider,
                   TegraUnifiedProvider)
-from .logs import ContainerLogs, FileLogs, JournalLogs, LogSource, line_level, request_stats
-from .procfs import (find_llama_swap_pid, find_ollama_pid, host_cpu_count, proc_children_map,
+from .logs import (ContainerLogs, FileLogs, JournalLogs, LogSource, line_level, request_stats,
+                   strip_ansi)
+from .procfs import (find_comfyui_pid, find_llama_swap_pid, find_ollama_pid,
+                     host_cpu_count, proc_children_map,
                      process_tree, proc_uptime_sec, read_acpi_thermal, read_proc_cmdline,
                      read_proc_cpu_ticks, read_proc_environ, read_proc_ppid, read_proc_pss_bytes,
                      read_proc_rss_bytes, read_unified_memory, systemd_environment,
@@ -41,6 +45,7 @@ HISTORY_LEN = 240         # sparkline samples kept (one per slow cycle, >= 2 s e
 LOG_FETCH = 200           # log lines fetched per slow cycle (request stats window)
 DEFAULT_LOG_LINES = 8     # log lines shown on screen
 EXTRA_WAIT = 1.0          # seconds a non-primary endpoint may hold up a cycle
+CATALOG_TTL = 60.0        # ComfyUI: seconds between re-reads of the /models folders
 
 
 class Collector(threading.Thread):
@@ -72,6 +77,11 @@ class Collector(threading.Thread):
                    exact id join (llama-swap's config key is the same string
                    on both the catalog and the runner's --served-model-name),
                    not Ollama's context-length heuristic.
+      comfyui    — /queue + /history (models of the running and recent jobs,
+                   see mtop.comfyui) and the /models catalog, version from
+                   /system_stats, no systemd unit (a `python main.py` from a
+                   ComfyUI checkout), no runner processes: ComfyUI runs the
+                   models in its own process.
     """
 
     def __init__(self, container: str, api_url: str, interval: float,
@@ -112,6 +122,8 @@ class Collector(threading.Thread):
         self._ps_pending: dict[str, concurrent.futures.Future] = {}
         self._ver_pending: dict[str, concurrent.futures.Future] = {}
         self._ps_last: dict[str, dict] = {}
+        # ComfyUI /models catalog per endpoint label: (monotonic read, counts).
+        self._catalog: dict[str, tuple[float, dict]] = {}
         # Used to pick the right `ollama serve` when several are running, and
         # only meaningful for a loopback URL — a remote API can't be a local pid.
         self.api_port = api_port(self.api_url) if is_loopback_url(self.api_url) else None
@@ -262,9 +274,13 @@ class Collector(threading.Thread):
         """
         if self.backend == "llama-swap":
             return parse_vllm_argv(args) or parse_runner_argv(args)
+        if self.backend == "comfyui":
+            return None
         return parse_runner_argv(args)
 
     def _detect_local(self) -> bool:
+        if self.backend == "comfyui":
+            return find_comfyui_pid(self.api_port) is not None
         if self.backend == "llama-swap":
             if IS_LINUX and systemd_llama_swap() is not None:
                 return True
@@ -340,7 +356,7 @@ class Collector(threading.Thread):
             self._logs = self._read_logs(mode) if self.show_logs else None
             self._slow_ts = now
 
-        if slow_due and mode == "docker" and source_up:
+        if slow_due and mode == "docker" and source_up and self.backend != "comfyui":
             self._runners = self._docker_runners(snap.get("pid"))
 
         snap["res_stats"] = self._res_stats if mode != "api" else None
@@ -372,6 +388,8 @@ class Collector(threading.Thread):
                                          for r in snap.get("runners") or [])
         link_runners_to_gpus(snap.get("runners"), snap.get("gpus"),
                              read_proc_ppid if host_pids else None)
+        if self.backend == "comfyui":
+            primary["gpu_mem_mib"] = self._server_gpu_mib(snap.get("pid"), snap.get("gpus"))
 
         if self.show_raw_ps and mode in ("docker", "local") and self.backend == "ollama":
             if mode == "docker" and self.runtime is not None:
@@ -460,7 +478,64 @@ class Collector(threading.Thread):
         m["ttl_left"] = round(left)
         m["expires_at"] = (datetime.now(timezone.utc) + timedelta(seconds=left)).isoformat()
 
+    def _comfyui_result(self, ep: Endpoint) -> dict:
+        """ComfyUI's queue, the models of its running and recent jobs, and the
+        catalog, shaped like `_ps_result`'s output.
+
+        `/queue` decides `models_ok`: it is the call that says the server is
+        up. A failed `/history` only costs the *recent* rows.
+        """
+        ok, queue = ep.get_json("/queue")
+        if not ok:
+            return {**ep.describe(), "models_ok": False, "models": [],
+                    "models_err": str(queue), "queue": None, "catalog": None}
+        ok2, history = ep.get_json(f"/history?max_items={HISTORY_ITEMS}")
+        return {
+            **ep.describe(),
+            "models_ok": True,
+            "models": models_in_use(queue, history if ok2 else None),
+            "models_err": "",
+            "queue": queue_summary(queue),
+            "catalog": self._comfyui_catalog(ep),
+        }
+
+    def _comfyui_catalog(self, ep: Endpoint) -> dict | None:
+        """/models folder counts, re-read every CATALOG_TTL seconds — one
+        request per folder, and the files change only when someone adds one."""
+        hit = self._catalog.get(ep.label)
+        if hit is not None and time.monotonic() - hit[0] < CATALOG_TTL:
+            return hit[1]
+        ok, folders = ep.get_json("/models")
+        if not ok or not isinstance(folders, list):
+            return hit[1] if hit else None
+        lists: dict[str, list] = {}
+        for f in folders:
+            if not isinstance(f, str) or f in NON_MODEL_FOLDERS:
+                continue
+            ok2, files = ep.get_json(f"/models/{f}")
+            if ok2 and isinstance(files, list):
+                lists[f] = files
+        counts = catalog_counts(lists)
+        self._catalog[ep.label] = (time.monotonic(), counts)
+        return counts
+
+    @staticmethod
+    def _server_gpu_mib(pid: int | None, gpus: list[dict] | None) -> int | None:
+        """Device memory NVML charges the server process tree, in MiB.
+
+        ComfyUI runs its models in its own process, so this is the one direct
+        sign of whether the *recent* models are still resident: it drops when
+        ComfyUI frees them. None without a pid or per-process GPU data.
+        """
+        if not pid or not gpus or not any("procs" in g for g in gpus):
+            return None
+        pids = set(process_tree(pid)) if IS_LINUX else {pid}
+        return sum(int(p.get("mem_mib") or 0) for g in gpus for p in g.get("procs") or []
+                   if p.get("pid") in pids)
+
     def _fetch_one(self, ep: Endpoint) -> dict:
+        if self.backend == "comfyui":
+            return self._comfyui_result(ep)
         return (self._llama_swap_result(ep) if self.backend == "llama-swap"
                else self._ps_result(ep))
 
@@ -515,9 +590,15 @@ class Collector(threading.Thread):
         Same non-blocking rule as _fetch_models: submit, wait EXTRA_WAIT for
         all, keep whatever answered; the rest is read on a later slow cycle.
         llama-swap answers the same path with {"version": "v256", ...} in
-        current builds; an older one that 404s is not asked again.
+        current builds; an older one that 404s is not asked again. ComfyUI
+        has it as `system.comfyui_version` in /system_stats.
         """
         def one(ep: Endpoint) -> tuple[str, str | None]:
+            if self.backend == "comfyui":
+                ok, stats = ep.get_json("/system_stats", timeout=3)
+                system = stats.get("system") if ok and isinstance(stats, dict) else None
+                v = str((system or {}).get("comfyui_version") or "")
+                return ep.label, (v or None)
             ok, ver = ep.get_json("/api/version", timeout=3)
             if not ok and str(ver).startswith("HTTP 404"):
                 self._no_version.add(ep.label)
@@ -566,7 +647,7 @@ class Collector(threading.Thread):
     def _build_log_source(self, mode: str) -> LogSource | None:
         if mode == "docker" and self.runtime is not None:
             return ContainerLogs(self.runtime, self.container)
-        if mode == "local" and IS_LINUX:
+        if mode == "local" and IS_LINUX and self.backend != "comfyui":
             swap = self.backend == "llama-swap"
             if (systemd_llama_swap() if swap else systemd_ollama()) is None:
                 return None
@@ -592,19 +673,21 @@ class Collector(threading.Thread):
             self._log_mode = mode
         src = self._log_source
         if src is None:
-            why = ("a manual `ollama serve` logs to its own terminal" if mode == "local"
-                   else "no log source in api mode")
+            why = ("no log source in api mode" if mode != "local"
+                   else "a local ComfyUI logs to its own terminal" if self.backend == "comfyui"
+                   else "a manual `ollama serve` logs to its own terminal")
             return {"source": None, "ok": False, "error": why, "lines": [], "requests": None}
         ok, res = src.tail(max(LOG_FETCH, self.log_lines))
         if not ok:
             return {"source": src.name, "ok": False, "error": str(res), "lines": [],
                     "requests": None}
-        lines = res
+        lines = [(ts, strip_ansi(text)) for ts, text in res]
         return {
             "source": src.name, "ok": True, "error": "",
             "lines": [{"ts": ts, "text": text, "level": line_level(text)}
                       for ts, text in lines[-self.log_lines:]],
-            "requests": request_stats(lines),
+            # ComfyUI logs no access lines: the stats would always read zero.
+            "requests": None if self.backend == "comfyui" else request_stats(lines),
         }
 
     def _server_info(self, mode: str, pid: int | None) -> dict:
@@ -621,7 +704,7 @@ class Collector(threading.Thread):
                 info["env"], info["env_source"] = inference_env(pairs), "process"
                 if self.backend == "llama-swap":
                     self._add_runner_env(info)
-            else:
+            elif self.backend != "comfyui":         # no unit to fall back on
                 sd = (systemd_environment("llama-swap.service", user=True)
                      if self.backend == "llama-swap" else systemd_environment())
                 if sd is not None:
@@ -665,12 +748,16 @@ class Collector(threading.Thread):
         status = "not found"
         cpu_limit: float | None = None
         is_swap = self.backend == "llama-swap"
-        if IS_LINUX:
+        if self.backend == "comfyui":
+            pid = find_comfyui_pid(self.api_port)
+            if pid is not None:
+                status = "running"
+        elif IS_LINUX:
             sd = systemd_llama_swap() if is_swap else systemd_ollama()
             if sd is not None:
                 status, pid, cpu_limit = sd
                 pid = pid or None
-        if pid is None:
+        if pid is None and self.backend != "comfyui":
             pid = (find_llama_swap_pid(self.api_port) if is_swap
                   else find_ollama_pid(self.api_port))
             if pid is not None:

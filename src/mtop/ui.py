@@ -238,7 +238,7 @@ def render_header(win, y: int, snap: dict, stale: bool) -> int:
     pid = snap.get("pid")
 
     # Top border: ╔═══ mtop v0.2.0 — Ollama Model Monitor ═══╗
-    server = "llama-swap" if snap.get("backend") == "llama-swap" else "Ollama"
+    server = SERVER_NAMES.get(snap.get("backend") or "ollama", "Ollama")
     title = f" mtop v{__version__} — {server} Model Monitor "
     pad_total = max(0, fill - len(title))
     pad_left = pad_total // 2
@@ -290,7 +290,8 @@ def render_header(win, y: int, snap: dict, stale: bool) -> int:
         else:
             nrun = (stats.get("procs") or 1) - 1
         runners = f" +{nrun}r" if nrun > 0 else ""
-        label, verb = (("llama-swap: ", "") if backend == "llama-swap" else ("ollama: ", "serve"))
+        label, verb = {"llama-swap": ("llama-swap: ", ""),
+                       "comfyui": ("comfyui: ", "")}.get(backend, ("ollama: ", "serve"))
         field(label, status_icon + (f"{verb} · pid {pid}{runners}".strip(" ·")
                                     if pid else (verb or "running")),
               status_attr)
@@ -302,7 +303,7 @@ def render_header(win, y: int, snap: dict, stale: bool) -> int:
         field("up: ", uptime, curses.color_pair(C_DIM))
     version = (snap.get("server") or {}).get("version")
     if version:
-        vlabel = "llama-swap " if snap.get("backend") == "llama-swap" else "ollama "
+        vlabel = (snap.get("backend") or "ollama") + " "
         field(vlabel, version, curses.color_pair(C_DIM))
     extra = len(snap.get("endpoints") or []) - 1
     if extra > 0:
@@ -475,6 +476,9 @@ def acpi_color(acpi: dict) -> int:
     return C_DIM
 
 
+SERVER_NAMES = {"ollama": "Ollama", "llama-swap": "llama-swap", "comfyui": "ComfyUI"}
+
+
 def render_models(win, y: int, snap: dict,
                   selected: tuple[int, str] | None = None) -> int:
     """Models from /api/ps (Ollama) or /v1/models+/running (llama-swap) —
@@ -489,9 +493,11 @@ def render_models(win, y: int, snap: dict,
         name = selected[1] if selected and selected[0] == i else None
         if backend == "llama-swap":
             return render_llama_swap_models_table(win, y, ep, title, name)
+        if backend == "comfyui":
+            return render_comfyui_models_table(win, y, ep, title)
         return render_models_table(win, y, ep, title, name)
 
-    title = " MODELS " if backend == "llama-swap" else " LOADED MODELS "
+    title = " LOADED MODELS " if backend == "ollama" else " MODELS "
     if len(endpoints) == 1:
         return table(y, 0, endpoints[0], title)
     for i, ep in enumerate(endpoints):
@@ -550,6 +556,57 @@ def render_llama_swap_models_table(win, y: int, ep: dict, title: str,
                    selected=names.index(selected_name) if selected_name in names else None)
     y += 1
     return y
+
+
+def comfyui_status_lines(ep: dict) -> list[str]:
+    """`queue: 1 running · 2 pending   GPU memory held: 29.5 GiB`, then the
+    catalog on a line of its own — it is long enough to run off the screen."""
+    q = ep.get("queue") or {}
+    first = f"queue: {q.get('running', 0)} running · {q.get('pending', 0)} pending"
+    if ep.get("gpu_mem_mib") is not None:
+        first += f"   GPU memory held: {ep['gpu_mem_mib'] / 1024:.1f} GiB"
+    lines = [first]
+    cat = ep.get("catalog")
+    if cat:
+        items = [f"{n} {folder}" for folder, n in sorted(cat.get("folders", {}).items())]
+        if cat.get("hf_cache"):
+            items.append(f"{cat['hf_cache']} in HF cache dirs")
+        lines.append("catalog: " + (" · ".join(items) or "empty"))
+    return lines
+
+
+def render_comfyui_models_table(win, y: int, ep: dict, title: str) -> int:
+    """ComfyUI: the models of the running job and of the recent ones.
+
+    ComfyUI's API cannot say what is in memory. A model of the running job
+    is (`in use`); one a recent job loaded probably still is — ComfyUI keeps
+    it until memory runs short or /free — so it shows as `recent`, with when
+    it was last used.
+    """
+    y = section_header(win, y, title)
+
+    if not ep.get("models_ok", False):
+        y = safe_addstr(win, y, 3, f"API error: {ep.get('models_err', '?')}",
+                        curses.color_pair(C_ERR))
+        return y + 1
+
+    for line in comfyui_status_lines(ep):
+        y = safe_addstr(win, y, 3, line, curses.color_pair(C_DIM))
+    models = ep.get("models", [])
+    if not models:
+        y = safe_addstr(win, y, 3, "No jobs in the history yet",
+                        curses.color_pair(C_WARN) | curses.A_DIM)
+        return y + 1
+
+    headers = ["MODEL", "KIND", "STATE", "LAST USED", "JOBS"]
+    col_widths = [44, 11, 8, 12, 5]
+    rows = [[m.get("name", "?"), m.get("kind", ""), m.get("state", ""),
+             "now" if m.get("running") else relative_time(m.get("last_used") or ""),
+             str(m.get("jobs") or "—")] for m in models]
+    y = draw_table(win, y, 3, headers, rows, col_widths,
+                   hdr_attr=curses.color_pair(C_TABLE_HDR) | curses.A_BOLD,
+                   row_attr=curses.color_pair(C_OK))
+    return y + 1
 
 
 def render_models_table(win, y: int, ep: dict, title: str,

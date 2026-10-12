@@ -44,6 +44,13 @@ _SWAP_RE = re.compile(
     r"\[[A-Z]+\]\s+Request\s+(?P<client>\S+)\s+\"(?P<method>[A-Z]+)\s+(?P<path>\S+)"
     r"\s+HTTP/[\d.]+\"\s+(?P<status>\d{3})\s+\d+\s+\"[^\"]*\"\s+(?P<latency>\S+)")
 _DUR_RE = re.compile(r"(\d+(?:\.\d+)?)(µs|us|ns|ms|s|m|h)")
+# SGR/CSI escape sequences: ComfyUI colors its log ("\x1b[32m[INFO]\x1b[0m"),
+# and so does Ollama's GIN logger on a terminal.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+
+def strip_ansi(text: str) -> str:
+    return _ANSI_RE.sub("", text) if "\x1b" in text else text
 _DUR_UNITS = {"ns": 1e-9, "us": 1e-6, "µs": 1e-6, "ms": 1e-3, "s": 1.0, "m": 60.0, "h": 3600.0}
 _TS_RE = re.compile(
     r"^(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:Z|[+-]\d{2}:?\d{2})?)\s+")
