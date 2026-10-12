@@ -2,7 +2,24 @@
 
 ## Unreleased
 
+### Added
+- **`--backend comfyui`.** Monitors ComfyUI. Its API cannot say which models
+  are in memory, so mtop reads the loader nodes of the running job (`/queue`,
+  state `in use`) and of the last 20 finished jobs (`/history`, state
+  `recent`, with when each model was last used). Above the table: the queue,
+  the GPU memory NVML charges the ComfyUI process tree (it drops when ComfyUI
+  frees the models) and the `/models` catalog per folder, with files under a
+  Hugging Face hub cache counted once, apart. Defaults: `http://localhost:8188`,
+  container `comfyui`; `--mode local` finds a `python main.py` from a ComfyUI
+  checkout. Version from `/system_stats`. Prometheus: `mtop_comfyui_info`,
+  `mtop_comfyui_queue_jobs`, `mtop_comfyui_gpu_memory_bytes`,
+  `mtop_comfyui_model_last_used_seconds`. No `--control` yet. Checked live
+  against ComfyUI 0.37.0 in Docker on a GB10.
+
 ### Fixed
+- **ANSI color codes no longer show up in LOGS.** ComfyUI colors its log
+  (`^[[32m[INFO]^[[0m`); escape sequences are now stripped before display and
+  before the request stats.
 - **Live TTL under llama-swap v259+.** v259 moved the access log off
   `/api/events` to `/api/events/logs` (`source: http`), so `/upstream/<model>/...`
   calls stopped counting as activity and the TTL countdown overstated the time

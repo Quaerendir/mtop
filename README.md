@@ -14,7 +14,7 @@ There are web dashboards, Prometheus exporters, and chat TUIs for Ollama. But th
 
 `mtop` fills that gap. One file, one command, pure stdlib Python. It auto-detects whether Ollama runs in a Docker/Podman container or as a bare-metal process (systemd or a manual `ollama serve`) and monitors it either way.
 
-It also watches [llama-swap](https://github.com/mostlygeek/llama-swap) fronting vLLM (`--backend llama-swap`), with the same host, GPU and runner views. See [llama-swap + vLLM](#llama-swap--vllm).
+It also watches [llama-swap](https://github.com/mostlygeek/llama-swap) fronting vLLM (`--backend llama-swap`), with the same host, GPU and runner views. See [llama-swap + vLLM](#llama-swap--vllm). And [ComfyUI](https://github.com/comfyanonymous/ComfyUI) (`--backend comfyui`): the models its jobs load, the queue and the model catalog. See [ComfyUI](#comfyui).
 
 ## Features
 
@@ -43,6 +43,7 @@ It also watches [llama-swap](https://github.com/mostlygeek/llama-swap) fronting 
 - **Several instances at once** — repeat `-u`; each remote gets its own LOADED MODELS table. Two Ollama instances on a mixed CUDA + ROCm host, or a fleet of remote boxes, on one screen
 - **Behind a reverse proxy** — `-H 'Authorization: Bearer …'`, `$OLLAMA_API_KEY`, basic auth in the URL, `--insecure` / `--cacert` for private certificates
 - **llama-swap + vLLM** — `--backend llama-swap`: the whole model catalog with state, port and TTL, the `vllm serve` flags of each running model, the user-level systemd unit and its journal
+- **ComfyUI** — `--backend comfyui`: the models of the running and recent jobs, the queue, the GPU memory ComfyUI holds, the `/models` catalog
 - **Zero external dependencies** — only Python stdlib (`curses`, `urllib`, `json`, `subprocess`)
 
 ## Quick Start
@@ -90,7 +91,7 @@ mtop [-c CONTAINER] [-i INTERVAL] [-u URL ...] [--backend B] [-H HEADER] [--inse
 
 Options:
   -c, --container NAME   Docker container name (default: ollama, or llama-swap for
-                         --backend llama-swap)
+                         --backend llama-swap, comfyui for --backend comfyui)
   -m, --mode MODE        Data source: auto|docker|local|api (default: auto)
                          local = bare-metal `ollama serve` (systemd/proc/ps)
                          api   = models only, no host resource stats
@@ -100,9 +101,10 @@ Options:
                          Repeatable: the first is the primary (host stats, runners), the
                          rest are API-only. Optional label: -u rig=http://gpu-rig:11434.
                          Credentials in the URL (https://user:pw@host) become basic auth.
-                         With --backend llama-swap the default is http://localhost:8001
-                         and $OLLAMA_HOST is ignored.
-      --backend B        Server to monitor: ollama|llama-swap (default: ollama)
+                         With --backend llama-swap the default is http://localhost:8001,
+                         with --backend comfyui http://localhost:8188; $OLLAMA_HOST is
+                         ignored for both.
+      --backend B        Server to monitor: ollama|llama-swap|comfyui (default: ollama)
   -H, --header 'N: v'    Extra HTTP header for every API request (repeatable);
                          $OLLAMA_API_KEY is sent as 'Authorization: Bearer …' automatically
       --insecure         Skip TLS certificate verification for https:// endpoints
@@ -179,6 +181,9 @@ mtop --backend llama-swap
 # llama-swap on another port or host
 mtop --backend llama-swap -u http://gpu-box:9292
 
+# ComfyUI (container `comfyui` or a `python main.py` from a ComfyUI checkout, API on :8188)
+mtop --backend comfyui
+
 # Using OLLAMA_HOST environment variable
 export OLLAMA_HOST=http://gpu-rig:11434
 mtop
@@ -244,6 +249,21 @@ TTL counts down from the model's last request. llama-swap reports only the confi
 
 Not available with this backend: the raw `ollama ps` table (`o`) and keep-loaded (`t`). Verified against llama-swap + vLLM and llama-server on an NVIDIA GB10.
 
+## ComfyUI
+
+`mtop --backend comfyui` monitors [ComfyUI](https://github.com/comfyanonymous/ComfyUI). ComfyUI's API has no equivalent of `/api/ps`: nothing in it says which models are in memory. What it does expose is the workflow of the running job (`/queue`) and of the finished ones (`/history`), so mtop reads the loader nodes in them (`CheckpointLoaderSimple`, `UNETLoader`, `CLIPLoader`, `VAELoader`, `LoraLoader`, … and custom loaders named the same way, e.g. `UnetLoaderGGUF`):
+
+| STATE | Meaning |
+|---|---|
+| `in use` | loaded by the job running now: certainly in memory |
+| `recent` | loaded by one of the last 20 jobs. ComfyUI keeps a model cached after the job until memory runs short, `/free` is called or the server restarts (a restart also clears the history), so it is *probably* still in memory |
+
+`LAST USED` is when the newest of those jobs finished, `JOBS` how many of them loaded the model. Only `in use` models count as loaded for `mtop_models_loaded`.
+
+The line above the table shows the queue (running / pending jobs), the GPU memory NVML charges the ComfyUI process tree (the direct sign of whether the `recent` models are still resident: it drops when ComfyUI frees them), and the `/models` catalog per folder. Files under a Hugging Face hub cache (`models--org--name/…`), which ComfyUI lists in every folder an `extra_model_paths` entry points at, are counted once, apart. The catalog is re-read once a minute.
+
+Defaults follow the backend: the API is `http://localhost:8188` and the container name `comfyui`. Without a container, `--mode local` finds a `python main.py` whose script path or working directory names ComfyUI. There is no systemd unit to read, so LOGS comes from the container only. The version comes from `/system_stats`. ComfyUI runs its models in its own process, so there is no RUNNERS section. Not available: `--control`, the raw `ollama ps` table (`o`). Prometheus adds `mtop_comfyui_info`, `mtop_comfyui_queue_jobs{state}`, `mtop_comfyui_gpu_memory_bytes` and `mtop_comfyui_model_last_used_seconds{model,kind}`. Verified against ComfyUI 0.37.0 in Docker on an NVIDIA GB10.
+
 ## Supported Platforms
 
 | Platform | GPU Monitoring | Notes |
@@ -265,7 +285,7 @@ Not available with this backend: the raw `ollama ps` table (`o`) and keep-loaded
 
 - **Python 3.10+** (uses `match`-era type hints like `list[str]`, `X | Y`)
 - **Docker or Podman** for container monitoring — access to the socket is enough, the CLI is optional
-- **Ollama** in a container, as a bare-metal process, or reachable via API — or **llama-swap** (`--backend llama-swap`)
+- **Ollama** in a container, as a bare-metal process, or reachable via API — or **llama-swap** (`--backend llama-swap`), or **ComfyUI** (`--backend comfyui`)
 - **NVIDIA driver** (optional, for GPU stats — `libnvidia-ml.so.1`, or `nvidia-smi` as fallback)
 
 ## Roadmap
@@ -296,7 +316,7 @@ PRs welcome. Keep it stdlib-only — the zero-dependency constraint is a feature
 git clone https://github.com/Quaerendir/mtop.git
 cd mtop
 pip install -e ".[dev]"      # + pytest, ruff
-# hack on src/mtop/*.py — util, procfs, runner, collector, ui, cli, container, gpu, logs, export
+# hack on src/mtop/*.py — util, procfs, runner, collector, ui, cli, container, gpu, logs, export, comfyui
 mtop
 
 ruff check src tools tests

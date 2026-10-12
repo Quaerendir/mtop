@@ -141,7 +141,16 @@ def prometheus_text(snap: dict, version: str, now: float | None = None) -> str:
     w.metric("mtop_api_up", "1 when /api/ps answered on this endpoint")
     w.metric("mtop_ollama_info", "Ollama server version per endpoint")
     w.metric("mtop_llama_swap_info", "llama-swap version per endpoint")
-    info = "mtop_llama_swap_info" if snap.get("backend") == "llama-swap" else "mtop_ollama_info"
+    w.metric("mtop_comfyui_info", "ComfyUI version per endpoint")
+    info = {"llama-swap": "mtop_llama_swap_info",
+            "comfyui": "mtop_comfyui_info"}.get(snap.get("backend"), "mtop_ollama_info")
+    if snap.get("backend") == "comfyui":
+        w.metric("mtop_comfyui_queue_jobs",
+                 "ComfyUI jobs in the queue (state: running, pending)")
+        w.metric("mtop_comfyui_model_last_used_seconds",
+                 "Seconds since a recent ComfyUI job that loaded this model finished")
+        w.metric("mtop_comfyui_gpu_memory_bytes",
+                 "Device memory the ComfyUI process tree holds (NVML per-process)")
     w.metric("mtop_models_loaded", "Models currently loaded on the endpoint")
     w.metric("mtop_model_size_bytes", "Total size of a loaded model")
     w.metric("mtop_model_vram_bytes", "Portion of a loaded model in accelerator memory")
@@ -153,8 +162,21 @@ def prometheus_text(snap: dict, version: str, now: float | None = None) -> str:
         w.sample("mtop_api_up", e, 1 if ep.get("models_ok") else 0)
         if ep.get("version"):
             w.sample(info, {**e, "version": ep["version"]}, 1)
-        # llama-swap lists its whole catalog; only what runs is "loaded".
-        # Ollama's /api/ps entries carry no flag and are all loaded.
+        q = ep.get("queue")
+        if q:
+            w.sample("mtop_comfyui_queue_jobs", {**e, "state": "running"}, num(q.get("running")))
+            w.sample("mtop_comfyui_queue_jobs", {**e, "state": "pending"}, num(q.get("pending")))
+        if ep.get("gpu_mem_mib") is not None:
+            w.sample("mtop_comfyui_gpu_memory_bytes", e, num(ep["gpu_mem_mib"]) * 1024**2)
+        for m in ep.get("models") or []:
+            t = parse_iso(m.get("last_used") or "")
+            if t is not None:
+                w.sample("mtop_comfyui_model_last_used_seconds",
+                         {**e, "model": m.get("name"), "kind": m.get("kind")},
+                         round((datetime.now(timezone.utc) - t).total_seconds(), 3))
+        # llama-swap lists its whole catalog and ComfyUI the models of recent
+        # jobs; only what runs is "loaded". Ollama's /api/ps entries carry no
+        # flag and are all loaded.
         models = [m for m in ep.get("models") or [] if m.get("running", True)]
         if ep.get("models_ok"):
             w.sample("mtop_models_loaded", e, len(models))

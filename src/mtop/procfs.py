@@ -277,6 +277,56 @@ def find_llama_swap_pid(port: int | None = None) -> int | None:
     return min(pids, key=proc_starttime_ticks)
 
 
+def find_comfyui_pids() -> list[int]:
+    """Every ComfyUI server PID visible in /proc (Linux only), unordered.
+
+    ComfyUI is `python main.py` started from its checkout, so the script name
+    alone matches any project's main.py: the script's path or the process's
+    working directory must also name ComfyUI.
+    """
+    pids: list[int] = []
+    if not os.path.isdir("/proc"):
+        return pids
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        args = read_proc_cmdline(int(entry))
+        if not args or not os.path.basename(args[0]).startswith("python"):
+            continue
+        script = next((a for a in args[1:3] if a.endswith("main.py")), None)
+        if script is None:
+            continue
+        where = script
+        if not os.path.isabs(script):
+            try:
+                where = os.readlink(f"/proc/{entry}/cwd")
+            except OSError:
+                continue
+        if "comfy" in where.lower():
+            pids.append(int(entry))
+    return pids
+
+
+def find_comfyui_pid(port: int | None = None) -> int | None:
+    """Find the ComfyUI server PID. See `find_ollama_pid` for the tie-break
+    rule when several are running (socket ownership, else oldest)."""
+    if IS_DARWIN:
+        ok, out = run_cmd(["pgrep", "-f", "[Cc]omfy[^ ]*/main\\.py"], timeout=2)
+        first = out.split()[0] if ok and out.strip() else ""
+        return int(first) if first.isdigit() else None
+    pids = find_comfyui_pids()
+    if not pids:
+        return None
+    if len(pids) == 1:
+        return pids[0]
+    if port:
+        inodes = listening_inodes(port)
+        for pid in sorted(pids):
+            if pid_owns_socket(pid, inodes):
+                return pid
+    return min(pids, key=proc_starttime_ticks)
+
+
 def parse_systemd_show(out: str) -> tuple[str, int, float | None] | None:
     """Normalize `systemctl show` output to (status, main_pid, cpu_limit).
 

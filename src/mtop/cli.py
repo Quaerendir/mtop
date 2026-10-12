@@ -21,9 +21,11 @@ JSON_SCHEMA_VERSION = 1   # bump when a --json field changes meaning or is remov
 
 DEFAULT_CONTAINER = "ollama"
 DEFAULT_CONTAINER_LLAMA_SWAP = "llama-swap"
+DEFAULT_CONTAINER_COMFYUI = "comfyui"
 DEFAULT_INTERVAL = 1.0
 DEFAULT_API_BASE = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 DEFAULT_API_BASE_LLAMA_SWAP = "http://localhost:8001"
+DEFAULT_API_BASE_COMFYUI = "http://localhost:8188"
 API_KEY_ENV = "OLLAMA_API_KEY"    # same variable the ollama CLI uses for Bearer auth
 
 
@@ -148,22 +150,28 @@ def main():
     )
     parser.add_argument("-c", "--container", default=DEFAULT_CONTAINER,
                         help=f"Docker container name (default: {DEFAULT_CONTAINER}, or "
-                             f"{DEFAULT_CONTAINER_LLAMA_SWAP} for --backend llama-swap)")
+                             f"{DEFAULT_CONTAINER_LLAMA_SWAP} for --backend llama-swap, "
+                             f"{DEFAULT_CONTAINER_COMFYUI} for --backend comfyui)")
     parser.add_argument("-i", "--interval", type=float, default=DEFAULT_INTERVAL,
                         help=f"Refresh interval in seconds (default: {DEFAULT_INTERVAL})")
     parser.add_argument("-u", "--api-url", action="append", dest="api_urls", metavar="URL",
                         help="API base URL (default: $OLLAMA_HOST or "
                              f"{DEFAULT_API_BASE} for --backend ollama, "
-                             f"{DEFAULT_API_BASE_LLAMA_SWAP} for --backend llama-swap). "
+                             f"{DEFAULT_API_BASE_LLAMA_SWAP} for --backend llama-swap, "
+                             f"{DEFAULT_API_BASE_COMFYUI} for --backend comfyui). "
                              "Repeat for several instances; the "
                              "first is the primary (host stats, runners), the rest are "
                              "API-only. Optional label: -u rig=http://gpu-rig:11434. "
                              "Credentials in the URL become basic auth.")
-    parser.add_argument("--backend", choices=["ollama", "llama-swap"], default="ollama",
+    parser.add_argument("--backend", choices=["ollama", "llama-swap", "comfyui"],
+                        default="ollama",
                         help="Which server this is (default: ollama). ollama: "
                              "/api/ps + /api/version, `ollama.service`, llama.cpp runner "
                              "flags. llama-swap: /v1/models + /running, the user-level "
-                             "`llama-swap.service`, `vllm serve` runner flags.")
+                             "`llama-swap.service`, `vllm serve` runner flags. comfyui: "
+                             "/queue + /history (models of the running and recent jobs) "
+                             "and the /models catalog, a `python main.py` from a ComfyUI "
+                             "checkout.")
     parser.add_argument("-H", "--header", action="append", default=[], metavar="'Name: value'",
                         help="Extra HTTP header for every API request (repeatable), e.g. "
                              "'Authorization: Bearer ...' for an instance behind a proxy")
@@ -236,16 +244,23 @@ def main():
         headers[name] = val
     if args.cacert and not os.path.exists(args.cacert):
         parser.error(f"--cacert: no such file: {args.cacert}")
-    if not args.api_urls and args.backend == "llama-swap":
-        # $OLLAMA_HOST is meaningless for this backend — don't let a leftover
-        # export from a mixed Ollama/llama-swap setup silently redirect it.
-        args.api_urls = [DEFAULT_API_BASE_LLAMA_SWAP]
-    if args.container == DEFAULT_CONTAINER and args.backend == "llama-swap":
-        # Otherwise --mode auto's docker probe checks for a container literally
-        # named "ollama" and, on a box that also runs Ollama in Docker, locks
-        # onto *that* unrelated container instead of ever reaching the local
-        # llama-swap process.
-        args.container = DEFAULT_CONTAINER_LLAMA_SWAP
+    if args.backend != "ollama":
+        api_base, container = {
+            "llama-swap": (DEFAULT_API_BASE_LLAMA_SWAP, DEFAULT_CONTAINER_LLAMA_SWAP),
+            "comfyui": (DEFAULT_API_BASE_COMFYUI, DEFAULT_CONTAINER_COMFYUI),
+        }[args.backend]
+        if not args.api_urls:
+            # $OLLAMA_HOST is meaningless for this backend — don't let a leftover
+            # export from a mixed setup silently redirect it.
+            args.api_urls = [api_base]
+        if args.container == DEFAULT_CONTAINER:
+            # Otherwise --mode auto's docker probe checks for a container
+            # literally named "ollama" and, on a box that also runs Ollama in
+            # Docker, locks onto *that* unrelated container instead of ever
+            # reaching this backend's own process.
+            args.container = container
+    if args.control and args.backend == "comfyui":
+        parser.error("--control is not available with --backend comfyui")
     try:
         args.endpoints = [Endpoint(u, headers, args.insecure, args.cacert)
                           for u in (args.api_urls or [DEFAULT_API_BASE])]

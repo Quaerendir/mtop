@@ -20,15 +20,17 @@ Usage:
          [--json | --prometheus] [--watch] [-o FILE] [-h]
 """
 
-from . import cli, collector, container, export, gpu, logs, procfs, runner, swapwatch, util
+from . import (cli, collector, comfyui, container, export, gpu, logs, procfs, runner, swapwatch,
+               util)
 from ._version import __version__
 from .cli import (API_KEY_ENV, DEFAULT_API_BASE, DEFAULT_CONTAINER, DEFAULT_INTERVAL,
                   JSON_SCHEMA_VERSION, headless_main, json_main, main, snapshot_healthy,
                   write_output)
 from .collector import (DEFAULT_LOG_LINES, HISTORY_LEN, JSON_CPU_WINDOW, LOG_FETCH, SLOW_FLOOR,
                         STALE_FACTOR, Collector)
-from .procfs import (find_llama_swap_pid, find_llama_swap_pids, find_ollama_pid,
-                     find_ollama_pids, host_cpu_count, listening_inodes,
+from .procfs import (find_comfyui_pid, find_comfyui_pids, find_llama_swap_pid,
+                     find_llama_swap_pids, find_ollama_pid, find_ollama_pids,
+                     host_cpu_count, listening_inodes,
                      parse_systemd_cpu_quota, parse_systemd_environment, parse_systemd_show,
                      pid_owns_socket, proc_children_map, proc_starttime_ticks, proc_uptime_sec,
                      process_tree, read_acpi_thermal, read_proc_cmdline, read_proc_cpu_ticks,
@@ -46,12 +48,13 @@ from .util import (CLK_TCK, FOREVER_AFTER_SEC, IS_DARWIN, IS_LINUX, Endpoint, ap
 
 __all__ = [
     "__version__", "main", "Collector", "Endpoint",
-    "cli", "collector", "container", "export", "gpu", "logs", "procfs", "runner", "swapwatch",
-    "util",
+    "cli", "collector", "comfyui", "container", "export", "gpu", "logs", "procfs", "runner",
+    "swapwatch", "util",
     "API_KEY_ENV", "DEFAULT_API_BASE", "DEFAULT_CONTAINER", "DEFAULT_INTERVAL",
     "JSON_SCHEMA_VERSION", "headless_main", "json_main", "snapshot_healthy", "write_output",
     "DEFAULT_LOG_LINES", "HISTORY_LEN", "JSON_CPU_WINDOW", "LOG_FETCH", "SLOW_FLOOR",
     "STALE_FACTOR",
+    "find_comfyui_pid", "find_comfyui_pids",
     "find_llama_swap_pid", "find_llama_swap_pids", "find_ollama_pid", "find_ollama_pids",
     "host_cpu_count", "listening_inodes",
     "parse_systemd_cpu_quota", "parse_systemd_environment", "parse_systemd_show",
