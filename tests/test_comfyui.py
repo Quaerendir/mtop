@@ -214,11 +214,6 @@ def test_cli_defaults_follow_the_backend(monkeypatch):
     assert args.api_url == "http://gpu:8189" and args.container == "comfy"
 
 
-def test_cli_rejects_control_with_comfyui(monkeypatch, capsys):
-    assert _parse(monkeypatch, "--backend", "comfyui", "--control") is None
-    assert "--control is not available" in capsys.readouterr().err
-
-
 # ── screen ──────────────────────────────────────────────────────────────────
 
 def _snap(**ep):

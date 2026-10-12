@@ -3,6 +3,18 @@
 ## Unreleased
 
 ### Added
+- **ComfyUI job progress.** A line under the catalog shows the running job's
+  node, step x/y with a bar, elapsed time and ETA, read from ComfyUI's
+  websocket (`/ws`) by a small stdlib WebSocket client (`mtop.wsclient`).
+  ComfyUI sends progress only to the client that queued a job (to everyone
+  when it was queued without a `client_id`, as scripts do). For a job from a
+  browser tab, the line says so and shows only the elapsed time. When idle, it
+  shows the last job's outcome and duration from `/history`. Prometheus:
+  `mtop_comfyui_job_elapsed_seconds`, `mtop_comfyui_job_progress_ratio`,
+  `mtop_comfyui_websocket_up`.
+- **`--control` with ComfyUI**: `s` cancels the running job
+  (`/api/jobs/<id>/cancel`, falling back to `/interrupt`), `C` clears the
+  pending queue, `F` unloads all models (`/free`); each asks y/N first.
 - **`--backend comfyui`.** Monitors ComfyUI. Its API cannot say which models
   are in memory, so mtop reads the loader nodes of the running job (`/queue`,
   state `in use`) and of the last 20 finished jobs (`/history`, state
@@ -14,7 +26,7 @@
   checkout. Version from `/system_stats`. Prometheus: `mtop_comfyui_info`,
   `mtop_comfyui_queue_jobs`, `mtop_comfyui_gpu_memory_bytes`,
   `mtop_comfyui_model_last_used_seconds`. LOGS shows the container log
-  without request stats (ComfyUI logs no access lines). No `--control` yet. Checked live
+  without request stats (ComfyUI logs no access lines). Checked live
   against ComfyUI 0.37.0 in Docker on a GB10.
 
 ### Fixed

@@ -103,12 +103,14 @@ def http_get_json(url: str, timeout: int = 5, headers: dict[str, str] | None = N
 
 def http_post_json(url: str, body: Any, timeout: int = 5,
                    headers: dict[str, str] | None = None,
-                   context: ssl.SSLContext | None = None) -> tuple[bool, Any]:
-    """POST `body` as JSON, same contract as http_get_json.
+                   context: ssl.SSLContext | None = None,
+                   parse: bool = True) -> tuple[bool, Any]:
+    """POST `body` as JSON, same contract as http_get_json; parse=False keeps
+    the reply as text (ComfyUI's /queue and /free answer with an empty body).
 
     Only the model actions (--control) write; everything else is GET.
     """
-    return _http_json(url, json.dumps(body).encode(), timeout, headers, context)
+    return _http_json(url, json.dumps(body).encode(), timeout, headers, context, parse=parse)
 
 
 def http_request(url: str, method: str = "GET", timeout: int = 5,
@@ -258,9 +260,10 @@ class Endpoint:
     def get_json(self, path: str, timeout: int = 5) -> tuple[bool, Any]:
         return http_get_json(self.url + path, timeout, self.headers or None, self.context)
 
-    def post_json(self, path: str, body: Any, timeout: int = 5) -> tuple[bool, Any]:
+    def post_json(self, path: str, body: Any, timeout: int = 5,
+                  parse: bool = True) -> tuple[bool, Any]:
         return http_post_json(self.url + path, body, timeout, self.headers or None,
-                              self.context)
+                              self.context, parse)
 
     def request(self, method: str, path: str, timeout: int = 5) -> tuple[bool, Any]:
         return http_request(self.url + path, method, timeout, self.headers or None,

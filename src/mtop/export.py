@@ -151,6 +151,11 @@ def prometheus_text(snap: dict, version: str, now: float | None = None) -> str:
                  "Seconds since a recent ComfyUI job that loaded this model finished")
         w.metric("mtop_comfyui_gpu_memory_bytes",
                  "Device memory the ComfyUI process tree holds (NVML per-process)")
+        w.metric("mtop_comfyui_job_elapsed_seconds",
+                 "Seconds the running job has run (a lower bound unless its start was seen)")
+        w.metric("mtop_comfyui_job_progress_ratio",
+                 "Steps done / steps of the running job's current node (from /ws)")
+        w.metric("mtop_comfyui_websocket_up", "1 while mtop follows the endpoint's /ws")
     w.metric("mtop_models_loaded", "Models currently loaded on the endpoint")
     w.metric("mtop_model_size_bytes", "Total size of a loaded model")
     w.metric("mtop_model_vram_bytes", "Portion of a loaded model in accelerator memory")
@@ -168,6 +173,15 @@ def prometheus_text(snap: dict, version: str, now: float | None = None) -> str:
             w.sample("mtop_comfyui_queue_jobs", {**e, "state": "pending"}, num(q.get("pending")))
         if ep.get("gpu_mem_mib") is not None:
             w.sample("mtop_comfyui_gpu_memory_bytes", e, num(ep["gpu_mem_mib"]) * 1024**2)
+        job = ep.get("job")
+        if job:
+            jl = {**e, "prompt_id": job.get("prompt_id")}
+            w.sample("mtop_comfyui_job_elapsed_seconds", jl, num(job.get("elapsed")))
+            if job.get("value") is not None and job.get("max"):
+                w.sample("mtop_comfyui_job_progress_ratio", {**jl, "node": job.get("node")},
+                         round(job["value"] / job["max"], 4))
+        if ep.get("websocket") is not None:
+            w.sample("mtop_comfyui_websocket_up", e, 1 if ep["websocket"] == "connected" else 0)
         for m in ep.get("models") or []:
             t = parse_iso(m.get("last_used") or "")
             if t is not None:
