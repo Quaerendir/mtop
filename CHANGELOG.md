@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.16.1 — 2026-10-12
+
+### Changed
+- **README:** new screenshots (v0.16.0 on Ollama, and ComfyUI during a
+  render), and the ComfyUI section rewritten with a per-section
+  Ollama/ComfyUI table.
+
+### Fixed
+- **Images on the PyPI page.** The README referred to its screenshots by
+  relative paths (`docs/screenshot.png`), which PyPI does not resolve, so
+  the project page showed broken images. They are now absolute GitHub URLs.
+
 ## 0.16.0 — 2026-10-12
 
 ### Added

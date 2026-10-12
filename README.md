@@ -6,7 +6,7 @@
 ![License: MIT](https://img.shields.io/badge/license-MIT-green)
 ![Platform: Linux](https://img.shields.io/badge/platform-Linux-lightgrey)
 
-![mtop on a DGX Spark: Ollama in Docker, two models loaded, NVML per-process memory, ACPI temperature, runner config, server environment and the access log](docs/screenshot.png)
+![mtop on a DGX Spark: Ollama in Docker, two models loaded, NVML per-process memory, ACPI temperature, runner config, server environment and the access log](https://raw.githubusercontent.com/Quaerendir/mtop/master/docs/screenshot.png)
 
 ## Why?
 
@@ -207,9 +207,9 @@ mtop
 | `L` | Ollama: pick a model from `/api/tags` and load it; `Tab` switches endpoint; asks first when the server is at `OLLAMA_MAX_LOADED_MODELS`. llama-swap: load the selected catalog entry; asks first when another model runs (`--control` only) |
 | `P` | Pull a model by name (`POST /api/pull`): type it, `Tab` switches endpoint, `Enter` starts. A progress row above the footer shows bytes, speed, ETA and the current layer; stop/load keep working meanwhile. `X` cancels — Ollama keeps the layers it has, so the next pull resumes (`--control`, Ollama only) |
 
-![mtop --control on a DGX Spark: two models loaded from the picker, one kept loaded for 2h, the ? key list, a model pulled with live progress, one stopped](docs/demo-control.gif)
+![mtop --control on a DGX Spark: two models loaded from the picker, one kept loaded for 2h, the ? key list, a model pulled with live progress, one stopped](https://raw.githubusercontent.com/Quaerendir/mtop/master/docs/demo-control.gif)
 
-`--control` on the Spark, in real time (waits over 2 s cut): `L` loads two models from the picker (Ollama itself unloads the first when the second needs the memory), `t` `2` keeps one loaded for 2h, `?` lists the keys, `P` pulls `smollm:135m`, `s` `y` stops a model. The recording is [`docs/demo-control.cast`](docs/demo-control.cast) (`asciinema play docs/demo-control.cast`); `tools/demo-control.sh` records and renders it again.
+`--control` on the Spark, in real time (waits over 2 s cut): `L` loads two models from the picker (Ollama itself unloads the first when the second needs the memory), `t` `2` keeps one loaded for 2h, `?` lists the keys, `P` pulls `smollm:135m`, `s` `y` stops a model. The recording is [`docs/demo-control.cast`](https://github.com/Quaerendir/mtop/blob/master/docs/demo-control.cast) (`asciinema play docs/demo-control.cast`); `tools/demo-control.sh` records and renders it again.
 
 ## What you see
 
@@ -239,7 +239,7 @@ The screenshot above is a real session on a DGX Spark (GB10) with Ollama in Dock
 | LOGS | container log or `journalctl -u ollama` | container log, `journalctl --user -u llama-swap`, or the file the unit writes to (`StandardOutput=append:/path`). llama-swap's `Request …` lines feed the request stats; its lines carry no time, so from a file the rate counts what arrives while mtop runs |
 | Version in header | `/api/version` | `/api/version` (`llama-swap v256`); an older llama-swap without it is asked once and shows none |
 
-![mtop --backend llama-swap on the same Spark: the configured catalog with one model ready, its runner joined to the GPU, the launcher's environment and llama-swap's access log](docs/screenshot-llama-swap.png)
+![mtop --backend llama-swap on the same Spark: the configured catalog with one model ready, its runner joined to the GPU, the launcher's environment and llama-swap's access log](https://raw.githubusercontent.com/Quaerendir/mtop/master/docs/screenshot-llama-swap.png)
 
 Defaults follow the backend: the API is `http://localhost:8001` and the container name `llama-swap`, so on a box that runs both, `--mode auto` does not lock onto the unrelated `ollama` container. Pass `-u` / `-c` for anything else.
 
@@ -253,7 +253,7 @@ Not available with this backend: the raw `ollama ps` table (`o`) and keep-loaded
 
 `mtop --backend comfyui` monitors [ComfyUI](https://github.com/comfyanonymous/ComfyUI), the node-based image and video generation server. Header, resources, GPU, SERVER CONFIG and LOGS work as for Ollama. The MODELS section is built differently, because ComfyUI is not a model server: it loads models as a job's workflow asks for them.
 
-![mtop --backend comfyui on the same Spark during a render: the job at step 24/60 of its KSampler with ETA, one more queued, the three models of the workflow in use, 28 GiB held by ComfyUI on the GPU, and ComfyUI's own log](docs/screenshot-comfyui.png)
+![mtop --backend comfyui on the same Spark during a render: the job at step 24/60 of its KSampler with ETA, one more queued, the three models of the workflow in use, 28 GiB held by ComfyUI on the GPU, and ComfyUI's own log](https://raw.githubusercontent.com/Quaerendir/mtop/master/docs/screenshot-comfyui.png)
 
 The screenshot is a real render of Qwen-Image on the Spark. Top to bottom in MODELS:
 
@@ -359,7 +359,7 @@ A `v*` tag attaches the bundle to the GitHub release and, once the repository va
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](https://github.com/Quaerendir/mtop/blob/master/LICENSE).
 
 ## Acknowledgements
 
