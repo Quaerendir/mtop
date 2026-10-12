@@ -315,3 +315,31 @@ def test_gpu_memory_on_screen_and_in_prometheus():
 def test_strip_ansi():
     assert mtop.logs.strip_ansi("\x1b[32m[INFO]\x1b[0m Prompt executed") == "[INFO] Prompt executed"
     assert mtop.logs.strip_ansi("plain") == "plain"
+
+
+def test_catalog_gets_its_own_line():
+    w = FakeWin(rows=10, cols=200)
+    mtop.render_models(w, 0, _snap(gpu_mem_mib=1024))
+    assert w.line(1).strip() == "queue: 1 running · 2 pending   GPU memory held: 1.0 GiB"
+    assert w.line(2).strip().startswith("catalog: 2 checkpoints")
+
+
+class _FakeLogs:
+    name = "docker-api logs"
+
+    def tail(self, n):
+        return True, [(1.0, "\x1b[32m[INFO]\x1b[0m Prompt executed in 3.1 seconds")]
+
+
+def test_logs_carry_no_request_stats(monkeypatch):
+    c = _collector(monkeypatch, ROUTES)
+    try:
+        c._log_source, c._log_mode = _FakeLogs(), "docker"
+        logs = c._read_logs("docker")
+        assert logs["ok"] and logs["requests"] is None
+        assert logs["lines"][0]["text"] == "[INFO] Prompt executed in 3.1 seconds"
+    finally:
+        c.close()
+    w = FakeWin(rows=4, cols=160)
+    mtop.render_logs(w, 0, {"logs": logs})
+    assert "requests" not in w.line(0) and "docker-api logs" in w.line(0)

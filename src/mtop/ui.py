@@ -558,19 +558,21 @@ def render_llama_swap_models_table(win, y: int, ep: dict, title: str,
     return y
 
 
-def comfyui_status_line(ep: dict) -> str:
-    """`queue: 1 running · 2 pending   GPU memory held: 29.5 GiB   catalog: ...`."""
+def comfyui_status_lines(ep: dict) -> list[str]:
+    """`queue: 1 running · 2 pending   GPU memory held: 29.5 GiB`, then the
+    catalog on a line of its own — it is long enough to run off the screen."""
     q = ep.get("queue") or {}
-    parts = [f"queue: {q.get('running', 0)} running · {q.get('pending', 0)} pending"]
+    first = f"queue: {q.get('running', 0)} running · {q.get('pending', 0)} pending"
     if ep.get("gpu_mem_mib") is not None:
-        parts.append(f"GPU memory held: {ep['gpu_mem_mib'] / 1024:.1f} GiB")
+        first += f"   GPU memory held: {ep['gpu_mem_mib'] / 1024:.1f} GiB"
+    lines = [first]
     cat = ep.get("catalog")
     if cat:
         items = [f"{n} {folder}" for folder, n in sorted(cat.get("folders", {}).items())]
         if cat.get("hf_cache"):
             items.append(f"{cat['hf_cache']} in HF cache dirs")
-        parts.append("catalog: " + (" · ".join(items) or "empty"))
-    return "   ".join(parts)
+        lines.append("catalog: " + (" · ".join(items) or "empty"))
+    return lines
 
 
 def render_comfyui_models_table(win, y: int, ep: dict, title: str) -> int:
@@ -588,7 +590,8 @@ def render_comfyui_models_table(win, y: int, ep: dict, title: str) -> int:
                         curses.color_pair(C_ERR))
         return y + 1
 
-    y = safe_addstr(win, y, 3, comfyui_status_line(ep), curses.color_pair(C_DIM))
+    for line in comfyui_status_lines(ep):
+        y = safe_addstr(win, y, 3, line, curses.color_pair(C_DIM))
     models = ep.get("models", [])
     if not models:
         y = safe_addstr(win, y, 3, "No jobs in the history yet",

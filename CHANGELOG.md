@@ -13,7 +13,8 @@
   container `comfyui`; `--mode local` finds a `python main.py` from a ComfyUI
   checkout. Version from `/system_stats`. Prometheus: `mtop_comfyui_info`,
   `mtop_comfyui_queue_jobs`, `mtop_comfyui_gpu_memory_bytes`,
-  `mtop_comfyui_model_last_used_seconds`. No `--control` yet. Checked live
+  `mtop_comfyui_model_last_used_seconds`. LOGS shows the container log
+  without request stats (ComfyUI logs no access lines). No `--control` yet. Checked live
   against ComfyUI 0.37.0 in Docker on a GB10.
 
 ### Fixed

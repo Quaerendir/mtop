@@ -686,7 +686,8 @@ class Collector(threading.Thread):
             "source": src.name, "ok": True, "error": "",
             "lines": [{"ts": ts, "text": text, "level": line_level(text)}
                       for ts, text in lines[-self.log_lines:]],
-            "requests": request_stats(lines),
+            # ComfyUI logs no access lines: the stats would always read zero.
+            "requests": None if self.backend == "comfyui" else request_stats(lines),
         }
 
     def _server_info(self, mode: str, pid: int | None) -> dict:
