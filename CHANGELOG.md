@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.16.0 — 2026-10-12
 
 ### Added
 - **ComfyUI job progress.** A line under the catalog shows the running job's
