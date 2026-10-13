@@ -139,8 +139,9 @@ def json_main(args) -> int:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="mtop — htop for Ollama: models, runners, GPUs and the server "
-                    "(container, systemd or manual), as a TUI or a JSON/Prometheus exporter",
+        description="mtop — htop for local AI inference (Ollama, llama-swap/vLLM, ComfyUI): "
+                    "models, runners, GPUs and the server (container, systemd or manual), "
+                    "as a TUI or a JSON/Prometheus exporter",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Keys: q=quit, +=faster, -=slower, o=toggle raw ollama ps, "
                "r=toggle runners, e=toggle server config, l=toggle logs; "

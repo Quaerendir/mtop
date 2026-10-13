@@ -1,6 +1,6 @@
 # mtop
 
-**htop for Ollama** — a curses-based TUI that monitors your models, GPU, and the Ollama server (in Docker, Podman *or* bare-metal) in real time. Zero flicker. Zero dependencies beyond Python 3.10+.
+**htop for local AI inference** — a curses-based TUI that monitors your models, GPU, and the inference server — Ollama, llama-swap/vLLM or ComfyUI (in Docker, Podman *or* bare-metal) — in real time. Zero flicker. Zero dependencies beyond Python 3.10+.
 
 ![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)
 ![License: MIT](https://img.shields.io/badge/license-MIT-green)
