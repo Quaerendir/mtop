@@ -1,6 +1,7 @@
 """
-mtop — htop for Ollama: a curses TUI (and a headless JSON / Prometheus
-exporter) for models, runners, GPUs and the server process or container.
+mtop — htop for local AI inference (Ollama, llama-swap/vLLM, ComfyUI): a curses
+TUI (and a headless JSON / Prometheus exporter) for models, runners, GPUs and
+the server process or container.
 
 Architecture: a background collector thread (mtop.collector) gathers all data
 — container runtime (mtop.container), /proc (mtop.procfs), GPU providers
