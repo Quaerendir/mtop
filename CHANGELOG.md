@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.16.2 — 2026-10-13
+
+### Changed
+- **Description.** mtop is now described as "htop for local AI inference"
+  (Ollama, llama-swap/vLLM and ComfyUI) instead of "htop for Ollama" — in the
+  README, the PyPI summary, `--help` and the package docstring.
+
 ## 0.16.1 — 2026-10-12
 
 ### Changed
