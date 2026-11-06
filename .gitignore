@@ -32,3 +32,4 @@ Thumbs.db
 # copied from docs/ at deploy time (see .github/workflows/pages.yml)
 site/screenshot*.png
 site/demo-control.gif
+site/social-preview.png
