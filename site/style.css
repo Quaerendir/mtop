@@ -122,3 +122,6 @@ img.demo { max-width: 900px; margin: 0 auto; }
   .hero .cmd { display: flex; }
 }
 @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+
+.notfound { min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; padding: 2rem; }
+.notfound h1 { margin-bottom: .5rem; }

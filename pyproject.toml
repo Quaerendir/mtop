@@ -41,7 +41,7 @@ classifiers = [
 dev = ["pytest>=8", "ruff>=0.5"]
 
 [project.urls]
-Homepage = "https://github.com/Quaerendir/mtop"
+Homepage = "https://mtop.quaerendir.net"
 Repository = "https://github.com/Quaerendir/mtop"
 Issues = "https://github.com/Quaerendir/mtop/issues"
 
