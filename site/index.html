@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mtop — htop for local AI inference</title>
+<meta name="description" content="A curses TUI that monitors local AI inference: Ollama, llama-swap/vLLM and ComfyUI — models, GPU and the server, in Docker, Podman or bare-metal. Zero flicker, zero dependencies beyond Python 3.10+.">
+<meta name="theme-color" content="#1b1d2b">
+<link rel="canonical" href="https://quaerendir.github.io/mtop/">
+<meta property="og:type" content="website">
+<meta property="og:title" content="mtop — htop for local AI inference">
+<meta property="og:description" content="Terminal monitor for Ollama, llama-swap/vLLM and ComfyUI: loaded models, per-runner inference config, live job progress, GPU (NVIDIA / AMD / Intel / Apple), logs. Pure stdlib Python.">
+<meta property="og:url" content="https://quaerendir.github.io/mtop/">
+<meta property="og:image" content="https://quaerendir.github.io/mtop/screenshot.png">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%231b1d2b'/%3E%3Cpath d='M6 22V10l5 7 5-7v12M20 22h6M20 16h6M20 10h6' fill='none' stroke='%239be8a6' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="top">
+  <a class="brand" href="#top">mtop</a>
+  <nav>
+    <a href="#features">Features</a>
+    <a href="#backends">Backends</a>
+    <a href="#control">Control</a>
+    <a href="#install">Install</a>
+    <a href="#usage">Usage</a>
+    <a href="https://github.com/Quaerendir/mtop">GitHub</a>
+    <a href="https://pypi.org/project/ollama-mtop/">PyPI</a>
+  </nav>
+</header>
+
+<main id="top">
+
+<section class="hero">
+  <p class="eyebrow">terminal monitor · Ollama · llama-swap / vLLM · ComfyUI · MIT</p>
+  <h1><span class="g">htop</span> for local <span class="p">AI inference</span></h1>
+  <p class="lead">See which models are loaded, how much VRAM they eat, what context the runners really negotiated, how far the render has got, and whether the server is healthy — from the SSH session you're already in. Zero flicker, zero dependencies beyond Python&nbsp;3.10.</p>
+
+  <div class="cmd" data-copy="pipx install ollama-mtop && mtop">
+    <code><span class="dim">$</span> pipx install ollama-mtop &amp;&amp; mtop</code>
+    <button type="button" aria-label="Copy command">copy</button>
+  </div>
+  <p class="alt">or <code>pip install ollama-mtop</code> · <code>uv tool install ollama-mtop</code> · <a href="#install">single-file download</a></p>
+</section>
+
+<section class="shot">
+  <img src="screenshot.png" width="2518" height="1478" alt="mtop on a DGX Spark: Ollama in Docker, two models loaded, NVML per-process memory, ACPI temperature, runner config, server environment and the access log">
+  <p class="caption">A real session on an NVIDIA DGX Spark (GB10): Ollama in Docker, two models loaded.</p>
+</section>
+
+<section id="why" class="narrow">
+  <h2>Why</h2>
+  <p>There are web dashboards, Prometheus exporters and chat TUIs for local inference. There was no <em>terminal monitor</em> — something you run on a box like <code>htop</code> or <code>nvtop</code> to see what is loaded, where, and with what settings. One command, pure standard library, finds the server on its own — Docker, Podman, systemd or a hand-started process.</p>
+</section>
+
+<section id="features">
+  <h2>What it shows</h2>
+  <div class="grid">
+    <article>
+      <h3>Effective inference config</h3>
+      <p><code>RUNNERS</code> parses each runner's argv: context, batch, flash attention, KV-cache dtype, layer offload, vLLM flags. The only place these are observable — "what was set" next to "what was negotiated".</p>
+    </article>
+    <article>
+      <h3>Which model on which card</h3>
+      <p>NVIDIA per-process VRAM via NVML (ctypes, no <code>nvidia-smi</code> fork) joined to runner PIDs: a GPU column in RUNNERS and a <code>procs:</code> line under every card.</p>
+    </article>
+    <article>
+      <h3>Any GPU, side by side</h3>
+      <p>NVIDIA, AMD (plain <code>amdgpu</code> via sysfs — no ROCm needed), Intel, Apple Silicon, Jetson / Spark unified memory. Utilisation, VRAM/GTT, temperature, power, ACPI thermal zones.</p>
+    </article>
+    <article>
+      <h3>Never blocks</h3>
+      <p>All I/O runs in a background collector thread. The UI stays at 100&nbsp;ms even when the API hangs; stale data is flagged instead of freezing the screen.</p>
+    </article>
+    <article>
+      <h3>Logs with request stats</h3>
+      <p>Tail of the container log or <code>journalctl</code>, plus requests/minute, status classes and p50 latency parsed from the access log.</p>
+    </article>
+    <article>
+      <h3>Several instances at once</h3>
+      <p>Repeat <code>-u</code>: the local box with full host stats, remotes API-only, one table each. Works behind reverse proxies — bearer tokens, basic auth, private CAs.</p>
+    </article>
+    <article>
+      <h3>Scriptable</h3>
+      <p><code>--json</code> for cron and Ansible facts (exit 1 when unhealthy), <code>--json --watch</code> for NDJSON, <code>--prometheus</code> for a node_exporter textfile — no port opened.</p>
+    </article>
+    <article>
+      <h3>Docker Engine API, no CLI</h3>
+      <p>Talks to the Docker or Podman socket with stdlib <code>http.client</code>; the <code>docker</code> binary is only a fallback. CPU bar is normalised to the container's cgroup limit.</p>
+    </article>
+    <article>
+      <h3>Read-only by default</h3>
+      <p>Without <code>--control</code> mtop never writes to the API. Model actions — stop, load, keep, pull, cancel — are opt-in and always ask y/N first.</p>
+    </article>
+  </div>
+</section>
+
+<section id="backends">
+  <h2>Three backends</h2>
+  <p class="sectionlead">The same layout — header, resources, GPU, models, runners, config, logs — fed by whichever server you run. <code>--mode auto</code> finds it; <code>--backend</code> picks the kind.</p>
+
+  <div class="backend">
+    <div class="btext">
+      <h3><span class="tag">default</span> Ollama</h3>
+      <p>Loaded models with the VRAM/RAM split, context, processor and TTL countdown, the runners' effective config, the server's <code>OLLAMA_*</code> environment, and the GIN access log. Docker, Podman, systemd or a manual <code>ollama serve</code>.</p>
+      <pre><code>mtop</code></pre>
+    </div>
+    <p class="bnote">Screenshot above.</p>
+  </div>
+
+  <div class="backend">
+    <div class="btext">
+      <h3><span class="tag">--backend llama-swap</span> llama-swap + vLLM</h3>
+      <p>The whole configured catalog — loaded or not — with state, upstream port and TTL left. <code>vllm serve</code> flags per runner (context, gpu-util, quant, tp), llama-server and other upstreams too, the user-level systemd unit and its journal.</p>
+      <pre><code>mtop --backend llama-swap</code></pre>
+    </div>
+    <img src="screenshot-llama-swap.png" width="2518" height="1820" loading="lazy" alt="mtop --backend llama-swap on a DGX Spark: the configured catalog with one model ready, its runner joined to the GPU, the launcher's environment and llama-swap's access log">
+  </div>
+
+  <div class="backend">
+    <div class="btext">
+      <h3><span class="tag">--backend comfyui</span> ComfyUI</h3>
+      <p>Not a model server, so mtop reads the workflow: the models of the running and recent jobs, <strong>live progress</strong> — node, step x/y, ETA — from the websocket, the queue, the GPU memory ComfyUI holds, and the <code>/models</code> catalog.</p>
+      <pre><code>mtop --backend comfyui</code></pre>
+    </div>
+    <img src="screenshot-comfyui.png" width="2518" height="1516" loading="lazy" alt="mtop --backend comfyui during a Qwen-Image render: the job at step 24/60 of its KSampler with ETA, one more queued, the three models of the workflow in use and 28 GiB held on the GPU">
+  </div>
+</section>
+
+<section id="control">
+  <h2>Control</h2>
+  <p class="sectionlead"><code>--control</code> turns the monitor into a small console. Arrow keys select a model; <kbd>s</kbd> unloads it, <kbd>t</kbd> keeps it loaded longer, <kbd>L</kbd> loads one, <kbd>P</kbd> pulls by name with live bytes, speed and ETA. For ComfyUI: cancel the job, clear the queue, free the models. Every action asks first.</p>
+  <img class="demo" src="demo-control.gif" width="1329" height="874" loading="lazy" alt="mtop --control on a DGX Spark: two models loaded from the picker, one kept loaded for 2h, the help overlay, a model pulled with live progress, one stopped">
+  <p class="caption">Real time, recorded on a DGX Spark. The <a href="https://github.com/Quaerendir/mtop/blob/master/docs/demo-control.cast">asciinema cast</a> is in the repo.</p>
+</section>
+
+<section id="install" class="narrow">
+  <h2>Install</h2>
+
+  <h3>From PyPI</h3>
+  <div class="cmd" data-copy="pipx install ollama-mtop"><code><span class="dim">$</span> pipx install ollama-mtop</code><button type="button" aria-label="Copy command">copy</button></div>
+  <div class="cmd" data-copy="uv tool install ollama-mtop"><code><span class="dim">$</span> uv tool install ollama-mtop</code><button type="button" aria-label="Copy command">copy</button></div>
+  <div class="cmd" data-copy="pip install ollama-mtop"><code><span class="dim">$</span> pip install ollama-mtop</code><button type="button" aria-label="Copy command">copy</button></div>
+
+  <h3>One file, no install</h3>
+  <div class="cmd" data-copy="curl -fsSL https://github.com/Quaerendir/mtop/releases/latest/download/mtop.py -o mtop.py &amp;&amp; chmod +x mtop.py &amp;&amp; ./mtop.py"><code><span class="dim">$</span> curl -fsSL https://github.com/Quaerendir/mtop/releases/latest/download/mtop.py -o mtop.py
+<span class="dim">$</span> chmod +x mtop.py &amp;&amp; ./mtop.py</code><button type="button" aria-label="Copy command">copy</button></div>
+
+  <h3>From source</h3>
+  <div class="cmd" data-copy="git clone https://github.com/Quaerendir/mtop.git &amp;&amp; cd mtop &amp;&amp; pip install -e . &amp;&amp; mtop"><code><span class="dim">$</span> git clone https://github.com/Quaerendir/mtop.git &amp;&amp; cd mtop
+<span class="dim">$</span> pip install -e . &amp;&amp; mtop</code><button type="button" aria-label="Copy command">copy</button></div>
+</section>
+
+<section id="usage" class="narrow">
+  <h2>Usage</h2>
+  <p>With no arguments mtop probes for Docker, then systemd, then a manual process, and honours <code>$OLLAMA_HOST</code>.</p>
+<pre><code><span class="c"># Ollama in a custom container / bare-metal service</span>
+mtop -c my-ollama
+mtop --mode local
+
+<span class="c"># several instances: local with host stats, two remotes API-only</span>
+mtop -u localhost:11434 -u rig=gpu-rig:11434 -u spark=192.168.3.6:11434
+
+<span class="c"># behind a reverse proxy with a private CA and a bearer token</span>
+OLLAMA_API_KEY=… mtop -u https://ollama.internal --cacert /etc/ssl/internal-ca.pem
+
+<span class="c"># other backends, and model actions</span>
+mtop --backend llama-swap
+mtop --backend comfyui --control
+
+<span class="c"># one-shot JSON for scripts, NDJSON stream, Prometheus textfile</span>
+mtop --json | jq '.models[].name'
+mtop --json --watch -i 1 | jq -c '{t: .wallclock, models: [.models[].name]}'
+mtop --prometheus --watch -i 15 -o /var/lib/node_exporter/textfile_collector/mtop.prom</code></pre>
+
+  <table class="keys">
+    <tr><th>Key</th><th>Action</th></tr>
+    <tr><td><kbd>q</kbd> / <kbd>Esc</kbd></td><td>Quit</td></tr>
+    <tr><td><kbd>?</kbd></td><td>All keys and which sections are on</td></tr>
+    <tr><td><kbd>+</kbd> / <kbd>-</kbd></td><td>Faster / slower refresh</td></tr>
+    <tr><td><kbd>r</kbd> <kbd>e</kbd> <kbd>l</kbd> <kbd>o</kbd></td><td>Toggle RUNNERS, SERVER CONFIG, LOGS, raw <code>ollama ps</code></td></tr>
+    <tr><td><kbd>↑</kbd> <kbd>↓</kbd> <kbd>s</kbd> <kbd>t</kbd> <kbd>L</kbd> <kbd>P</kbd></td><td>Select, stop, keep, load, pull — with <code>--control</code></td></tr>
+  </table>
+  <p class="note">Full option reference and per-backend details in the <a href="https://github.com/Quaerendir/mtop#readme">README</a>.</p>
+</section>
+
+<section id="platforms">
+  <h2>Platforms</h2>
+  <div class="tablewrap">
+  <table class="plat">
+    <tr><th>Platform</th><th>Status</th><th>Notes</th></tr>
+    <tr><td>Linux + NVIDIA</td><td class="ok">full</td><td>NVML via ctypes; <code>nvidia-smi</code> as fallback</td></tr>
+    <tr><td>Jetson / Orin / GB10 Spark</td><td class="ok">full</td><td>unified memory via <code>/proc/meminfo</code></td></tr>
+    <tr><td>Linux + AMD (amdgpu)</td><td class="ok">full</td><td>sysfs, no ROCm needed; APUs report the GTT pool</td></tr>
+    <tr><td>Linux + Intel (Arc / Xe / iGPU)</td><td class="warn">partial, untested</td><td>no utilisation without root</td></tr>
+    <tr><td>macOS (Apple Silicon)</td><td class="ok">full*</td><td>GPU util and memory via <code>ioreg</code>, no root; *temperature/power need <code>powermetrics</code></td></tr>
+    <tr><td>Docker / Podman / systemd / manual</td><td class="ok">full</td><td>auto-detected, Engine API over the socket</td></tr>
+    <tr><td>WSL2</td><td class="warn">partial</td><td>needs Docker + nvidia-container-toolkit</td></tr>
+  </table>
+  </div>
+  <p class="note">Requires Python 3.10+. Docker/Podman socket access is enough — the CLI is optional. Verified against Ollama, llama-swap + vLLM and ComfyUI on an NVIDIA GB10.</p>
+</section>
+
+</main>
+
+<footer>
+  <p>
+    <a href="https://github.com/Quaerendir/mtop">GitHub</a> ·
+    <a href="https://pypi.org/project/ollama-mtop/">PyPI</a> ·
+    <a href="https://github.com/Quaerendir/mtop/releases">Releases</a> ·
+    <a href="https://github.com/Quaerendir/mtop/blob/master/CHANGELOG.md">Changelog</a> ·
+    <a href="https://github.com/Quaerendir/mtop/issues">Issues</a> ·
+    <a href="https://github.com/Quaerendir/mtop/blob/master/LICENSE">MIT License</a>
+  </p>
+  <p class="dim">Built by a human homelab geek together with Claude (Anthropic). PRs welcome — keep it stdlib-only.</p>
+</footer>
+
+<script>
+// Progressive enhancement: copy buttons. The page works without it.
+document.querySelectorAll('.cmd button').forEach(function (b) {
+  b.addEventListener('click', function () {
+    var text = b.parentElement.getAttribute('data-copy');
+    var done = function () { b.textContent = 'copied'; setTimeout(function () { b.textContent = 'copy'; }, 1500); };
+    if (navigator.clipboard) { navigator.clipboard.writeText(text).then(done, function () {}); }
+  });
+});
+</script>
+</body>
+</html>

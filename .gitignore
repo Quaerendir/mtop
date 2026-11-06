@@ -28,3 +28,7 @@ Thumbs.db
 *.tar.gz
 
 # generated single-file artifact: dist/ (already ignored above)
+
+# copied from docs/ at deploy time (see .github/workflows/pages.yml)
+site/screenshot*.png
+site/demo-control.gif
